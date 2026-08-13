@@ -2562,6 +2562,7 @@ type IncrementalSessionUpdate struct {
 	HasTotalOutputTokens    bool
 	HasPeakContextTokens    bool
 	SubagentLinks           []ToolCallSubagentLink
+	ToolCallResultUpdates   []ToolCallResultUpdate
 	BlockedResultCategories map[string]bool
 }
 
@@ -2571,6 +2572,14 @@ type ToolCallSubagentLink struct {
 	ResultContent     string
 	ResultContentLen  int
 	HasResult         bool
+}
+
+// ToolCallResultUpdate carries result events for a tool call that already
+// exists in the database. Incremental parsers use it when an appended output
+// record refers to a call from an earlier sync batch.
+type ToolCallResultUpdate struct {
+	ToolUseID string
+	Events    []ToolResultEvent
 }
 
 // GetSessionForIncremental returns session state needed for incremental
