@@ -1000,6 +1000,7 @@ type IncrementalOutcome struct {
 	SessionID            string
 	Messages             []ParsedMessage
 	SubagentLinks        []ClaudeSubagentLink
+	ToolCallUpdates      []ParsedToolCallUpdate
 	EndedAt              time.Time
 	ConsumedBytes        int64
 	MessageCount         int
@@ -1020,6 +1021,12 @@ const (
 	IncrementalNoNewData
 	IncrementalApplied
 	IncrementalNeedsFullParse
+)
+
+// ErrIncrementalNeedsFullParse is the provider-neutral signal used by the
+// sync adapter when an incremental provider requests an authoritative replace.
+var ErrIncrementalNeedsFullParse = errors.New(
+	"incremental parse requires full parse",
 )
 
 // ProviderFactories returns one provider factory for every registered agent.
