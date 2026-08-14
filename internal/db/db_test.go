@@ -4108,6 +4108,169 @@ func TestWriteSessionIncrementalToolCallResultUpdate(t *testing.T) {
 		"idempotent replay must not bump the transcript revision")
 }
 
+func TestWriteSessionIncrementalResultEventIndexesAreMonotonic(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			ToolUseID: "call_cmd",
+		}},
+	})
+
+	for _, content := range []string{"first output", "second output"} {
+		_, werr := d.WriteSessionIncremental("s1", nil, IncrementalSessionUpdate{
+			MsgCount:    1,
+			NextOrdinal: 1,
+			ToolCallResultUpdates: []ToolCallResultUpdate{{
+				ToolUseID: "call_cmd",
+				Events: []ToolResultEvent{{
+					ToolUseID:     "call_cmd",
+					Source:        "function_call_output",
+					Content:       content,
+					ContentLength: len(content),
+				}},
+			}},
+		})
+		require.NoError(t, werr)
+	}
+
+	var secondRows int
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT COUNT(*) FROM tool_result_events
+		WHERE session_id = ? AND tool_use_id = ? AND event_index = 1`,
+		"s1", "call_cmd",
+	).Scan(&secondRows))
+	assert.Equal(t, 1, secondRows,
+		"each late result event must get the next per-call event index")
+
+	var latestIndex int
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT latest_event_index FROM tool_call_agent_state
+		WHERE session_id = ? AND tool_use_id = ? AND agent_id = ''`,
+		"s1", "call_cmd",
+	).Scan(&latestIndex))
+	assert.Equal(t, 1, latestIndex,
+		"the agent state must point at the newest event")
+
+	var result string
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT COALESCE(result_content, '') FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "call_cmd",
+	).Scan(&result))
+	assert.Equal(t, "second output", result)
+}
+
+func TestWriteSessionIncrementalBlockedResultKeepsLength(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			ToolUseID: "call_cmd",
+		}},
+	})
+
+	_, werr := d.WriteSessionIncremental("s1", nil, IncrementalSessionUpdate{
+		MsgCount:                1,
+		NextOrdinal:             1,
+		BlockedResultCategories: map[string]bool{"Bash": true},
+		ToolCallResultUpdates: []ToolCallResultUpdate{{
+			ToolUseID: "call_cmd",
+			Events: []ToolResultEvent{
+				{
+					AgentID:       "a",
+					ToolUseID:     "call_cmd",
+					Source:        "function_call_output",
+					Content:       "x",
+					ContentLength: 1,
+				},
+				{
+					AgentID:       "b",
+					ToolUseID:     "call_cmd",
+					Source:        "function_call_output",
+					Content:       "yy",
+					ContentLength: 2,
+				},
+			},
+		}},
+	})
+	require.NoError(t, werr)
+
+	var storedContent string
+	var storedLen int
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT COALESCE(result_content, ''), result_content_length
+		FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "call_cmd",
+	).Scan(&storedContent, &storedLen))
+	assert.Empty(t, storedContent, "blocked result content stays blank")
+	assert.Equal(t, 11, storedLen,
+		"blocked result length keeps agent labels and separators: "+
+			"\"a:\\nx\\n\\nb:\\nyy\"")
+}
+
+func TestBackfillToolCallAgentStateTracksFirstAndLatest(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			ToolUseID: "call_cmd",
+		}},
+	})
+
+	tx, err := d.getWriter().BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	for i, content := range []string{"old", "mid", "new"} {
+		_, err := tx.Exec(`
+			INSERT INTO tool_result_events
+				(session_id, tool_call_message_ordinal, call_index, tool_use_id,
+				 agent_id, source, status, content, content_length, event_index)
+			 VALUES (?, 0, 0, ?, 'agent-a', 'function_call_output',
+			         'completed', ?, ?, ?)`,
+			"s1", "call_cmd", content, len(content), i,
+		)
+		require.NoError(t, err)
+	}
+	require.NoError(t, backfillToolCallAgentStateTx(
+		tx, "s1", "call_cmd", 0, 0,
+	))
+	require.NoError(t, tx.Commit())
+
+	var first, latest int
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT first_event_index, latest_event_index
+		FROM tool_call_agent_state
+		WHERE session_id = ? AND tool_use_id = ? AND agent_id = 'agent-a'`,
+		"s1", "call_cmd",
+	).Scan(&first, &latest))
+	assert.Equal(t, 0, first)
+	assert.Equal(t, 2, latest,
+		"backfill keeps the newest event index per agent")
+}
+
 // claude_linear_parse round-trips through upsert and the incremental
 // lookup, stays NULL for legacy rows, and survives an upsert that
 // carries no verdict.

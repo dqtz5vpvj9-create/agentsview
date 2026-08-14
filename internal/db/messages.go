@@ -178,6 +178,91 @@ func summarizeToolCallFromStateTx(
 	return strings.Join(parts, "\n\n"), nil
 }
 
+// summarizeToolCallLengthFromStateTx returns the byte length of the summary
+// summarizeToolCallFromStateTx would assemble, without materializing the
+// contents. Blocked-category rows store blank content but keep their
+// content_length, so this reconstructs the original summary length — agent
+// labels and separators included — instead of the zero the blanked display
+// summary would report. It must stay structurally identical to
+// summarizeToolCallFromStateTx: a change to either assembly rule must update
+// both.
+func summarizeToolCallLengthFromStateTx(
+	tx *sql.Tx, sessionID, toolUseID string,
+) (int, error) {
+	rows, err := tx.Query(
+		`SELECT s.agent_id, e.content_length
+		 FROM tool_call_agent_state s
+		 JOIN tool_result_events e
+		   ON e.session_id = s.session_id
+		  AND e.tool_use_id = s.tool_use_id
+		  AND e.event_index = s.latest_event_index
+		 WHERE s.session_id = ? AND s.tool_use_id = ?
+		 ORDER BY s.first_event_index`,
+		sessionID, toolUseID,
+	)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"loading agent state lengths for %s/%s: %w",
+			sessionID, toolUseID, err,
+		)
+	}
+	var orderedAgents []string
+	latest := make(map[string]int)
+	lastAnonLen := 0
+	for rows.Next() {
+		var agentID string
+		var contentLength int
+		if err := rows.Scan(&agentID, &contentLength); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf(
+				"scanning agent state lengths for %s/%s: %w",
+				sessionID, toolUseID, err,
+			)
+		}
+		if agentID == "" {
+			lastAnonLen = contentLength
+			continue
+		}
+		if _, ok := latest[agentID]; !ok {
+			orderedAgents = append(orderedAgents, agentID)
+		}
+		latest[agentID] = contentLength
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, fmt.Errorf(
+			"reading agent state lengths for %s/%s: %w",
+			sessionID, toolUseID, err,
+		)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf(
+			"closing agent state lengths for %s/%s: %w",
+			sessionID, toolUseID, err,
+		)
+	}
+	switch {
+	case len(latest) == 0:
+		return lastAnonLen, nil
+	case len(latest) == 1:
+		total := latest[orderedAgents[0]]
+		if lastAnonLen > 0 {
+			total += 2 + lastAnonLen
+		}
+		return total, nil
+	default:
+		total := 0
+		for _, agentID := range orderedAgents {
+			total += len(agentID) + 2 + latest[agentID]
+		}
+		total += 2 * (len(orderedAgents) - 1)
+		if lastAnonLen > 0 {
+			total += 2 + lastAnonLen
+		}
+		return total, nil
+	}
+}
+
 // backfillToolCallAgentStateTx rebuilds the per-call agent state rows
 // from the stored events. It runs once per call for sessions written
 // before the state table existed or through the staged publish; after
@@ -201,7 +286,8 @@ func backfillToolCallAgentStateTx(
 		)
 	}
 	type stateRow struct {
-		firstIndex int
+		firstIndex  int
+		latestIndex int
 	}
 	latest := make(map[string]stateRow)
 	for rows.Next() {
@@ -216,7 +302,7 @@ func backfillToolCallAgentStateTx(
 				sessionID, toolUseID, err,
 			)
 		}
-		if strings.TrimSpace(content) == "" {
+		if strings.TrimSpace(content) == "" && length == 0 {
 			continue
 		}
 		key := strings.TrimSpace(agentID)
@@ -224,6 +310,7 @@ func backfillToolCallAgentStateTx(
 		if !ok {
 			entry.firstIndex = eventIndex
 		}
+		entry.latestIndex = eventIndex
 		latest[key] = entry
 	}
 	if err := rows.Err(); err != nil {
@@ -243,7 +330,7 @@ func backfillToolCallAgentStateTx(
 	for key, entry := range latest {
 		args = append(args,
 			sessionID, toolUseID, key,
-			entry.firstIndex, entry.firstIndex,
+			entry.firstIndex, entry.latestIndex,
 		)
 	}
 	if len(args) == 0 {
@@ -1097,7 +1184,8 @@ func upsertToolCallAgentStateRows(
 ) error {
 	args := make([]any, 0, len(rows)*5)
 	for _, r := range rows {
-		if strings.TrimSpace(r.Event.Content) == "" {
+		if strings.TrimSpace(r.Event.Content) == "" &&
+			r.Event.ContentLength == 0 {
 			continue
 		}
 		args = append(args,
@@ -2935,7 +3023,7 @@ func applyToolCallResultUpdateTx(
 				sessionID, update.ToolUseID, err,
 			)
 		}
-		candidate.EventIndex = nextEventIndex
+		stored.EventIndex = nextEventIndex
 		nextEventIndex++
 		insertRows = append(insertRows, toolResultEventRow{
 			SessionID:      sessionID,
@@ -2957,6 +3045,12 @@ func applyToolCallResultUpdateTx(
 	if err != nil {
 		return false, err
 	}
+	resultLength, err := summarizeToolCallLengthFromStateTx(
+		tx, sessionID, update.ToolUseID,
+	)
+	if err != nil {
+		return false, err
+	}
 	storedSummary := summary
 	if blocked {
 		storedSummary = ""
@@ -2965,7 +3059,7 @@ func applyToolCallResultUpdateTx(
 		`UPDATE tool_calls
 		 SET result_content_length = ?, result_content = ?
 		 WHERE session_id = ? AND tool_use_id = ?`,
-		len(summary), storedSummary, sessionID, update.ToolUseID,
+		resultLength, storedSummary, sessionID, update.ToolUseID,
 	); err != nil {
 		return false, fmt.Errorf(
 			"updating tool result summary for %s/%s: %w",
