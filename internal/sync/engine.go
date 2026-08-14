@@ -1273,6 +1273,17 @@ func (j *syncJob) releaseRetention() {
 	j.retentionLease = nil
 }
 
+// releaseAll drops every parse-owned resource a discarded result holds: the
+// retention lease bounds the parsed payload memory, and releaseStaged closes
+// the scratch staging sink and restores the process GC target it lowered.
+// Every collector discard path — including cancellation draining — must call
+// this instead of releaseRetention alone, or a staged Codex result leaks its
+// scratch database and pins the process GC percent at the staged value.
+func (j *syncJob) releaseAll() {
+	j.releaseRetention()
+	j.processResult.releaseStaged()
+}
+
 func (j syncJob) skipCacheKey() string {
 	return j.processResult.skipCacheKey(j.path)
 }
@@ -8051,7 +8062,7 @@ func (e *Engine) collectAndBatch(
 			// ctx.Done() branch above.
 			if ctx.Err() != nil {
 				stats.Aborted = true
-				r.releaseRetention()
+				r.releaseAll()
 				drainResults(results, total-i-1)
 				goto flush
 			}
@@ -8061,7 +8072,7 @@ func (e *Engine) collectAndBatch(
 				e.cacheSkip(r.skipCacheKey(), r.mtime, r.sourceFingerprint)
 			}
 			log.Printf("sync error: %v", r.err)
-			r.releaseRetention()
+			r.releaseAll()
 			continue
 		}
 		for range r.providerFailureCount {
@@ -8085,7 +8096,7 @@ func (e *Engine) collectAndBatch(
 			}
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
-			r.releaseRetention()
+			r.releaseAll()
 			continue
 		}
 		sourceAllowsParserExclusions := e.sourceAllowsParserExclusions(
@@ -8111,7 +8122,7 @@ func (e *Engine) collectAndBatch(
 			log.Printf("list pre-write subagent children: %v", err)
 			stats.RecordFailed()
 			e.noteSQLiteContainerResult(r.path, false)
-			r.releaseRetention()
+			r.releaseAll()
 			continue
 		}
 		// Persist affected IDs before any exclusion or replacement can
@@ -8121,7 +8132,7 @@ func (e *Engine) collectAndBatch(
 			log.Printf("queue subagent parent repairs: %v", err)
 			stats.RecordFailed()
 			e.noteSQLiteContainerResult(r.path, false)
-			r.releaseRetention()
+			r.releaseAll()
 			continue
 		}
 		claudeDAG := r.agent == parser.AgentClaude && len(r.results) > 1
@@ -8138,7 +8149,7 @@ func (e *Engine) collectAndBatch(
 				log.Printf("stage Claude source data versions: %v", err)
 				stats.RecordFailed()
 				e.noteSQLiteContainerResult(r.path, false)
-				r.releaseRetention()
+				r.releaseAll()
 				continue
 			}
 		}
@@ -8149,7 +8160,7 @@ func (e *Engine) collectAndBatch(
 			log.Printf("delete parser-excluded sessions: %v", err)
 			stats.RecordFailed()
 			e.noteSQLiteContainerResult(r.path, false)
-			r.releaseRetention()
+			r.releaseAll()
 			continue
 		}
 		if len(excludedSessionIDs) > 0 {
@@ -8196,7 +8207,7 @@ func (e *Engine) collectAndBatch(
 				)
 				stats.RecordFailed()
 				e.noteSQLiteContainerResult(r.path, false)
-				r.releaseRetention()
+				r.releaseAll()
 				continue
 			}
 		}
@@ -8235,7 +8246,7 @@ func (e *Engine) collectAndBatch(
 			}
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
-			r.releaseRetention()
+			r.releaseAll()
 			continue
 		}
 		if r.cacheSkip {
@@ -8269,8 +8280,7 @@ func (e *Engine) collectAndBatch(
 			}
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
-			r.releaseRetention()
-			r.releaseStaged()
+			r.releaseAll()
 			continue
 		}
 
@@ -8278,7 +8288,7 @@ func (e *Engine) collectAndBatch(
 			if err := e.writeIncremental(r.incremental); err != nil {
 				log.Printf("%v", err)
 				stats.RecordFailed()
-				r.releaseRetention()
+				r.releaseAll()
 				continue
 			}
 			stats.RecordSynced(1)
@@ -8291,7 +8301,7 @@ func (e *Engine) collectAndBatch(
 				r.incremental.msgs,
 			)
 			stats.messagesIndexed = progress.MessagesIndexed
-			r.releaseRetention()
+			r.releaseAll()
 		} else {
 			sourceNeedsRetry := vetoed > 0 ||
 				r.providerFailureCount > 0 || len(r.retrySessionIDs) > 0
@@ -8503,7 +8513,7 @@ func (e *Engine) linkSubagentSessions(ctx context.Context) error {
 func drainResults(results <-chan syncJob, remaining int) {
 	for range remaining {
 		job := <-results
-		job.releaseRetention()
+		job.releaseAll()
 	}
 }
 

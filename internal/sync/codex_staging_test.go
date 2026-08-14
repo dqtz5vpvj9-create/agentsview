@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"testing"
 	"time"
@@ -14,6 +15,37 @@ import (
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
+
+func TestDrainResultsReleasesStagedScratchAndGCGuard(t *testing.T) {
+	dir := t.TempDir()
+	sink, err := newCodexStagingSink(dir, nil)
+	require.NoError(t, err)
+
+	// SetGCPercent(-1) disables GC rather than querying it on this
+	// toolchain, so drive the restore check with an explicit baseline and
+	// read each transition from SetGCPercent's return value.
+	debug.SetGCPercent(200)
+	t.Cleanup(func() { debug.SetGCPercent(100) })
+	guard := beginStagedColdSync()
+	t.Cleanup(guard)
+	require.Equal(t, stagedColdSyncGCPercent,
+		debug.SetGCPercent(stagedColdSyncGCPercent),
+		"the staged parse must lower the GC target")
+
+	results := make(chan syncJob, 1)
+	results <- syncJob{processResult: processResult{
+		staged:          sink,
+		stagedGCRelease: guard,
+	}}
+	drainResults(results, 1)
+
+	require.Equal(t, 200, debug.SetGCPercent(200),
+		"draining must restore the process GC target")
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	assert.Empty(t, entries,
+		"draining must remove the staged scratch file")
+}
 
 // TestCodexStreamingParseParityWithLegacy drives one Codex transcript
 // through both the collecting parse (legacy full write) and the staging
