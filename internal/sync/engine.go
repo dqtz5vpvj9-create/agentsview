@@ -7724,6 +7724,7 @@ func (e *Engine) collectAndBatch(
 	var pending []pendingWrite
 	var pendingBytes int64
 	var pendingLeases []*parseRetentionLease
+	var pendingStaged []*codexStagingSink
 	var pendingCacheWrites []skipCacheWrite
 	baselineCacheWrites := make(
 		map[machineSessionSource]map[string]skipCacheWrite,
@@ -7874,6 +7875,7 @@ func (e *Engine) collectAndBatch(
 		}
 		func() {
 			defer releaseParseRetentionLeases(pendingLeases)
+			defer closeCodexStagingSinks(pendingStaged)
 			var outcome writeBatchOutcome
 			if e.writeBatchOverride != nil {
 				writtenSessions, writtenMessages, failedSessions, cwdFiltered :=
@@ -7996,6 +7998,7 @@ func (e *Engine) collectAndBatch(
 		pending = pending[:0]
 		pendingBytes = 0
 		pendingLeases = pendingLeases[:0]
+		pendingStaged = pendingStaged[:0]
 		pendingCacheWrites = pendingCacheWrites[:0]
 	}
 
@@ -8249,6 +8252,7 @@ func (e *Engine) collectAndBatch(
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
 			r.releaseRetention()
+			r.releaseStaged()
 			continue
 		}
 
@@ -8306,6 +8310,9 @@ func (e *Engine) collectAndBatch(
 					pw.sourceCompletionEligible = !sourceNeedsRetry
 					pw.promoteSourceOnComplete = claudeDAG
 				}
+				if i == 0 {
+					pw.staged = r.staged
+				}
 				pending = append(pending, pw)
 				pendingBytes += pw.sourceBytes
 				if runtimeMetrics != nil {
@@ -8315,6 +8322,10 @@ func (e *Engine) collectAndBatch(
 			if r.retentionLease != nil {
 				pendingLeases = append(pendingLeases, r.retentionLease)
 				r.retentionLease = nil
+			}
+			if r.staged != nil {
+				pendingStaged = append(pendingStaged, r.staged)
+				r.staged = nil
 			}
 			if r.cacheAfterWrite && !sourceNeedsRetry {
 				pendingCacheWrites = append(pendingCacheWrites, skipCacheWrite{
@@ -8649,6 +8660,24 @@ type processResult struct {
 	// syncJob.retentionLease, which is released exactly once via
 	// releaseRetention or the pendingLeases flush.
 	retentionLease *parseRetentionLease
+	// staged carries the scratch staging sink for a Codex full parse that
+	// took the streaming path. The collector moves it onto the pending
+	// write (and into pendingStaged for release after the batch commits);
+	// every path that drops the result without writing must releaseStaged.
+	staged *codexStagingSink
+}
+
+// releaseStaged closes the result's staging sink and clears the handle. It
+// must be called exactly once on every processResult that carries one and
+// is not moving the sink onto a pending write.
+func (r *processResult) releaseStaged() {
+	if r.staged == nil {
+		return
+	}
+	if err := r.staged.Close(); err != nil {
+		log.Printf("closing codex staging sink: %v", err)
+	}
+	r.staged = nil
 }
 
 func (r processResult) needsRetryForSession(sessionID string) bool {
@@ -9379,13 +9408,52 @@ func (e *Engine) processProviderFile(
 			runtimeMetrics.openCodeSQLiteParse()
 		}
 	}
-	outcome, err := provider.Parse(ctx, parser.ParseRequest{
-		Source:      source,
-		Fingerprint: fingerprint,
-		Machine:     machine,
-		ForceParse:  e.forceParse || file.ForceParse,
-	})
+	// Large Codex full parses stream through the scratch staging sink: the
+	// in-memory model keeps placeholders instead of tool-result content, so
+	// peak memory stays bounded by messages + one scratch batch rather than
+	// the transcript size. Small files keep the collecting path.
+	var stagedSink *codexStagingSink
+	if file.Agent == parser.AgentCodex &&
+		sourceBytes > stagedCodexParseMinBytes {
+		stagedSink, err = newCodexStagingSink(e.blockedResultCategories)
+		if err != nil {
+			lease.Release()
+			return processResult{
+				err:         fmt.Errorf("codex staging sink: %w", err),
+				mtime:       fingerprint.MTimeNS,
+				cacheSkip:   cacheSkip,
+				cacheKey:    cacheKey,
+				noCacheSkip: true,
+			}, true
+		}
+	}
+	var outcome parser.ParseOutcome
+	if stagedSink != nil {
+		if e.forceParse || file.ForceParse {
+			parser.EvictCodexSessionIndexForSession(
+				providerDiscoveredPath(source),
+			)
+		}
+		outcome, err = stagedCodexParseOutcome(
+			parser.ProviderConfig{
+				Roots:        e.agentDirs[file.Agent],
+				Machine:      machine,
+				PathRewriter: e.pathRewriter,
+			},
+			source, stagedSink,
+		)
+	} else {
+		outcome, err = provider.Parse(ctx, parser.ParseRequest{
+			Source:      source,
+			Fingerprint: fingerprint,
+			Machine:     machine,
+			ForceParse:  e.forceParse || file.ForceParse,
+		})
+	}
 	if err != nil {
+		if stagedSink != nil {
+			stagedSink.Close()
+		}
 		return processResult{
 			err:            err,
 			mtime:          fingerprint.MTimeNS,
@@ -9401,6 +9469,9 @@ func (e *Engine) processProviderFile(
 		fingerprint,
 		outcome,
 	); err != nil {
+		if stagedSink != nil {
+			stagedSink.Close()
+		}
 		return processResult{
 			err:            err,
 			mtime:          fingerprint.MTimeNS,
@@ -9529,6 +9600,12 @@ func (e *Engine) processProviderFile(
 	filteredResults := e.dropUnchangedSharedSQLiteResults(
 		file, parsedResults, providerSemantics.UnchangedResults,
 	)
+	if stagedSink != nil && len(filteredResults) == 0 {
+		// Every result was dropped as unchanged; nothing will publish the
+		// staged rows, so release the scratch sink now.
+		stagedSink.Close()
+		stagedSink = nil
+	}
 	res := processResult{
 		results:                  filteredResults,
 		excludedSessionIDs:       excludedSessionIDs,
@@ -9544,6 +9621,7 @@ func (e *Engine) processProviderFile(
 		providerWideFailureCount: providerWideFailureCount,
 		retentionLease:           lease,
 		providerStatHash:         preParseStatHash,
+		staged:                   stagedSink,
 	}
 	if file.Agent == parser.AgentOmnigent && cacheSkip && cleanCache &&
 		!e.forceParse && !file.ForceParse &&
@@ -12632,8 +12710,12 @@ type pendingWrite struct {
 	// full parse. Empty when the provider did not supply them.
 	checkpointHashState    []byte
 	checkpointAnchorDigest string
-	needsRetry             bool
-	forceReplace           bool
+	// staged carries the scratch staging sink when this write came from a
+	// streaming Codex full parse; the write path publishes tool-result rows
+	// and summaries from it and the batch flush closes it.
+	staged       *codexStagingSink
+	needsRetry   bool
+	forceReplace bool
 	// sourceIdentityUnverified marks a copy that shares a native session ID
 	// without matching the stored machine, source path, or content hash. The
 	// copy still follows native-ID deduplication, but it cannot borrow the
@@ -13190,7 +13272,30 @@ func (e *Engine) writeBatchWithOutcome(
 
 		var werr error
 		if replaceMessages {
-			if isCodexFormatAgent(pw.sess.Agent) {
+			if pw.staged != nil {
+				positions := make(map[string]db.StagedToolCallPosition)
+				for _, m := range msgs {
+					for callIdx, tc := range m.ToolCalls {
+						if tc.ToolUseID == "" {
+							continue
+						}
+						positions[tc.ToolUseID] = db.StagedToolCallPosition{
+							ToolUseID: tc.ToolUseID,
+							Ordinal:   m.Ordinal,
+							CallIndex: callIdx,
+						}
+					}
+				}
+				combined := append(
+					append([]db.SecretFinding(nil), findings...),
+					pw.staged.Findings(s.ID, positions)...,
+				)
+				update.SecretLeakCount = definiteFindingCount(combined)
+				werr = e.db.ReplaceSessionContentStaged(
+					s.ID, msgs, update, combined, pw.staged,
+					e.blockedResultCategories,
+				)
+			} else if isCodexFormatAgent(pw.sess.Agent) {
 				cp, blobs, cpErr := e.buildCodexFullParseCheckpoint(
 					pw.sess.File.Path, pw,
 				)
