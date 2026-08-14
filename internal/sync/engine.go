@@ -8870,6 +8870,11 @@ func (e *Engine) processProviderFile(
 		e.invalidateVerifiedSource(
 			verifiedCapture.key.agent, verifiedCapture.key.path,
 		)
+		// The stat snapshot was fresh, but the persisted projection was not.
+		// Treat the source as unverified for the remaining gates in this call:
+		// if the row disappeared, the Codex cold-parse path can derive its
+		// fingerprint from the parse instead of paying for a redundant read.
+		verifiedFresh = false
 	}
 
 	// Capture the per-component stat digest from the same pre-parse
