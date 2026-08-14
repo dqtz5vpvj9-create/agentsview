@@ -8847,9 +8847,18 @@ func (e *Engine) processProviderFile(
 		source.ProjectHint = file.Project
 	}
 
+	needsCodexCheckpointBootstrap, err := e.codexCheckpointNeedsBootstrap(
+		source, file,
+	)
+	if err != nil {
+		return processResult{
+			err: fmt.Errorf("checking Codex checkpoint bootstrap: %w", err),
+		}, true
+	}
+
 	verifiedCapture, verifiedMtime, verifiedFresh, verifiedStateOK :=
 		e.verifiedProviderSourceState(provider, source, file)
-	if verifiedStateOK && verifiedFresh {
+	if !needsCodexCheckpointBootstrap && verifiedStateOK && verifiedFresh {
 		if e.verifiedProviderSourceFreshInDB(
 			verifiedCapture.key.agent, source,
 			verifiedCapture.signature.size, verifiedMtime,
@@ -8907,16 +8916,18 @@ func (e *Engine) processProviderFile(
 	// change -- including a same-size same-mtime in-place rewrite --
 	// bumps a ctime and breaks the digest, falling through to the
 	// content-verified gates.
-	if freshMtime, fresh := e.providerSourceFreshBeforeFingerprint(
-		ctx, source, file, preParseStatHash,
-	); fresh {
-		if verifiedStateOK {
-			e.promoteVerifiedSource(verifiedCapture)
+	if !needsCodexCheckpointBootstrap {
+		if freshMTime, fresh := e.providerSourceFreshBeforeFingerprint(
+			ctx, source, file, preParseStatHash,
+		); fresh {
+			if verifiedStateOK {
+				e.promoteVerifiedSource(verifiedCapture)
+			}
+			return processResult{
+				skip:  true,
+				mtime: freshMTime,
+			}, true
 		}
-		return processResult{
-			skip:  true,
-			mtime: freshMtime,
-		}, true
 	}
 
 	// DB-freshness skip for single-session JSONL providers (Claude):
@@ -8930,29 +8941,31 @@ func (e *Engine) processProviderFile(
 	// companion touch invalidated); without the stamp those rows would
 	// re-hash on every fresh process forever, since a skip never writes.
 	sourceForceReplace := false
-	if mtime, fresh, forceReplace, contentVerified := e.providerSingleSessionFresh(
-		ctx, provider, source, file,
-	); fresh {
-		if !verifiedStateOK || contentVerified {
-			if verifiedStateOK {
-				e.promoteVerifiedSource(verifiedCapture)
+	if !needsCodexCheckpointBootstrap {
+		if mtime, fresh, forceReplace, contentVerified := e.providerSingleSessionFresh(
+			ctx, provider, source, file,
+		); fresh {
+			if !verifiedStateOK || contentVerified {
+				if verifiedStateOK {
+					e.promoteVerifiedSource(verifiedCapture)
+				}
+				if contentVerified {
+					e.stampProviderStatHashForConfirmedSource(
+						ctx, preParseStatHash,
+					)
+				}
+				return processResult{
+					skip:  true,
+					mtime: mtime,
+				}, true
 			}
-			if contentVerified {
-				e.stampProviderStatHashForConfirmedSource(
-					ctx, preParseStatHash,
-				)
-			}
-			return processResult{
-				skip:  true,
-				mtime: mtime,
-			}, true
+			// A gate-eligible local source without a comparable stored hash (or
+			// whose hash could not be read) must take the fingerprint path once.
+			// Otherwise it would retain the legacy stat-only skip forever without
+			// ever earning verified-source trust.
+		} else if forceReplace {
+			sourceForceReplace = true
 		}
-		// A gate-eligible local source without a comparable stored hash (or
-		// whose hash could not be read) must take the fingerprint path once.
-		// Otherwise it would retain the legacy stat-only skip forever without
-		// ever earning verified-source trust.
-	} else if forceReplace {
-		sourceForceReplace = true
 	}
 
 	// Watermark-only shared-container sources (changed-path classification)
