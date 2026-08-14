@@ -8855,7 +8855,6 @@ func (e *Engine) processProviderFile(
 			err: fmt.Errorf("checking Codex checkpoint bootstrap: %w", err),
 		}, true
 	}
-
 	verifiedCapture, verifiedMtime, verifiedFresh, verifiedStateOK :=
 		e.verifiedProviderSourceState(provider, source, file)
 	if !needsCodexCheckpointBootstrap && verifiedStateOK && verifiedFresh {
@@ -9002,6 +9001,17 @@ func (e *Engine) processProviderFile(
 		} else {
 			switch cpResult.decision {
 			case codexCheckpointUnchanged:
+				if verifiedStateOK {
+					e.promoteVerifiedSource(verifiedCapture)
+				}
+				// The checkpoint proves the committed transcript and the
+				// current stat snapshot agree. Persist that same snapshot so
+				// archives created before provider freshness digests do not
+				// re-enter the content-hash path after every restart. This also
+				// refreshes a digest after an unrelated session-index touch.
+				e.stampProviderStatHashForConfirmedSource(
+					ctx, preParseStatHash,
+				)
 				return processResult{
 					skip:        true,
 					mtime:       cpResult.fingerprint.MTimeNS,
