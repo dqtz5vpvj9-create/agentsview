@@ -8861,6 +8861,7 @@ func (e *Engine) processProviderFile(
 	var codexHashState []byte
 	codexForceFullParse := false
 	codexProvenUnchanged := false
+	codexAuditDeepVerify := e.checkpointAudit.Load()
 	var codexUnchangedMtime int64
 	if isCodexFormatAgent(file.Agent) {
 		cpResult, cpErr := e.codexCheckpointFingerprint(ctx, source, file)
@@ -8881,18 +8882,11 @@ func (e *Engine) processProviderFile(
 				codexForceFullParse = true
 			}
 		}
-		// The periodic audit bypasses the checkpoint stat trust so every
-		// Codex source deep-verifies against its stored rows. The audit
-		// does not run under forceParse, so the freshness fast paths and
-		// the incremental append below would otherwise skip or tail-apply
-		// an unchanged source and never repair a rewritten prefix.
-		if e.checkpointAudit.Load() {
-			codexForceFullParse = true
-		}
 	}
 	verifiedCapture, verifiedMtime, verifiedFresh, verifiedStateOK :=
 		e.verifiedProviderSourceState(provider, source, file)
 	if !codexForceFullParse && !codexProvenUnchanged &&
+		!codexAuditDeepVerify &&
 		verifiedStateOK && verifiedFresh {
 		if e.verifiedProviderSourceFreshInDB(
 			verifiedCapture.key.agent, source,
@@ -8956,7 +8950,8 @@ func (e *Engine) processProviderFile(
 	// change -- including a same-size same-mtime in-place rewrite --
 	// bumps a ctime and breaks the digest, falling through to the
 	// content-verified gates.
-	if !codexForceFullParse && !codexProvenUnchanged {
+	if !codexForceFullParse && !codexProvenUnchanged &&
+		!codexAuditDeepVerify {
 		if freshMTime, fresh := e.providerSourceFreshBeforeFingerprint(
 			ctx, source, file, preParseStatHash,
 		); fresh {
@@ -8981,7 +8976,8 @@ func (e *Engine) processProviderFile(
 	// companion touch invalidated); without the stamp those rows would
 	// re-hash on every fresh process forever, since a skip never writes.
 	sourceForceReplace := false
-	if !codexForceFullParse && !codexProvenUnchanged {
+	if !codexForceFullParse && !codexProvenUnchanged &&
+		!codexAuditDeepVerify {
 		if mtime, fresh, forceReplace, contentVerified := e.providerSingleSessionFresh(
 			ctx, provider, source, file,
 		); fresh {
@@ -9014,7 +9010,8 @@ func (e *Engine) processProviderFile(
 	// did not change, so skip before Fingerprint pays the per-session child
 	// lookup; a child-only edit this cannot see is reconciled by the next
 	// full-discovery pass, whose digest comparison still catches it.
-	if !codexForceFullParse && !codexProvenUnchanged {
+	if !codexForceFullParse && !codexProvenUnchanged &&
+		!codexAuditDeepVerify {
 		if freshMtime, fresh := e.watermarkOnlySQLiteSourceFresh(
 			source, file,
 		); fresh {
@@ -9050,7 +9047,8 @@ func (e *Engine) processProviderFile(
 		var err error
 		if isCodexFormatAgent(file.Agent) &&
 			!verifiedFresh &&
-			!e.forceParse && !file.ForceParse {
+			!e.forceParse && !file.ForceParse &&
+			!codexAuditDeepVerify {
 			// A never-synced Codex-format source has no stored hash to
 			// compare: skip the standalone fingerprint read and derive
 			// the hash from the parser's single-pass capture after the
@@ -9124,7 +9122,7 @@ func (e *Engine) processProviderFile(
 	)
 	cacheSkip := e.shouldCacheSkip(file)
 	if cacheSkip && !e.forceParse && !file.ForceParse &&
-		!codexForceFullParse {
+		!codexForceFullParse && !codexAuditDeepVerify {
 		e.skipMu.RLock()
 		cachedMtime, cached := e.skipCache[cacheKey]
 		e.skipMu.RUnlock()
@@ -9236,6 +9234,10 @@ func (e *Engine) processProviderFile(
 	var incOK bool
 	if codexForceFullParse {
 		incRes = processResult{forceReplace: true}
+	} else if codexAuditDeepVerify {
+		// The audit content-hashes the full source below and repairs only
+		// on mismatch; never tail-apply against a prefix it cannot prove.
+		incRes = processResult{}
 	} else {
 		incRes, incOK = e.tryProviderIncrementalAppend(
 			ctx, provider, source, file, fingerprint,
