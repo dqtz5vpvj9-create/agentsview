@@ -60,6 +60,69 @@ func TestParserCheckpointRoundTrip(t *testing.T) {
 	assert.False(t, ok, "delete must remove the blob payload too")
 }
 
+func TestReplaceSessionContentWithCheckpointUsesPrefixedSessionID(t *testing.T) {
+	d := testDB(t)
+	const storedID = "host:codex:native"
+	insertSession(t, d, storedID, "proj")
+	msgs := []Message{{
+		SessionID:  storedID,
+		Ordinal:    0,
+		Role:       "assistant",
+		Content:    "running",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: storedID,
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			ToolUseID: "call_1",
+		}},
+	}}
+	cp := &ParserCheckpoint{
+		SessionID:        "codex:native",
+		Agent:            "codex",
+		FilePath:         "/sessions/rollout.jsonl",
+		FileInode:        1,
+		FileDevice:       1,
+		FileMTime:        1,
+		FileChangeTime:   1,
+		Offset:           8,
+		TailAnchorDigest: "anchor",
+		Hash:             "hash",
+		NextOrdinal:      0,
+		Version:          ParserCheckpointVersion,
+	}
+	blobs := &ParserCheckpointBlobs{
+		SessionID: "codex:native",
+		Cursor:    []byte("cursor"),
+		HashState: []byte("state"),
+	}
+	err := d.ReplaceSessionContentWithCheckpoint(
+		storedID, msgs, SessionSignalUpdate{}, nil, cp, blobs,
+	)
+	require.NoError(t, err)
+
+	var nativeCount, prefixedCount int
+	require.NoError(t, d.Reader().QueryRow(
+		`SELECT COUNT(*) FROM parser_checkpoints WHERE session_id = ?`,
+		"codex:native",
+	).Scan(&nativeCount))
+	require.NoError(t, d.Reader().QueryRow(
+		`SELECT COUNT(*) FROM parser_checkpoints WHERE session_id = ?`,
+		storedID,
+	).Scan(&prefixedCount))
+	assert.Zero(t, nativeCount,
+		"the checkpoint must not be stored under the parser-native id")
+	assert.Equal(t, 1, prefixedCount,
+		"the checkpoint must be stored under the rewritten session id")
+
+	var blobCount int
+	require.NoError(t, d.Reader().QueryRow(
+		`SELECT COUNT(*) FROM parser_checkpoint_blobs WHERE session_id = ?`,
+		storedID,
+	).Scan(&blobCount))
+	assert.Equal(t, 1, blobCount)
+}
+
 func TestWriteSessionIncrementalPersistsCheckpointInSameTx(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "s1", "proj")

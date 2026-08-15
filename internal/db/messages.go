@@ -1547,6 +1547,13 @@ func (db *DB) replaceSessionContent(
 	if cp != nil {
 		c := *cp
 		b := *blobs
+		// The checkpoint row is keyed by session id just like the blobs.
+		// The engine may hand in a parser-native id while the write lands
+		// under an idPrefix-rewritten session id; storing the two tables
+		// under different ids would strand the resume state and let a
+		// prefixed session overwrite (or borrow) a local checkpoint that
+		// shares the same native id.
+		c.SessionID = sessionID
 		b.SessionID = sessionID
 		if err := upsertParserCheckpointTx(tx, c, b); err != nil {
 			return err
