@@ -8500,6 +8500,46 @@ type incrementalUpdate struct {
 	providerStatHash     *pendingProviderStatHash
 }
 
+// hasSubstantiveUserMessage reports whether the delta contains a user
+// message with non-whitespace content. Such deltas can change prompt-derived
+// heuristics, which the incremental signal maintainer does not fold; they
+// fall back to the debounced full recompute.
+func (inc *incrementalUpdate) hasSubstantiveUserMessage() bool {
+	for _, m := range inc.msgs {
+		if m.Role == parser.RoleUser &&
+			strings.TrimSpace(m.Content) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// hasCompactBoundary reports whether the delta contains a compact-boundary
+// message. Boundaries change the compaction detectors, which the incremental
+// signal maintainer does not fold; they fall back to a full recompute.
+func (inc *incrementalUpdate) hasCompactBoundary() bool {
+	for _, m := range inc.msgs {
+		if m.IsCompactBoundary {
+			return true
+		}
+	}
+	return false
+}
+
+// hasResultSubagentLink reports whether the delta carries a subagent link
+// with result content. Linked results update tool_calls.result_content
+// outside ToolCallResultUpdates, so the incremental secret scan never sees
+// them; maintenance must decline and let the debounced full recompute
+// rescan the affected call instead of stamping it current.
+func (inc *incrementalUpdate) hasResultSubagentLink() bool {
+	for _, link := range inc.links {
+		if link.HasResult && strings.TrimSpace(link.ResultContentRaw) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // sessionParseError is a per-session parse failure inside a shared
 // SQLite store (OpenCode, Zed, Kiro), where one file path fans out to
 // many sessions and a single bad payload must not fail the whole db.
@@ -12551,6 +12591,14 @@ func (e *Engine) recomputeSignalsFromDB(
 			"updating signals %s: %w", sessionID, err,
 		)
 	}
+	// Seed the compact incremental state so later deltas can fold. A
+	// failed seed is non-fatal: the next incremental write declines and
+	// this recompute reruns.
+	if err := e.seedSignalStateFromFull(sessionID, msgs); err != nil {
+		log.Printf(
+			"signals: seed state %s: %v", sessionID, err,
+		)
+	}
 	return heapBytes, nil
 }
 
@@ -13157,6 +13205,13 @@ func (e *Engine) writeBatchWithOutcome(
 			e.markStaleFailedMemberWrite(pw)
 			outcome.failedSessions++
 			continue
+		}
+		if replaceMessages {
+			if err := e.seedSignalStateFromFull(s.ID, msgs); err != nil {
+				log.Printf(
+					"signals: seed state %s: %v", s.ID, err,
+				)
+			}
 		}
 		if err := e.db.ReplaceSessionUsageEvents(
 			s.ID, e.usageEventsForWrite(s.ID, pw.usageEvents),
@@ -14121,6 +14176,17 @@ func (e *Engine) writeBatchBulkWithOutcome(
 			outcome.written[pendingIndex] = true
 			outcome.resolved[pendingIndex] = true
 		}
+		if writtenIndex >= 0 && writtenIndex < len(writes) {
+			if err := e.seedSignalStateFromFull(
+				writes[writtenIndex].Session.ID,
+				writes[writtenIndex].Messages,
+			); err != nil {
+				log.Printf(
+					"signals: seed state %s: %v",
+					writes[writtenIndex].Session.ID, err,
+				)
+			}
+		}
 	}
 	for _, id := range result.FailedIDs {
 		if pw, ok := pendingByID[id]; ok {
@@ -14765,7 +14831,25 @@ func (e *Engine) writeIncremental(
 		}
 	}
 
-	if err := e.db.WriteSessionIncremental(
+	signalsMaintained := false
+	var maintainer db.SignalMaintainer
+	if !inc.hasSubstantiveUserMessage() &&
+		!inc.hasCompactBoundary() &&
+		!inc.hasResultSubagentLink() {
+		preRev, err := e.db.TranscriptRevision(inc.sessionID)
+		if err == nil {
+			var preSecrets string
+			if preSecrets, err = e.db.SessionSecretsRulesVersion(
+				inc.sessionID,
+			); err == nil {
+				maintainer = e.newIncrementalSignalMaintainer(
+					inc, dbMsgs, toolCallResultUpdates,
+					preRev, preSecrets,
+				)
+			}
+		}
+	}
+	signalsMaintained, err := e.db.WriteSessionIncremental(
 		inc.sessionID,
 		dbMsgs,
 		db.IncrementalSessionUpdate{
@@ -14787,8 +14871,10 @@ func (e *Engine) writeIncremental(
 			Checkpoint:              inc.checkpoint,
 			CheckpointBlobs:         inc.checkpointBlobs,
 			BlockedResultCategories: e.blockedResultCategories,
+			SignalMaintainer:        maintainer,
 		},
-	); err != nil {
+	)
+	if err != nil {
 		return fmt.Errorf(
 			"incremental write %s: %w",
 			inc.sessionID, err,
@@ -14818,14 +14904,17 @@ func (e *Engine) writeIncremental(
 		)
 	}
 
-	// Signal/secret recompute costs O(session history), so it is
-	// debounced per session instead of running on every appended
-	// line: the first write after a quiet period recomputes
-	// inline, writes during a streaming burst coalesce into one
-	// recompute per interval plus a trailing flush. Recompute
-	// errors are logged inside recomputeSignalsFromDB and are
-	// non-fatal; a later write or flush retries.
-	e.signalSched.markDirty(inc.sessionID)
+	// Signal/secret maintenance normally ran inside the incremental write
+	// transaction. When the maintainer declined (user prompts, compact
+	// boundaries, stale state, out-of-window updates), fall back to the
+	// debounced full recompute: the first write after a quiet period
+	// recomputes inline, writes during a streaming burst coalesce into one
+	// recompute per interval plus a trailing flush. Recompute errors are
+	// logged inside recomputeSignalsFromDB and are non-fatal; a later
+	// write or flush retries.
+	if !signalsMaintained {
+		e.signalSched.markDirty(inc.sessionID)
+	}
 	if inc.providerStatHash != nil {
 		e.recordProviderStatHash(
 			context.Background(), *inc.providerStatHash,
@@ -14936,6 +15025,11 @@ func (e *Engine) writeSessionFullWithResolver(
 			s.ID, err,
 		)
 		return err
+	}
+	if err := e.seedSignalStateFromFull(s.ID, msgs); err != nil {
+		log.Printf(
+			"signals: seed state %s: %v", s.ID, err,
+		)
 	}
 	if err := e.db.ReplaceSessionUsageEvents(
 		s.ID, e.usageEventsForWrite(s.ID, pw.usageEvents),
