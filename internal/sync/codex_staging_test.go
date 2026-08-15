@@ -89,6 +89,80 @@ func TestStagedCodexParseOutcomeCopiesFingerprintHash(t *testing.T) {
 		"the staged path must persist the fingerprint hash the collecting path would")
 }
 
+func TestSyncSingleSessionStagedPublishesRealContent(t *testing.T) {
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122c11"
+	root := writeCodexParityRoot(t, uuid)
+	stagingDir := t.TempDir()
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		Machine:                  "local",
+		StagedCodexParseMinBytes: 1,
+		CodexStagingDir:          stagingDir,
+	})
+	t.Cleanup(engine.Close)
+	sessionID := "codex:" + uuid
+
+	require.NoError(t, engine.SyncSingleSession(sessionID))
+	msgs, err := database.GetAllMessages(
+		context.Background(), sessionID,
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, msgs)
+
+	found := false
+	for _, m := range msgs {
+		for _, tc := range m.ToolCalls {
+			if tc.ToolUseID != "call_a" || len(tc.ResultEvents) == 0 {
+				continue
+			}
+			found = true
+			require.NotContains(t, tc.ResultEvents[0].Content, "staged:",
+				"the single-session path must publish real output, "+
+					"not staged placeholders")
+			require.Contains(t, tc.ResultEvents[0].Content,
+				"build passed")
+		}
+	}
+	require.True(t, found, "call_a output must be stored")
+
+	entries, err := os.ReadDir(stagingDir)
+	require.NoError(t, err)
+	assert.Empty(t, entries,
+		"the single-session path must release its scratch file")
+}
+
+func TestParseDiffLargeCodexDoesNotStagePlaceholders(t *testing.T) {
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122c12"
+	root := writeCodexParityRoot(t, uuid)
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		Machine:                  "local",
+		StagedCodexParseMinBytes: 1,
+	})
+	t.Cleanup(engine.Close)
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+
+	diff := NewDiffEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(diff.Close)
+	report, err := diff.ParseDiff(t.Context(), ParseDiffOptions{
+		Agents: []parser.AgentType{parser.AgentCodex},
+	})
+	require.NoError(t, err)
+	require.Zero(t, report.Totals.Changed,
+		"parse-diff must compare real content, not staged placeholders")
+}
+
 // TestCodexStreamingParseParityWithLegacy drives one Codex transcript
 // through both the collecting parse (legacy full write) and the staging
 // parse (scratch-backed write), then compares the stored message, tool

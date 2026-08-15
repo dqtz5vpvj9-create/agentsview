@@ -9459,7 +9459,8 @@ func (e *Engine) processProviderFile(
 	var stagedSink *codexStagingSink
 	var stagedGCRelease func()
 	if file.Agent == parser.AgentCodex &&
-		sourceBytes > e.stagedCodexMin {
+		sourceBytes > e.stagedCodexMin &&
+		!e.forceParse {
 		stagedSink, err = newCodexStagingSink(
 			e.stagedCodexDir, e.blockedResultCategories,
 		)
@@ -15315,18 +15316,30 @@ func (e *Engine) writeSessionFullWithResolver(
 		log.Printf("upsert session %s: %v", s.ID, err)
 		return err
 	}
-	update, findings := computeSignalsAndSecrets(s, msgs)
-	if err := e.db.ReplaceSessionContent(s.ID, msgs, update, findings); err != nil {
-		log.Printf(
-			"replace messages for %s: %v",
-			s.ID, err,
-		)
-		return err
-	}
-	if err := e.seedSignalStateFromFull(s.ID, msgs); err != nil {
-		log.Printf(
-			"signals: seed state %s: %v", s.ID, err,
-		)
+	if pw.staged != nil {
+		if err := e.writeStagedFullParse(s, msgs, pw); err != nil {
+			log.Printf(
+				"write staged session %s: %v",
+				s.ID, err,
+			)
+			return err
+		}
+	} else {
+		update, findings := computeSignalsAndSecrets(s, msgs)
+		if err := e.db.ReplaceSessionContent(
+			s.ID, msgs, update, findings,
+		); err != nil {
+			log.Printf(
+				"replace messages for %s: %v",
+				s.ID, err,
+			)
+			return err
+		}
+		if err := e.seedSignalStateFromFull(s.ID, msgs); err != nil {
+			log.Printf(
+				"signals: seed state %s: %v", s.ID, err,
+			)
+		}
 	}
 	if err := e.db.ReplaceSessionUsageEvents(
 		s.ID, e.usageEventsForWrite(s.ID, pw.usageEvents),
@@ -16644,6 +16657,7 @@ func (e *Engine) processAndWriteSessionFile(
 	res := e.processFile(ctx, file)
 	defer e.retentionBudget().scavengeIfNeeded()
 	defer res.retentionLease.Release()
+	defer res.releaseStaged()
 	if res.err != nil {
 		if res.cacheSkip && res.mtime != 0 && !res.noCacheSkip {
 			e.cacheSkip(res.skipCacheKey(path), res.mtime, res.sourceFingerprint)
@@ -16833,6 +16847,9 @@ func (e *Engine) processAndWriteSessionFile(
 			checkpointAnchorDigest: pr.CheckpointAnchorDigest,
 			needsRetry:             sessionNeedsRetry || claudeDAG,
 			forceReplace:           res.forceReplace,
+		}
+		if i == 0 {
+			write.staged = res.staged
 		}
 		// The session upsert commits parser-derived parent provenance before
 		// the later content, usage, and completion stages. Queue the attempted
