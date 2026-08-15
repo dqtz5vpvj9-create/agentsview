@@ -179,6 +179,82 @@ func TestReplaceSessionContentStagedAttachLifecycle(t *testing.T) {
 		msgs[0].ToolCalls[0].ResultEvents[0].Content)
 }
 
+func TestReplaceSessionContentStagedWithCheckpointUsesPrefixedSessionID(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "staged-prefix.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+
+	const storedID = "host:codex:native"
+	require.NoError(t, database.UpsertSession(Session{
+		ID:               storedID,
+		Agent:            "codex",
+		Project:          "project",
+		Machine:          "local",
+		MessageCount:     1,
+		UserMessageCount: 1,
+	}))
+
+	staged := newScratchStagedResults(t)
+	staged.AddEvent(t, "call_1", "output")
+	msgs := []Message{{
+		SessionID:  storedID,
+		Ordinal:    0,
+		Role:       "assistant",
+		Content:    "running",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: storedID,
+			ToolUseID: "call_1",
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			CallIndex: 0,
+		}},
+	}}
+	cp := &ParserCheckpoint{
+		SessionID:        "codex:native",
+		Agent:            "codex",
+		FilePath:         "/sessions/rollout.jsonl",
+		FileInode:        1,
+		FileDevice:       1,
+		FileMTime:        1,
+		FileChangeTime:   1,
+		Offset:           8,
+		TailAnchorDigest: "anchor",
+		Hash:             "hash",
+		NextOrdinal:      0,
+		Version:          ParserCheckpointVersion,
+	}
+	blobs := &ParserCheckpointBlobs{
+		SessionID: "codex:native",
+		Cursor:    []byte("cursor"),
+		HashState: []byte("state"),
+	}
+
+	err = database.ReplaceSessionContentStagedWithCheckpoint(
+		context.Background(), storedID, msgs, staged,
+		map[string]bool{},
+		func(map[string]bool) (SessionSignalUpdate, []SecretFinding, error) {
+			return SessionSignalUpdate{}, nil, nil
+		},
+		cp, blobs,
+	)
+	require.NoError(t, err)
+
+	var nativeCount, prefixedCount int
+	require.NoError(t, database.Reader().QueryRow(
+		`SELECT COUNT(*) FROM parser_checkpoints WHERE session_id = ?`,
+		"codex:native",
+	).Scan(&nativeCount))
+	require.NoError(t, database.Reader().QueryRow(
+		`SELECT COUNT(*) FROM parser_checkpoints WHERE session_id = ?`,
+		storedID,
+	).Scan(&prefixedCount))
+	require.Zero(t, nativeCount,
+		"the checkpoint must not be stored under the parser-native id")
+	require.Equal(t, 1, prefixedCount,
+		"the checkpoint must be stored under the rewritten session id")
+}
+
 // TestReplaceSessionContentStagedRollbackDetaches pins the failure path:
 // an aborted publish must still detach the scratch schema so the next
 // publish on the same writer connection can attach again.

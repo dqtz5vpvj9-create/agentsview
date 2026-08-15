@@ -265,6 +265,7 @@ func (s *codexStagingSink) Path() string {
 func stagedCodexParseOutcome(
 	cfg parser.ProviderConfig,
 	source parser.SourceRef,
+	fingerprint parser.SourceFingerprint,
 	sink *codexStagingSink,
 ) (parser.ParseOutcome, error) {
 	sess, msgs, cursor, hashState, anchorDigest, retryReason, err :=
@@ -274,6 +275,15 @@ func stagedCodexParseOutcome(
 	}
 	if stageErr := sink.Err(); stageErr != nil {
 		return parser.ParseOutcome{}, stageErr
+	}
+	// The collecting provider copies the fingerprint hash onto the parsed
+	// session; the streaming entry point has no fingerprint parameter, so
+	// mirror that here. A staged full parse with a precomputed fingerprint
+	// must persist the same file_hash the collecting path would, or the
+	// checkpoint's hash and the stored file_hash disagree and every later
+	// validation forces another full parse.
+	if fingerprint.Hash != "" {
+		sess.File.Hash = fingerprint.Hash
 	}
 	// Return the parse phase's transient arenas before the publish builds
 	// its own transient working set, so the process RSS high-water mark

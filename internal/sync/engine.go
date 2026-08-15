@@ -9488,7 +9488,7 @@ func (e *Engine) processProviderFile(
 				Machine:      machine,
 				PathRewriter: e.pathRewriter,
 			},
-			source, stagedSink,
+			source, fingerprint, stagedSink,
 		)
 	} else {
 		outcome, err = provider.Parse(ctx, parser.ParseRequest{

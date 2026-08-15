@@ -328,7 +328,7 @@ func TestCodexStagedScratchFailureIsSticky(t *testing.T) {
 
 	// The outcome wrapper must surface the sticky error so the engine
 	// treats the parse as failed and keeps prior archive content.
-	_, err = stagedCodexParseOutcome(cfg, source, staged)
+	_, err = stagedCodexParseOutcome(cfg, source, parser.SourceFingerprint{}, staged)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "codex staging")
 }

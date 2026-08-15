@@ -180,6 +180,10 @@ func (db *DB) replaceSessionContentStaged(
 	if cp != nil {
 		c := *cp
 		b := *blobs
+		// The checkpoint row is keyed by session id just like the blobs;
+		// an idPrefix-rewritten publish must not strand the row under the
+		// parser-native id or collide with a local session sharing it.
+		c.SessionID = sessionID
 		b.SessionID = sessionID
 		if err := upsertParserCheckpointTx(tx, c, b); err != nil {
 			return err

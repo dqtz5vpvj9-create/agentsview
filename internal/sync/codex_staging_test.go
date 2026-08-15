@@ -47,6 +47,48 @@ func TestDrainResultsReleasesStagedScratchAndGCGuard(t *testing.T) {
 		"draining must remove the staged scratch file")
 }
 
+func TestStagedCodexParseOutcomeCopiesFingerprintHash(t *testing.T) {
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122b04"
+	root := t.TempDir()
+	day := filepath.Join(root, "2024", "01", "01")
+	require.NoError(t, os.MkdirAll(day, 0o755))
+	path := filepath.Join(
+		day, "rollout-2024-01-01T10-00-00-"+uuid+".jsonl",
+	)
+	require.NoError(t, os.WriteFile(path, []byte(testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp", "user", "2024-01-01T10:00:00Z",
+		),
+		testjsonl.CodexMsgJSON("user", "hi", "2024-01-01T10:00:01Z"),
+	)), 0o644))
+
+	cfg := parser.ProviderConfig{Roots: []string{root}, Machine: "local"}
+	provider, ok := parser.NewProvider(parser.AgentCodex, cfg)
+	require.True(t, ok)
+	source, found, err := provider.FindSource(
+		context.Background(), parser.FindSourceRequest{
+			FullSessionID: "codex:" + uuid,
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, found)
+
+	staged, err := newCodexStagingSink("", map[string]bool{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = staged.Close() })
+
+	outcome, err := stagedCodexParseOutcome(
+		cfg, source,
+		parser.SourceFingerprint{Hash: "sha256:abc"},
+		staged,
+	)
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	assert.Equal(t, "sha256:abc",
+		outcome.Results[0].Result.Session.File.Hash,
+		"the staged path must persist the fingerprint hash the collecting path would")
+}
+
 // TestCodexStreamingParseParityWithLegacy drives one Codex transcript
 // through both the collecting parse (legacy full write) and the staging
 // parse (scratch-backed write), then compares the stored message, tool
