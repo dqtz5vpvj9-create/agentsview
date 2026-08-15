@@ -295,6 +295,12 @@ func codexCheckpointAnchorMatches(
 	return digest == cp.TailAnchorDigest, nil
 }
 
+// codexResumeHashFn is an overridable seam for tests that exercise the
+// post-parse reconstruction failure path. Production always resumes through
+// codexResumeHash; the checkpoint gate keeps using codexResumeHash directly
+// so a test can fail only the engine's later reconstruction.
+var codexResumeHashFn = codexResumeHash
+
 // codexResumeHash continues a persisted SHA-256 state over [offset, size) and
 // returns the new state plus the full-file digest.
 func codexResumeHash(

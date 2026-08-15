@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -351,6 +352,89 @@ func TestCodexCheckpointAuditRepairsPrefixRewriteBeforeAppend(t *testing.T) {
 	require.NotEmpty(t, after)
 	require.Contains(t, after[0].Content, "NEW-MARKER",
 		"the repaired prefix must replace the stale stored content")
+}
+
+func TestCodexIncrementalResumeHashFailureRetainsCheckpoint(t *testing.T) {
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122c13"
+	root := t.TempDir()
+	day := filepath.Join(root, "2024", "01", "01")
+	require.NoError(t, os.MkdirAll(day, 0o755))
+	path := filepath.Join(
+		day, "rollout-2024-01-01T10-00-00-"+uuid+".jsonl",
+	)
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp", "user", "2024-01-01T10:00:00Z",
+		),
+		testjsonl.CodexTurnContextJSON(
+			"gpt-5.4", "2024-01-01T10:00:01Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"user", "run the command", "2024-01-01T10:00:02Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"assistant", "running", "2024-01-01T10:00:03Z",
+		),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"exec_command", "call_x", nil, "2024-01-01T10:00:04Z",
+		),
+	)
+	require.NoError(t, os.WriteFile(path, []byte(initial), 0o644))
+	sessionID := "codex:" + uuid
+
+	database, err := db.Open(filepath.Join(t.TempDir(), "resume-fail.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+	before, ok, err := database.GetParserCheckpoint(sessionID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	oldOffset := before.Offset
+
+	appended := testjsonl.JoinJSONL(
+		testjsonl.CodexFunctionCallOutputJSON(
+			"call_x", "late output", "2024-01-01T10:00:13Z",
+		),
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(appended)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	orig := codexResumeHashFn
+	codexResumeHashFn = func(
+		string, int64, int64, []byte,
+	) ([]byte, string, error) {
+		return nil, "", errors.New("injected resume failure")
+	}
+	t.Cleanup(func() { codexResumeHashFn = orig })
+
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+	cp, ok, err := database.GetParserCheckpoint(sessionID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, oldOffset, cp.Offset,
+		"a failed reconstruction must not advance the checkpoint")
+
+	codexResumeHashFn = orig
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+	fixed, ok, err := database.GetParserCheckpoint(sessionID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Greater(t, fixed.Offset, oldOffset,
+		"the next sync must rebuild the checkpoint authoritatively")
+	storedHash, hasHash := database.GetFileHashByAgentPath(path, "codex")
+	require.True(t, hasHash)
+	require.Equal(t, storedHash, fixed.Hash)
 }
 
 // writeCodexParityRoot writes the standard parity transcript fixture.

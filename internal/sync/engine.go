@@ -11564,6 +11564,7 @@ func (e *Engine) tryIncrementalJSONL(
 	// the next sync.
 	newOffset := inc.FileSize + consumed
 	var incHash string
+	resumeOK := false
 	// Refresh the stored content fingerprint on the incremental path. Codex
 	// needs it for parse-diff's raced-skew detection; Claude needs it so
 	// providerSingleSessionFresh can compare the stored hash against the
@@ -11574,11 +11575,12 @@ func (e *Engine) tryIncrementalJSONL(
 		// not an unfinished partial tail at EOF. Resume the hash state
 		// through newOffset (the last complete record) rather than trusting
 		// the full-file hash computed by the checkpoint gate.
-		if state, hash, hashErr := codexResumeHash(
+		if state, hash, hashErr := codexResumeHashFn(
 			file.Path, inc.FileSize, newOffset, hashState,
 		); hashErr == nil {
 			incHash = hash
 			hashState = state
+			resumeOK = true
 		} else {
 			log.Printf(
 				"resuming codex hash for %s at %d: %v",
@@ -11596,7 +11598,12 @@ func (e *Engine) tryIncrementalJSONL(
 	// delta when this append was resumed from one.
 	var nextCheckpoint *db.ParserCheckpoint
 	var nextCheckpointBlobs *db.ParserCheckpointBlobs
-	if checkpoint != nil && len(cursor) > 0 && hashState != nil {
+	// Only persist the advanced checkpoint when the resumable hash state was
+	// proven to cover the new offset. On reconstruction failure the write
+	// keeps the previous checkpoint: its offset now disagrees with the
+	// committed file size, so the next gate rebuilds authoritatively instead
+	// of resuming from stale state at a newer offset and omitting bytes.
+	if checkpoint != nil && len(cursor) > 0 && hashState != nil && resumeOK {
 		cpNextOrdinal := inc.NextOrdinal
 		if len(newMsgs) > 0 {
 			cpNextOrdinal = nextParsedOrdinal(inc.NextOrdinal, newMsgs)
