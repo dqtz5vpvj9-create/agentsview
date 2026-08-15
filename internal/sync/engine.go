@@ -8881,6 +8881,14 @@ func (e *Engine) processProviderFile(
 				codexForceFullParse = true
 			}
 		}
+		// The periodic audit bypasses the checkpoint stat trust so every
+		// Codex source deep-verifies against its stored rows. The audit
+		// does not run under forceParse, so the freshness fast paths and
+		// the incremental append below would otherwise skip or tail-apply
+		// an unchanged source and never repair a rewritten prefix.
+		if e.checkpointAudit.Load() {
+			codexForceFullParse = true
+		}
 	}
 	verifiedCapture, verifiedMtime, verifiedFresh, verifiedStateOK :=
 		e.verifiedProviderSourceState(provider, source, file)

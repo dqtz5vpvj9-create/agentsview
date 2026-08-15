@@ -261,6 +261,31 @@ func TestCodexCheckpointInvalidRebuildsDespiteWarmGates(t *testing.T) {
 	require.Equal(t, storedHash, fixed.Hash)
 }
 
+func TestCodexCheckpointAuditDeepVerifiesDespiteWarmGates(t *testing.T) {
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122c09"
+	root := writeCodexParityRoot(t, uuid)
+
+	database, err := db.Open(filepath.Join(t.TempDir(), "audit-cp.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+	require.Zero(t, engine.SyncAll(t.Context(), nil).Synced,
+		"second pass must be a warm no-op")
+
+	engine.SetCheckpointAudit(true)
+	t.Cleanup(func() { engine.SetCheckpointAudit(false) })
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced,
+		"the audit must deep-verify instead of skipping on stat trust")
+}
+
 // writeCodexParityRoot writes the standard parity transcript fixture.
 // (The staged-path tests share this fixture; it lives here until the
 // staging layer lands and takes ownership.)
