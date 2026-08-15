@@ -4271,6 +4271,84 @@ func TestBackfillToolCallAgentStateTracksFirstAndLatest(t *testing.T) {
 		"backfill keeps the newest event index per agent")
 }
 
+func TestReplaceSessionContentDiffClearsStaleAgentState(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	msgs := func(content string, events []ToolResultEvent) []Message {
+		return []Message{{
+			SessionID:  "s1",
+			Ordinal:    0,
+			Role:       "assistant",
+			Content:    content,
+			HasToolUse: true,
+			ToolCalls: []ToolCall{{
+				SessionID:    "s1",
+				ToolName:     "exec_command",
+				Category:     "Bash",
+				ToolUseID:    "call_1",
+				ResultEvents: events,
+			}},
+		}}
+	}
+	first := msgs("running", []ToolResultEvent{
+		{
+			ToolUseID:     "call_1",
+			AgentID:       "a",
+			Source:        "function_call_output",
+			Content:       "a1",
+			ContentLength: 2,
+		},
+		{
+			ToolUseID:     "call_1",
+			AgentID:       "b",
+			Source:        "function_call_output",
+			Content:       "b1",
+			ContentLength: 2,
+		},
+	})
+	require.NoError(t, d.ReplaceSessionContent(
+		"s1", first, SessionSignalUpdate{}, nil,
+	))
+
+	var before int
+	require.NoError(t, d.Reader().QueryRow(
+		`SELECT COUNT(*) FROM tool_call_agent_state
+		 WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "call_1",
+	).Scan(&before))
+	require.Equal(t, 2, before)
+
+	second := msgs("done", []ToolResultEvent{{
+		ToolUseID:     "call_1",
+		AgentID:       "a",
+		Source:        "function_call_output",
+		Content:       "a2",
+		ContentLength: 2,
+	}})
+	require.NoError(t, d.ReplaceSessionContent(
+		"s1", second, SessionSignalUpdate{}, nil,
+	))
+
+	rows, err := d.Reader().Query(
+		`SELECT agent_id FROM tool_call_agent_state
+		 WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "call_1",
+	)
+	require.NoError(t, err)
+	agents := make(map[string]bool)
+	for rows.Next() {
+		var agent string
+		require.NoError(t, rows.Scan(&agent))
+		agents[agent] = true
+	}
+	require.NoError(t, rows.Err())
+	require.NoError(t, rows.Close())
+	require.Len(t, agents, 1,
+		"a removed agent must not survive the diff rewrite")
+	require.True(t, agents["a"], "the surviving agent must be rebuilt")
+}
+
 // claude_linear_parse round-trips through upsert and the incremental
 // lookup, stays NULL for legacy rows, and survives an upsert that
 // carries no verdict.
