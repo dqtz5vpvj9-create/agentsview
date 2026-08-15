@@ -148,16 +148,13 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 		}
 		modified[f.CallPos] = f
 
-		// Stored events for the call (post-update). When any event
-		// exists, the full compute scans events instead of the
-		// result_content summary, so the summary-derived findings must go
-		// and the stored events are scanned with their real indexes.
-		events, err := q.CallResultEvents(
-			ctx, fact.MessageOrdinal, fact.CallIndex,
-		)
-		if err != nil {
-			return nil, err
-		}
+		// Only the events this transaction inserted need scanning:
+		// previously stored events already carry findings, and rescanning
+		// the call's whole history makes repeated late outputs quadratic.
+		// When any event exists the full compute scans events instead of
+		// the result_content summary, so the summary-derived finding must
+		// go and the inserted events are scanned with their real indexes.
+		events := q.InsertedResultEvents(u.ToolUseID)
 		if len(events) == 0 {
 			continue
 		}

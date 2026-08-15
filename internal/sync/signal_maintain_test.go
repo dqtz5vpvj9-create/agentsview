@@ -19,10 +19,16 @@ import (
 // fakeSignalQuery is a minimal in-memory db.SignalQuery for maintainer
 // unit tests. It lets the maintainer run without a live transaction.
 type fakeSignalQuery struct {
-	sess     *db.Session
-	state    db.SessionSignalState
-	hasState bool
-	revision string
+	sess      *db.Session
+	state     db.SessionSignalState
+	hasState  bool
+	revision  string
+	callFacts []db.ToolCallSignalFact
+	// callEvents is the call's full stored history, returned by
+	// CallResultEvents. inserted maps a tool_use_id to the events this
+	// transaction inserted, returned by InsertedResultEvents.
+	callEvents []db.ToolResultEvent
+	inserted   map[string][]db.ToolResultEvent
 }
 
 func (f *fakeSignalQuery) Session(context.Context) (*db.Session, error) {
@@ -48,13 +54,19 @@ func (f *fakeSignalQuery) TrailingToolCalls(
 func (f *fakeSignalQuery) ToolCallsByUseID(
 	context.Context, []string,
 ) ([]db.ToolCallSignalFact, error) {
-	return nil, nil
+	return f.callFacts, nil
 }
 
 func (f *fakeSignalQuery) CallResultEvents(
 	context.Context, int, int,
 ) ([]db.ToolResultEvent, error) {
-	return nil, nil
+	return f.callEvents, nil
+}
+
+func (f *fakeSignalQuery) InsertedResultEvents(
+	toolUseID string,
+) []db.ToolResultEvent {
+	return f.inserted[toolUseID]
 }
 
 // newTestMaintainer builds a maintainer stamped with the current quality
@@ -169,6 +181,85 @@ func TestIncrementalMaintainerProceedsCurrentVersions(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, delta,
 		"current versions with a matching revision must proceed")
+}
+
+func TestIncrementalMaintainerScansOnlyInsertedResultEvents(t *testing.T) {
+	const newContent = "new AKIA7QHWN2DKR4FYPLJM"
+	const oldContent = "old output that must not be rescanned"
+
+	m := newTestMaintainer("rev", secrets.DefiniteRulesVersion(), nil)
+	m.resultUpdates = []db.ToolCallResultUpdate{{
+		ToolUseID: "call_0",
+	}}
+	state := signals.SeedIncrementalState(
+		[]signals.ToolCallRow{{
+			ToolName:       "exec_command",
+			Category:       "Bash",
+			InputJSON:      "{}",
+			ResultContent:  oldContent,
+			MessageOrdinal: 0,
+			CallIndex:      0,
+			EventStatus:    "completed",
+		}},
+		nil, "", "", nil, nil, 0, 0,
+	)
+	blob, err := state.MarshalBinary()
+	require.NoError(t, err)
+	q := &fakeSignalQuery{
+		sess: &db.Session{
+			QualitySignalVersion: db.CurrentQualitySignalVersion,
+		},
+		state: db.SessionSignalState{
+			State:              blob,
+			TranscriptRevision: "rev",
+			SignalVersion:      db.CurrentQualitySignalVersion,
+		},
+		hasState: true,
+		revision: "rev",
+		callFacts: []db.ToolCallSignalFact{{
+			MessageOrdinal: 0,
+			CallIndex:      0,
+			ToolName:       "exec_command",
+			Category:       "Bash",
+			InputJSON:      "{}",
+			ResultContent:  newContent,
+			ToolUseID:      "call_0",
+			EventStatus:    "completed",
+		}},
+		callEvents: []db.ToolResultEvent{{
+			ToolUseID:     "call_0",
+			Source:        "function_call_output",
+			Content:       oldContent,
+			ContentLength: len(oldContent),
+			EventIndex:    0,
+		}},
+		inserted: map[string][]db.ToolResultEvent{
+			"call_0": {{
+				ToolUseID:     "call_0",
+				Source:        "function_call_output",
+				Content:       newContent,
+				ContentLength: len(newContent),
+				EventIndex:    1,
+			}},
+		},
+	}
+
+	scanBytesBefore := SecretScanBytes()
+	delta, err := m.MaintainTx(context.Background(), q)
+	require.NoError(t, err)
+	require.NotNil(t, delta)
+	scanned := SecretScanBytes() - scanBytesBefore
+	assert.LessOrEqual(t, scanned, int64(len(newContent)),
+		"the maintainer must scan only the newly inserted result events")
+
+	var newEventFindings int
+	for _, finding := range delta.InsertFindings {
+		if finding.EventIndex != nil && *finding.EventIndex == 1 {
+			newEventFindings++
+		}
+	}
+	assert.Equal(t, 1, newEventFindings,
+		"the inserted event's finding must land with its real index")
 }
 
 // TestIncrementalMaintainerCompactionExplicitBoundaryParity pins parity

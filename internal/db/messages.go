@@ -1394,8 +1394,9 @@ func (db *DB) WriteSessionIncremental(
 		}
 		transcriptChanged = transcriptChanged || changed
 	}
+	var insertedResultEvents map[string][]ToolResultEvent
 	for _, resultUpdate := range update.ToolCallResultUpdates {
-		changed, err := applyToolCallResultUpdateTx(
+		changed, inserted, err := applyToolCallResultUpdateTx(
 			tx, sessionID, resultUpdate,
 			update.BlockedResultCategories,
 		)
@@ -1403,6 +1404,15 @@ func (db *DB) WriteSessionIncremental(
 			return false, err
 		}
 		transcriptChanged = transcriptChanged || changed
+		if len(inserted) > 0 {
+			if insertedResultEvents == nil {
+				insertedResultEvents = make(map[string][]ToolResultEvent)
+			}
+			key := strings.TrimSpace(resultUpdate.ToolUseID)
+			insertedResultEvents[key] = append(
+				insertedResultEvents[key], inserted...,
+			)
+		}
 	}
 	if transcriptChanged {
 		if err := bumpTranscriptRevisionTx(tx, sessionID); err != nil {
@@ -1425,7 +1435,11 @@ func (db *DB) WriteSessionIncremental(
 	signalsMaintained := false
 	if update.SignalMaintainer != nil {
 		delta, err := update.SignalMaintainer.MaintainTx(
-			context.Background(), signalTxQuery{tx: tx, sessionID: sessionID},
+			context.Background(), signalTxQuery{
+				tx:                   tx,
+				sessionID:            sessionID,
+				insertedResultEvents: insertedResultEvents,
+			},
 		)
 		if err != nil {
 			return false, err
@@ -2917,9 +2931,9 @@ func applyToolCallSubagentLinkTx(
 func applyToolCallResultUpdateTx(
 	tx *sql.Tx, sessionID string, update ToolCallResultUpdate,
 	blockedResultCategories map[string]bool,
-) (bool, error) {
+) (bool, []ToolResultEvent, error) {
 	if strings.TrimSpace(update.ToolUseID) == "" || len(update.Events) == 0 {
-		return false, nil
+		return false, nil, nil
 	}
 
 	var messageOrdinal, callIndex int
@@ -2932,9 +2946,9 @@ func applyToolCallResultUpdateTx(
 		sessionID, update.ToolUseID,
 	).Scan(&messageOrdinal, &callIndex, &category); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
+			return false, nil, nil
 		}
-		return false, fmt.Errorf(
+		return false, nil, fmt.Errorf(
 			"checking tool result target for %s/%s: %w",
 			sessionID, update.ToolUseID, err,
 		)
@@ -2953,7 +2967,7 @@ func applyToolCallResultUpdateTx(
 		sessionID, update.ToolUseID,
 	).Scan(&stateExists)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return false, fmt.Errorf(
+		return false, nil, fmt.Errorf(
 			"checking agent state for %s/%s: %w",
 			sessionID, update.ToolUseID, err,
 		)
@@ -2962,7 +2976,7 @@ func applyToolCallResultUpdateTx(
 		if err := backfillToolCallAgentStateTx(
 			tx, sessionID, update.ToolUseID, messageOrdinal, callIndex,
 		); err != nil {
-			return false, err
+			return false, nil, err
 		}
 	}
 	var nextEventIndex int
@@ -2973,7 +2987,7 @@ func applyToolCallResultUpdateTx(
 		   AND call_index = ?`,
 		sessionID, messageOrdinal, callIndex,
 	).Scan(&nextEventIndex); err != nil {
-		return false, fmt.Errorf(
+		return false, nil, fmt.Errorf(
 			"reading next event index for %s/%s: %w",
 			sessionID, update.ToolUseID, err,
 		)
@@ -2994,6 +3008,7 @@ func applyToolCallResultUpdateTx(
 
 	blocked := blockedResultCategories[category]
 	insertRows := make([]toolResultEventRow, 0, len(incoming))
+	var inserted []ToolResultEvent
 	for _, candidate := range incoming {
 		stored := candidate
 		if blocked {
@@ -3018,13 +3033,14 @@ func applyToolCallResultUpdateTx(
 			continue // equivalent event already stored
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
-			return false, fmt.Errorf(
+			return false, nil, fmt.Errorf(
 				"checking tool result equivalence for %s/%s: %w",
 				sessionID, update.ToolUseID, err,
 			)
 		}
 		stored.EventIndex = nextEventIndex
 		nextEventIndex++
+		inserted = append(inserted, stored)
 		insertRows = append(insertRows, toolResultEventRow{
 			SessionID:      sessionID,
 			MessageOrdinal: messageOrdinal,
@@ -3033,23 +3049,23 @@ func applyToolCallResultUpdateTx(
 		})
 	}
 	if len(insertRows) == 0 {
-		return false, nil
+		return false, nil, nil
 	}
 	if err := insertToolResultEventsTx(tx, insertRows); err != nil {
-		return false, err
+		return false, nil, err
 	}
 
 	summary, err := summarizeToolCallFromStateTx(
 		tx, sessionID, update.ToolUseID,
 	)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	resultLength, err := summarizeToolCallLengthFromStateTx(
 		tx, sessionID, update.ToolUseID,
 	)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	storedSummary := summary
 	if blocked {
@@ -3061,12 +3077,12 @@ func applyToolCallResultUpdateTx(
 		 WHERE session_id = ? AND tool_use_id = ?`,
 		resultLength, storedSummary, sessionID, update.ToolUseID,
 	); err != nil {
-		return false, fmt.Errorf(
+		return false, nil, fmt.Errorf(
 			"updating tool result summary for %s/%s: %w",
 			sessionID, update.ToolUseID, err,
 		)
 	}
-	return true, nil
+	return true, inserted, nil
 }
 
 func hasEquivalentToolResultEvent(

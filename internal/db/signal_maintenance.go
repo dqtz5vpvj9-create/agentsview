@@ -87,13 +87,20 @@ type SignalQuery interface {
 	CallResultEvents(
 		ctx context.Context, messageOrdinal, callIndex int,
 	) ([]ToolResultEvent, error)
+	// InsertedResultEvents returns only the result events this
+	// transaction just inserted for the named call, with their assigned
+	// event indexes. Late-result maintenance must scan exactly these rows:
+	// previously stored events already carry findings, and rescanning the
+	// call's whole history makes repeated updates quadratic.
+	InsertedResultEvents(toolUseID string) []ToolResultEvent
 }
 
 // signalTxQuery implements SignalQuery over the incremental write
 // transaction.
 type signalTxQuery struct {
-	tx        *sql.Tx
-	sessionID string
+	tx                   *sql.Tx
+	sessionID            string
+	insertedResultEvents map[string][]ToolResultEvent
 }
 
 func (q signalTxQuery) Session(
@@ -346,6 +353,14 @@ func (q signalTxQuery) CallResultEvents(
 		events = append(events, ev)
 	}
 	return events, rows.Err()
+}
+
+// InsertedResultEvents returns the result events this transaction inserted
+// for one call, keyed by the call's tool_use_id.
+func (q signalTxQuery) InsertedResultEvents(
+	toolUseID string,
+) []ToolResultEvent {
+	return q.insertedResultEvents[toolUseID]
 }
 
 // TranscriptRevision returns a session's stored transcript revision. The
