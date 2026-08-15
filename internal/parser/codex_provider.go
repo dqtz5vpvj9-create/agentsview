@@ -269,8 +269,7 @@ func (p *codexProvider) Parse(
 		EvictCodexSessionIndexForSession(path)
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
-	parentID, parentResolved := p.codexParentResolution(path)
-	sess, msgs, cursor, safe, hashState, anchorDigest, err :=
+	sess, msgs, cursor, safe, hashState, anchorDigest, retryReason, err :=
 		p.parseSessionWithCursor(path, machine, false)
 	if err != nil {
 		return ParseOutcome{}, err
@@ -306,9 +305,9 @@ func (p *codexProvider) Parse(
 		},
 		DataVersion: DataVersionCurrent,
 	}
-	if parentID != "" && !parentResolved {
+	if retryReason != "" {
 		result.DataVersion = DataVersionNeedsRetry
-		result.RetryReason = "codex parent turns unresolved for " + parentID
+		result.RetryReason = retryReason
 	}
 	return ParseOutcome{
 		Results:           []ParseResultOutcome{result},
