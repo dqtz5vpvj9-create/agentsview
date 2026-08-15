@@ -58,40 +58,6 @@ type codexCheckpointResult struct {
 	hashState []byte
 }
 
-// codexCheckpointNeedsBootstrap reports whether an already-archived
-// Codex-format session lacks a usable checkpoint. The engine checks this
-// before any generic freshness shortcut: those shortcuts can prove that the
-// stored projection is current, but they cannot create the continuation state
-// needed for zero-read no-op syncs and bounded append resumes.
-func (e *Engine) codexCheckpointNeedsBootstrap(
-	source parser.SourceRef,
-	file parser.DiscoveredFile,
-) (bool, error) {
-	if !isCodexFormatAgent(file.Agent) ||
-		e.forceParse || file.ForceParse || e.checkpointAudit.Load() {
-		return false, nil
-	}
-	path := providerDiscoveredPath(source)
-	if path == "" {
-		return false, nil
-	}
-	lookupPath := path
-	if e.pathRewriter != nil {
-		lookupPath = e.pathRewriter(path)
-	}
-	inc, ok := e.db.GetSessionForIncremental(
-		lookupPath, string(file.Agent),
-	)
-	if !ok {
-		return false, nil
-	}
-	cp, hasCP, err := e.db.GetParserCheckpoint(inc.ID)
-	if err != nil {
-		return false, err
-	}
-	return !hasCP || cp.Version != codexCheckpointVersion, nil
-}
-
 // codexCheckpointFingerprint tries to resolve a Codex source fingerprint and
 // its persisted checkpoint without reading the transcript prefix:
 //

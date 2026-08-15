@@ -155,6 +155,112 @@ func TestCodexCheckpointBootstrapForUpgradedArchive(t *testing.T) {
 	}
 }
 
+func TestCodexCheckpointBootstrapIgnoresMatchingSkipEntry(t *testing.T) {
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122c07"
+	root := writeCodexParityRoot(t, uuid)
+	sessionID := "codex:" + uuid
+
+	database, err := db.Open(filepath.Join(t.TempDir(), "bootstrap-skip.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+	require.NoError(t, database.DeleteParserCheckpoint(sessionID))
+
+	// Plant the exact skip-cache entry a warm process would carry; the
+	// bootstrap decision must win over the cache short-circuit.
+	path := filepath.Join(
+		root, "2024", "01", "01",
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl",
+	)
+	cfg := parser.ProviderConfig{Roots: []string{root}, Machine: "local"}
+	provider, ok := parser.NewProvider(parser.AgentCodex, cfg)
+	require.True(t, ok)
+	source, found, err := provider.FindSource(
+		context.Background(), parser.FindSourceRequest{
+			FullSessionID: sessionID,
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, found)
+	fingerprint, err := provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+	file := parser.DiscoveredFile{
+		Path:            path,
+		Agent:           parser.AgentCodex,
+		ProviderSource:  &source,
+		ProviderProcess: true,
+	}
+	cacheKey := providerProcessCacheKey(
+		file, source, fingerprint, provider.Capabilities().Sync,
+	)
+	engine.InjectSkipCache(map[string]int64{
+		cacheKey: fingerprint.MTimeNS,
+	})
+
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced,
+		"the bootstrap must not be swallowed by a matching skip entry")
+	cp, ok, err := database.GetParserCheckpoint(sessionID)
+	require.NoError(t, err)
+	require.True(t, ok, "the bootstrap must recreate the checkpoint")
+	require.Equal(t, codexCheckpointVersion, cp.Version)
+}
+
+func TestCodexCheckpointInvalidRebuildsDespiteWarmGates(t *testing.T) {
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122c08"
+	root := writeCodexParityRoot(t, uuid)
+	sessionID := "codex:" + uuid
+	path := filepath.Join(
+		root, "2024", "01", "01",
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl",
+	)
+
+	database, err := db.Open(filepath.Join(t.TempDir(), "invalid-cp.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+	require.Zero(t, engine.SyncAll(t.Context(), nil).Synced,
+		"second pass must be a warm no-op")
+
+	cp, ok, err := database.GetParserCheckpoint(sessionID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	blobs, hasBlobs, err := database.GetParserCheckpointBlobs(sessionID)
+	require.NoError(t, err)
+	require.True(t, hasBlobs)
+	corrupted := *cp
+	corrupted.Hash = "corrupted-proof"
+	require.NoError(t, database.UpsertParserCheckpoint(corrupted, blobs))
+
+	// An unchanged source whose checkpoint proof no longer matches the
+	// archive must take an authoritative rebuild; the stat-digest and
+	// verified-source fast paths must not skip it.
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+	fixed, ok, err := database.GetParserCheckpoint(sessionID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NotEqual(t, "corrupted-proof", fixed.Hash,
+		"the rebuild must repair the checkpoint proof")
+	storedHash, hasHash := database.GetFileHashByAgentPath(path, "codex")
+	require.True(t, hasHash)
+	require.Equal(t, storedHash, fixed.Hash)
+}
+
 // writeCodexParityRoot writes the standard parity transcript fixture.
 // (The staged-path tests share this fixture; it lives here until the
 // staging layer lands and takes ownership.)

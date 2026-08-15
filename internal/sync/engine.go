@@ -8847,17 +8847,45 @@ func (e *Engine) processProviderFile(
 		source.ProjectHint = file.Project
 	}
 
-	needsCodexCheckpointBootstrap, err := e.codexCheckpointNeedsBootstrap(
-		source, file,
-	)
-	if err != nil {
-		return processResult{
-			err: fmt.Errorf("checking Codex checkpoint bootstrap: %w", err),
-		}, true
+	// Codex checkpoint decision: evaluate the persisted checkpoint before
+	// any freshness fast path. A stored Codex session whose checkpoint is
+	// missing (upgraded archive) or whose proof failed must take one
+	// authoritative full parse; the verified-source, stat-digest,
+	// single-session, watermark, and skip-cache gates must not swallow
+	// that rebuild. A proven-unchanged checkpoint likewise wins over the
+	// generic gates and returns the same confirmed-unchanged skip.
+	var fingerprint parser.SourceFingerprint
+	var codexCheckpoint *db.ParserCheckpoint
+	var codexSeed []byte
+	var codexFullHash string
+	var codexHashState []byte
+	codexForceFullParse := false
+	codexProvenUnchanged := false
+	var codexUnchangedMtime int64
+	if isCodexFormatAgent(file.Agent) {
+		cpResult, cpErr := e.codexCheckpointFingerprint(ctx, source, file)
+		if cpErr != nil {
+			log.Printf("codex checkpoint %s: %v", file.Path, cpErr)
+		} else {
+			switch cpResult.decision {
+			case codexCheckpointUnchanged:
+				codexProvenUnchanged = true
+				codexUnchangedMtime = cpResult.fingerprint.MTimeNS
+			case codexCheckpointAppend:
+				fingerprint = cpResult.fingerprint
+				codexCheckpoint = cpResult.checkpoint
+				codexSeed = cpResult.seed
+				codexFullHash = cpResult.fingerprint.Hash
+				codexHashState = cpResult.hashState
+			case codexCheckpointBootstrap, codexCheckpointInvalid:
+				codexForceFullParse = true
+			}
+		}
 	}
 	verifiedCapture, verifiedMtime, verifiedFresh, verifiedStateOK :=
 		e.verifiedProviderSourceState(provider, source, file)
-	if !needsCodexCheckpointBootstrap && verifiedStateOK && verifiedFresh {
+	if !codexForceFullParse && !codexProvenUnchanged &&
+		verifiedStateOK && verifiedFresh {
 		if e.verifiedProviderSourceFreshInDB(
 			verifiedCapture.key.agent, source,
 			verifiedCapture.signature.size, verifiedMtime,
@@ -8920,7 +8948,7 @@ func (e *Engine) processProviderFile(
 	// change -- including a same-size same-mtime in-place rewrite --
 	// bumps a ctime and breaks the digest, falling through to the
 	// content-verified gates.
-	if !needsCodexCheckpointBootstrap {
+	if !codexForceFullParse && !codexProvenUnchanged {
 		if freshMTime, fresh := e.providerSourceFreshBeforeFingerprint(
 			ctx, source, file, preParseStatHash,
 		); fresh {
@@ -8945,7 +8973,7 @@ func (e *Engine) processProviderFile(
 	// companion touch invalidated); without the stamp those rows would
 	// re-hash on every fresh process forever, since a skip never writes.
 	sourceForceReplace := false
-	if !needsCodexCheckpointBootstrap {
+	if !codexForceFullParse && !codexProvenUnchanged {
 		if mtime, fresh, forceReplace, contentVerified := e.providerSingleSessionFresh(
 			ctx, provider, source, file,
 		); fresh {
@@ -8978,69 +9006,38 @@ func (e *Engine) processProviderFile(
 	// did not change, so skip before Fingerprint pays the per-session child
 	// lookup; a child-only edit this cannot see is reconciled by the next
 	// full-discovery pass, whose digest comparison still catches it.
-	if freshMtime, fresh := e.watermarkOnlySQLiteSourceFresh(source, file); fresh {
+	if !codexForceFullParse && !codexProvenUnchanged {
+		if freshMtime, fresh := e.watermarkOnlySQLiteSourceFresh(
+			source, file,
+		); fresh {
+			return processResult{
+				skip:  true,
+				mtime: freshMtime,
+			}, true
+		}
+	}
+
+	// The checkpoint proved the committed transcript and the current stat
+	// snapshot agree. Persist that same snapshot so archives created before
+	// provider freshness digests do not re-enter the content-hash path after
+	// every restart; this also refreshes a digest after an unrelated
+	// session-index touch.
+	if codexProvenUnchanged {
+		if verifiedStateOK {
+			e.promoteVerifiedSource(verifiedCapture)
+		}
+		e.stampProviderStatHashForConfirmedSource(ctx, preParseStatHash)
 		return processResult{
-			skip:  true,
-			mtime: freshMtime,
+			skip:        true,
+			mtime:       codexUnchangedMtime,
+			noCacheSkip: true,
 		}, true
 	}
 
-	// Codex checkpoint gate: when a persisted checkpoint proves the source is
-	// unchanged (stat-trust) or safely append-only (tail anchor + resumable
-	// hash), resolve the fingerprint without hashing the transcript prefix.
-	// Anything the checkpoint cannot prove falls through to provider.Fingerprint.
-	var fingerprint parser.SourceFingerprint
-	var codexCheckpoint *db.ParserCheckpoint
-	var codexSeed []byte
-	var codexFullHash string
-	var codexHashState []byte
-	codexForceFullParse := false
 	// codexFingerprintFromParse marks a never-synced Codex-format source
 	// whose fingerprint is derived from the parser's single-pass hash
 	// state instead of a separate full-file fingerprint read.
 	codexFingerprintFromParse := false
-	if isCodexFormatAgent(file.Agent) {
-		cpResult, cpErr := e.codexCheckpointFingerprint(ctx, source, file)
-		if cpErr != nil {
-			log.Printf("codex checkpoint %s: %v", file.Path, cpErr)
-		} else {
-			switch cpResult.decision {
-			case codexCheckpointUnchanged:
-				if verifiedStateOK {
-					e.promoteVerifiedSource(verifiedCapture)
-				}
-				// The checkpoint proves the committed transcript and the
-				// current stat snapshot agree. Persist that same snapshot so
-				// archives created before provider freshness digests do not
-				// re-enter the content-hash path after every restart. This also
-				// refreshes a digest after an unrelated session-index touch.
-				e.stampProviderStatHashForConfirmedSource(
-					ctx, preParseStatHash,
-				)
-				return processResult{
-					skip:        true,
-					mtime:       cpResult.fingerprint.MTimeNS,
-					noCacheSkip: true,
-				}, true
-			case codexCheckpointAppend:
-				fingerprint = cpResult.fingerprint
-				codexCheckpoint = cpResult.checkpoint
-				codexSeed = cpResult.seed
-				codexFullHash = cpResult.fingerprint.Hash
-				codexHashState = cpResult.hashState
-			case codexCheckpointInvalid:
-				// The persisted checkpoint exists but cannot prove the
-				// committed prefix. Never append against it: rebuild the
-				// session authoritatively and replace stored rows.
-				codexForceFullParse = true
-			case codexCheckpointBootstrap:
-				// A stored Codex session without a usable checkpoint
-				// (upgraded archive) earns one authoritative full parse;
-				// the write commits content and checkpoint together.
-				codexForceFullParse = true
-			}
-		}
-	}
 	if codexCheckpoint == nil {
 		var err error
 		if isCodexFormatAgent(file.Agent) &&
@@ -9118,7 +9115,8 @@ func (e *Engine) processProviderFile(
 		file, source, fingerprint, providerSemantics,
 	)
 	cacheSkip := e.shouldCacheSkip(file)
-	if cacheSkip && !e.forceParse && !file.ForceParse {
+	if cacheSkip && !e.forceParse && !file.ForceParse &&
+		!codexForceFullParse {
 		e.skipMu.RLock()
 		cachedMtime, cached := e.skipCache[cacheKey]
 		e.skipMu.RUnlock()
