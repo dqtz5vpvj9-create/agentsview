@@ -1699,16 +1699,27 @@ func (p *codexProvider) parseSessionSnapshotWithCursor(
 	b.normalizeOrdinals()
 	seed := b.incrementalSeed()
 	inode, device := sourceFileIdentity(info)
+	changeTime, _ := codexIndexChangeTime(path, info)
 	safe := false
-	if safeCheck, safeErr := codexSafeResumeOffsetFile(f, info.Size()); safeErr == nil && safeCheck {
-		safe = true
-		p.cursorCache.Put(
-			path,
-			info.Size(),
-			inode,
-			device,
-			seed,
-		)
+	// A snapshot that ends while the fork replay gate is still active
+	// contains only replayed parent history so far. Persisting a cursor
+	// here would resume past session_meta with the gate dropped, and the
+	// remaining replayed parent records would be imported as child
+	// content. Refuse the checkpoint until a genuine child turn opens the
+	// gate; the file then reparses authoritatively and earns its cursor.
+	if !b.forkGate.active {
+		if safeCheck, safeErr := codexSafeResumeOffsetFile(
+			f, info.Size(),
+		); safeErr == nil && safeCheck {
+			safe = true
+			p.cursorCache.Put(
+				path,
+				info.Size(),
+				inode,
+				device,
+				seed,
+			)
+		}
 	}
 
 	sessionID := b.sessionID
@@ -1761,11 +1772,12 @@ func (p *codexProvider) parseSessionSnapshotWithCursor(
 		UserMessageCount:   userCount,
 		TerminationStatus:  classifyCodexTermination(b.lastTaskEvent),
 		File: FileInfo{
-			Path:   path,
-			Size:   info.Size(),
-			Mtime:  mtime,
-			Inode:  int64(inode),
-			Device: int64(device),
+			Path:       path,
+			Size:       info.Size(),
+			Mtime:      mtime,
+			Inode:      int64(inode),
+			Device:     int64(device),
+			ChangeTime: changeTime,
 		},
 	}
 

@@ -1137,6 +1137,10 @@ type FileInfo struct {
 	Inode  int64
 	Device int64
 	Hash   string
+	// ChangeTime is the change time captured from the same descriptor the
+	// parser read its snapshot from. Zero means the platform could not
+	// provide one; checkpoint consumers then rebuild conservatively.
+	ChangeTime int64
 }
 
 // ParsedSession holds session metadata extracted from a JSONL file.

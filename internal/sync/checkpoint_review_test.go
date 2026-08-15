@@ -130,6 +130,49 @@ func TestCodexCheckpointHashStateBoundedToCommittedOffset(t *testing.T) {
 		"a normal append resume must persist the real source hash")
 }
 
+func TestBuildCodexFullParseCheckpointUsesParseSnapshotIdentity(t *testing.T) {
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{Machine: "local"})
+	t.Cleanup(engine.Close)
+
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte("session\n"), 0o600))
+
+	h := sha256.New()
+	h.Write([]byte("parsed prefix"))
+	hashState, err := h.(encoding.BinaryMarshaler).MarshalBinary()
+	require.NoError(t, err)
+
+	pw := pendingWrite{
+		sess: parser.ParsedSession{
+			ID:    "codex:snapshot",
+			Agent: parser.AgentCodex,
+			File: parser.FileInfo{
+				Path:       path,
+				Size:       8,
+				Mtime:      111,
+				Inode:      222,
+				Device:     333,
+				ChangeTime: 444,
+			},
+			MessageCount: 2,
+		},
+		checkpoint:             []byte("cursor"),
+		checkpointHashState:    hashState,
+		checkpointAnchorDigest: "anchor",
+	}
+	cp, blobs, err := engine.buildCodexFullParseCheckpoint(path, pw)
+	require.NoError(t, err)
+	require.NotNil(t, cp)
+	require.NotNil(t, blobs)
+	require.Equal(t, uint64(222), cp.FileInode,
+		"identity must come from the parse snapshot, not a later stat")
+	require.Equal(t, uint64(333), cp.FileDevice)
+	require.Equal(t, int64(111), cp.FileMTime)
+	require.Equal(t, int64(444), cp.FileChangeTime)
+	require.Equal(t, int64(8), cp.Offset)
+}
+
 func TestCodexCheckpointTraeXLoadsPersistedCheckpoint(t *testing.T) {
 	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122d99"
 	root := t.TempDir()

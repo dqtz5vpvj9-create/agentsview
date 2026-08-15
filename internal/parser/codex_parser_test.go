@@ -1700,6 +1700,50 @@ func TestParseCodexSession_ForkedSessionSkipsReplayedHistory(t *testing.T) {
 	})
 }
 
+func TestParseCodexSessionWithCursorActiveForkGateNeverPersistsCheckpoint(
+	t *testing.T,
+) {
+	forkCreatedMs := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC).UnixMilli()
+	forkID := testUUIDv7(forkCreatedMs, 1)
+	parentID := testUUIDv7(forkCreatedMs-7200_000, 0)
+	parentTurnID := testUUIDv7(forkCreatedMs-3600_000, 2)
+	root := t.TempDir()
+	parent := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(parentID, "/tmp", "user", tsEarly),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", parentTurnID, tsEarly),
+	)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "rollout-2024-01-01T08-00-00-"+parentID+".jsonl"),
+		[]byte(parent), 0o600,
+	))
+
+	// The fork ends while the replay gate is still open: only the copied
+	// parent meta and a replayed parent turn have arrived so far. Such a
+	// snapshot must not persist a resume cursor, or a later append would
+	// import the remaining replayed parent records as child content.
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexForkedSessionMetaJSON(
+			forkID, parentID, "/tmp", "user", tsEarly,
+		),
+		testjsonl.CodexSessionMetaJSON(parentID, "/tmp", "user", tsEarly),
+		testjsonl.CodexTurnContextWithIDJSON(
+			"gpt-5.4", parentTurnID, tsEarly,
+		),
+	)
+	path := filepath.Join(
+		root, "rollout-2024-01-01T10-00-00-"+forkID+".jsonl",
+	)
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	_, _, _, safe, _, _, err := newCodexTestProvider(
+		t, root,
+	).parseSessionWithCursor(path, "local", false)
+	require.NoError(t, err)
+	assert.False(t, safe,
+		"a snapshot ending inside replayed parent history must not "+
+			"persist a checkpoint")
+}
+
 func TestParseCodexSession_ForkBoundaryTreatsTurnIDsAsOpaque(t *testing.T) {
 	t.Parallel()
 

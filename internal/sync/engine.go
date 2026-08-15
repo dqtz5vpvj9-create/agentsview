@@ -11601,13 +11601,17 @@ func (e *Engine) tryIncrementalJSONL(
 				"building codex checkpoint %s: %v", file.Path, anchorErr,
 			)
 		} else {
+			inode, device := getFileIdentity(file.Path, info)
+			changeTime, _ := fileChangeTime(file.Path, info)
 			built, blobs := buildCodexCheckpoint(
 				inc.ID,
 				string(agent),
 				e.effectiveSourcePath(file.Path),
-				info,
-				newOffset,
+				uint64(inode),
+				uint64(device),
 				incMtime,
+				changeTime,
+				newOffset,
 				cursor,
 				hashState,
 				incHash,

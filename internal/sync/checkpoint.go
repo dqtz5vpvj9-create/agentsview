@@ -387,28 +387,22 @@ func (e *Engine) buildCodexFullParseCheckpoint(
 		pw.checkpointAnchorDigest == "" {
 		return nil, nil, nil
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	mtime := info.ModTime().UnixNano()
-	if pw.sess.Agent == parser.AgentCodex {
-		mtime = parser.CodexEffectiveMtime(path, mtime)
-	}
 	hash, err := codexHashStateDigest(pw.checkpointHashState)
 	if err != nil {
 		return nil, nil, err
 	}
-	inode, device := getFileIdentity(path, info)
-	changeTime, _ := fileChangeTime(path, info)
+	// Identity comes from the parse snapshot, never from a later path
+	// stat: the cursor, hash state, and anchor describe the bytes the
+	// parser read, and pairing them with a fresher stat could bless a
+	// concurrent rewrite as the parsed content.
 	cp := &db.ParserCheckpoint{
 		SessionID:        pw.sess.ID,
 		Agent:            string(pw.sess.Agent),
 		FilePath:         e.effectiveSourcePath(path),
-		FileInode:        uint64(inode),
-		FileDevice:       uint64(device),
-		FileMTime:        mtime,
-		FileChangeTime:   changeTime,
+		FileInode:        uint64(pw.sess.File.Inode),
+		FileDevice:       uint64(pw.sess.File.Device),
+		FileMTime:        pw.sess.File.Mtime,
+		FileChangeTime:   pw.sess.File.ChangeTime,
 		Offset:           pw.sess.File.Size,
 		TailAnchorDigest: pw.checkpointAnchorDigest,
 		Hash:             hash,
@@ -453,10 +447,6 @@ func (e *Engine) persistFullParseCheckpoint(
 		log.Printf("checkpoint stat %s: %v", path, err)
 		return
 	}
-	mtime := info.ModTime().UnixNano()
-	if pw.sess.Agent == parser.AgentCodex {
-		mtime = parser.CodexEffectiveMtime(path, mtime)
-	}
 	lookupPath := path
 	if e.pathRewriter != nil {
 		lookupPath = e.pathRewriter(path)
@@ -492,9 +482,11 @@ func (e *Engine) persistFullParseCheckpoint(
 		inc.ID,
 		string(pw.sess.Agent),
 		e.effectiveSourcePath(path),
-		info,
+		uint64(pw.sess.File.Inode),
+		uint64(pw.sess.File.Device),
+		pw.sess.File.Mtime,
+		pw.sess.File.ChangeTime,
 		committed,
-		mtime,
 		pw.checkpoint,
 		pw.checkpointHashState,
 		committedHash,
@@ -513,17 +505,15 @@ func (e *Engine) persistFullParseCheckpoint(
 // read of the file tail (incremental path).
 func buildCodexCheckpoint(
 	sessionID, agent, storedPath string,
-	info os.FileInfo,
+	inode, device uint64,
+	mtime, changeTime int64,
 	newOffset int64,
-	mtime int64,
 	cursor []byte,
 	hashState []byte,
 	hash string,
 	nextOrdinal int,
 	anchorDigest string,
 ) (*db.ParserCheckpoint, db.ParserCheckpointBlobs) {
-	inode, device := getFileIdentity(storedPath, info)
-	changeTime, _ := fileChangeTime(storedPath, info)
 	return &db.ParserCheckpoint{
 			SessionID:        sessionID,
 			FileChangeTime:   changeTime,

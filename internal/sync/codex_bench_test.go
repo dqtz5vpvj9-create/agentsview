@@ -165,13 +165,17 @@ func runCodexCheckpointAppendReads(
 	if err != nil {
 		return outcome, err
 	}
+	inode, device := getFileIdentity(path, info)
+	changeTime, _ := fileChangeTime(path, info)
 	built, _ := buildCodexCheckpoint(
 		"codex:"+codexSyncBenchmarkUUID,
 		"codex",
 		path,
-		info,
-		cp.Offset+outcome.ConsumedBytes,
+		uint64(inode),
+		uint64(device),
 		info.ModTime().UnixNano(),
+		changeTime,
+		cp.Offset+outcome.ConsumedBytes,
 		outcome.NextCursor,
 		state,
 		hash,
