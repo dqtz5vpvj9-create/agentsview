@@ -1735,11 +1735,14 @@ func TestParseCodexSessionWithCursorActiveForkGateNeverPersistsCheckpoint(
 	)
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
 
-	_, _, _, safe, _, _, err := newCodexTestProvider(
-		t, root,
-	).parseSessionWithCursor(path, "local", false)
+	provider := newCodexTestProvider(t, root)
+	source := requireCodexProviderSource(t, provider, forkID)
+	outcome, err := provider.Parse(context.Background(), ParseRequest{
+		Source: source,
+	})
 	require.NoError(t, err)
-	assert.False(t, safe,
+	require.Len(t, outcome.Results, 1)
+	assert.Empty(t, outcome.Results[0].Result.Checkpoint,
 		"a snapshot ending inside replayed parent history must not "+
 			"persist a checkpoint")
 }
