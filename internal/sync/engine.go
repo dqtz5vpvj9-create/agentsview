@@ -8526,6 +8526,20 @@ func (inc *incrementalUpdate) hasCompactBoundary() bool {
 	return false
 }
 
+// hasResultSubagentLink reports whether the delta carries a subagent link
+// with result content. Linked results update tool_calls.result_content
+// outside ToolCallResultUpdates, so the incremental secret scan never sees
+// them; maintenance must decline and let the debounced full recompute
+// rescan the affected call instead of stamping it current.
+func (inc *incrementalUpdate) hasResultSubagentLink() bool {
+	for _, link := range inc.links {
+		if link.HasResult && strings.TrimSpace(link.ResultContentRaw) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // sessionParseError is a per-session parse failure inside a shared
 // SQLite store (OpenCode, Zed, Kiro), where one file path fans out to
 // many sessions and a single bad payload must not fail the whole db.
@@ -14819,7 +14833,9 @@ func (e *Engine) writeIncremental(
 
 	signalsMaintained := false
 	var maintainer db.SignalMaintainer
-	if !inc.hasSubstantiveUserMessage() && !inc.hasCompactBoundary() {
+	if !inc.hasSubstantiveUserMessage() &&
+		!inc.hasCompactBoundary() &&
+		!inc.hasResultSubagentLink() {
 		preRev, err := e.db.TranscriptRevision(inc.sessionID)
 		if err == nil {
 			var preSecrets string

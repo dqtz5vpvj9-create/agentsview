@@ -33,6 +33,78 @@ func openTestDB(t *testing.T) *db.DB {
 	return dbtest.OpenTestDB(t)
 }
 
+func TestIncrementalClaudeLateResultLinkScansDefiniteSecret(t *testing.T) {
+	const secret = "AKIA7QHWN2DKR4FYPLJM"
+	root := t.TempDir()
+	projectDir := filepath.Join(root, "proj-a")
+	require.NoError(t, os.MkdirAll(projectDir, 0o755))
+	path := filepath.Join(projectDir, "session.jsonl")
+	initial := testjsonl.JoinJSONL(
+		testjsonl.ClaudeUserJSON("hello", "2024-01-01T10:00:00Z"),
+		testjsonl.ClaudeAssistantJSON("hi", "2024-01-01T10:00:01Z"),
+		`{"type":"assistant","uuid":"a2","parentUuid":"a1",`+
+			`"timestamp":"2024-01-01T10:00:02Z",`+
+			`"message":{"id":"msg_tool","content":[{"type":"tool_use",`+
+			`"id":"toolu_r","name":"Bash","input":{"command":"ls"}}]}}`,
+	)
+	require.NoError(t, os.WriteFile(path, []byte(initial), 0o600))
+
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {root},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+	ids, err := database.ListSessionIDsByFilePath(path, "claude")
+	require.NoError(t, err)
+	require.Len(t, ids, 1)
+	sessionID := ids[0]
+
+	appended := `{"type":"user","timestamp":"2024-01-01T10:00:05Z",` +
+		`"uuid":"u2","parentUuid":"a2","message":{"content":[` +
+		`{"type":"tool_result","tool_use_id":"toolu_r",` +
+		`"content":"` + secret + `","is_error":false}]}}` + "\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	_, err = f.WriteString(appended)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+	sess, err := database.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.True(t, sess.LastWriteIncremental,
+		"the late result must take the incremental path")
+
+	var stored string
+	require.NoError(t, database.Reader().QueryRow(
+		`SELECT COALESCE(result_content, '') FROM tool_calls
+		 WHERE session_id = ? AND tool_use_id = ?`,
+		sessionID, "toolu_r",
+	).Scan(&stored))
+	require.Contains(t, stored, secret,
+		"the late link must update the stored result content")
+
+	findings, err := database.SessionSecretFindings(
+		t.Context(), sessionID,
+	)
+	require.NoError(t, err)
+	found := false
+	for _, finding := range findings {
+		if finding.LocationKind == "tool_result" &&
+			strings.Contains(finding.RedactedMatch, "AKIA") {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found,
+		"a definite secret in a late Claude result link must be reported")
+}
+
 func requireClassifyPaths(
 	t *testing.T, engine *Engine, paths []string,
 ) []parser.DiscoveredFile {

@@ -541,12 +541,21 @@ func (s *IncrementalState) FoldToolHealth(
 	}
 	next.PendingBoundaries = kept
 
-	// Runaway loop: window detector over the full tail with exit folding.
+	// Runaway loop: latch only windows that have fully exited the trailing
+	// facts window — their facts can no longer be changed by a late result.
+	// Windows still intersecting the trailing window are mutable and only
+	// contribute to the current output, so a later delta that heals them
+	// clears the signal exactly as an authoritative recompute would.
 	runaway := s.RunawayHistorical
+	currentRunaway := false
 	windowStart := max(0, s.TotalCalls-TrailingFactCount)
 	for i := windowStart; i+12 <= next.TotalCalls; i++ {
 		if windowAt(fullTail, windowStart, i) {
-			runaway = true
+			if i+12 <= next.TotalCalls-TrailingFactCount {
+				runaway = true
+			} else {
+				currentRunaway = true
+			}
 		}
 	}
 	next.RunawayHistorical = runaway
@@ -583,7 +592,7 @@ func (s *IncrementalState) FoldToolHealth(
 	next.ExactRunFailures = crossingState.failures
 
 	out.RunawayToolLoopCount = 0
-	if exactQualifies || runaway {
+	if exactQualifies || runaway || currentRunaway {
 		out.RunawayToolLoopCount = 1
 	}
 

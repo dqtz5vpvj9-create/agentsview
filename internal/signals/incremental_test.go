@@ -470,3 +470,87 @@ func TestIncrementalFoldMidTaskAcrossSeed(t *testing.T) {
 	assert.Equal(t, 1, got.MidTaskCompactions)
 	assert.Empty(t, next.PendingBoundaries)
 }
+
+func TestFoldToolHealthRunawayMutableWindowHeals(t *testing.T) {
+	calls := make([]ToolCallRow, 12)
+	for i := range calls {
+		calls[i] = ToolCallRow{
+			ToolName:       "exec_command",
+			Category:       "Bash",
+			InputJSON:      `{"command":"run"}`,
+			ResultContent:  "failed",
+			EventStatus:    "errored",
+			MessageOrdinal: i,
+			CallIndex:      0,
+		}
+	}
+	state := SeedIncrementalState(calls, nil, "", "", nil, nil, 0, 0)
+
+	pos := func(i int) CallPos {
+		return CallPos{MessageOrdinal: i, CallIndex: 0}
+	}
+	healthy := func(i int) ToolFact {
+		return ToolFact{
+			CallPos:        pos(i),
+			Failure:        false,
+			ExactSignature: ExactToolSignature(calls[i]),
+			CommandClass:   CommandClass(calls[i]),
+		}
+	}
+
+	// Heal one failure: the trailing window still qualifies, but it is a
+	// mutable window and must not latch.
+	next, out, ok := state.FoldToolHealth(
+		nil, map[CallPos]ToolFact{pos(0): healthy(0)}, ToolHealthRow{},
+	)
+	require.True(t, ok)
+	assert.Equal(t, 1, out.RunawayToolLoopCount)
+	assert.False(t, next.RunawayHistorical,
+		"a qualifying window inside the mutable trailing region must not latch")
+
+	// Heal all but one more failure: the window no longer qualifies, and
+	// the previously reported runaway must clear.
+	modified := make(map[CallPos]ToolFact)
+	for i := 1; i < 11; i++ {
+		modified[pos(i)] = healthy(i)
+	}
+	next, out, ok = next.FoldToolHealth(nil, modified, ToolHealthRow{})
+	require.True(t, ok)
+	assert.Equal(t, 0, out.RunawayToolLoopCount,
+		"a healed trailing window must clear the runaway signal")
+	assert.False(t, next.RunawayHistorical)
+}
+
+func TestFoldToolHealthRunawayHistoricalStaysLatched(t *testing.T) {
+	calls := make([]ToolCallRow, 47)
+	for i := range calls {
+		calls[i] = ToolCallRow{
+			ToolName:       "exec_command",
+			Category:       "Bash",
+			InputJSON:      `{"command":"run"}`,
+			ResultContent:  "failed",
+			EventStatus:    "errored",
+			MessageOrdinal: i,
+			CallIndex:      0,
+		}
+	}
+	state := SeedIncrementalState(calls, nil, "", "", nil, nil, 0, 0)
+	require.True(t, state.RunawayHistorical,
+		"the seeded archive already has a fully exited runaway window")
+
+	// Heal the entire trailing window: the mutable windows clear, but the
+	// window that exited the trailing region stays latched.
+	modified := make(map[CallPos]ToolFact)
+	for i := 35; i < 47; i++ {
+		modified[CallPos{MessageOrdinal: i, CallIndex: 0}] = ToolFact{
+			CallPos:        CallPos{MessageOrdinal: i, CallIndex: 0},
+			Failure:        false,
+			ExactSignature: ExactToolSignature(calls[i]),
+			CommandClass:   CommandClass(calls[i]),
+		}
+	}
+	next, _, ok := state.FoldToolHealth(nil, modified, ToolHealthRow{})
+	require.True(t, ok)
+	assert.True(t, next.RunawayHistorical,
+		"windows that fully exited the trailing window stay latched")
+}
