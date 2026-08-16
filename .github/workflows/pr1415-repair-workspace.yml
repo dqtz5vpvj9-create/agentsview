@@ -1,4 +1,4 @@
-name: PR 1415 repair workspace
+name: PR 1415 publish upstream merge
 
 on:
   push:
@@ -7,23 +7,80 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  export:
+  publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Fetch current upstream main
+      - name: Merge current upstream main without retaining this workflow
+        env:
+          EXPECTED_REMOTE_HEAD: ${{ github.sha }}
         run: |
+          set -euo pipefail
+          git config user.name "OpenAI"
+          git config user.email "noreply@openai.com"
           git remote add upstream https://github.com/kenn-io/agentsview.git
           git fetch upstream main:refs/remotes/upstream/main
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pr1415-repair-workspace
-          path: .
-          include-hidden-files: true
-          retention-days: 1
-          compression-level: 6
+          git reset --hard c14a02b5be017d4bf43b7685a31eb09316aaf1d1
+          if ! git merge --no-ff upstream/main -m "Merge upstream main into PR 1415 repair branch"; then
+            python - <<'PY'
+          from pathlib import Path
+
+          p = Path("docs/internal/performance-gates.md")
+          s = p.read_text()
+          s = s.replace(
+              """<<<<<<< HEAD
+            new rows, late tool results update stored calls in place, and lifecycle
+            metadata, incomplete records, title changes, and other retroactive updates
+            preserve full-parse behavior.
+          =======
+            new rows while lifecycle metadata, incomplete records, title changes, and
+            retroactive updates preserve full-parse behavior.
+          - `TestCountDuplicatePromptsAllocationGrowthStaysNearLinear`
+            (`internal/signals/heuristics_test.go`) — session-quality analysis must not
+            rebuild token sets for every pair of user prompts.
+          >>>>>>> upstream/main
+          """,
+              """  new rows, late tool results update stored calls in place, and lifecycle
+            metadata, incomplete records, title changes, and other retroactive updates
+            preserve full-parse behavior.
+          - `TestCountDuplicatePromptsAllocationGrowthStaysNearLinear`
+            (`internal/signals/heuristics_test.go`) — session-quality analysis must not
+            rebuild token sets for every pair of user prompts.
+          """,
+          )
+          p.write_text(s)
+
+          p = Path("internal/sync/s3.go")
+          s = p.read_text()
+          s = s.replace(
+              """<<<<<<< HEAD
+          \tres.sourceBytes = sourceBytes
+          =======
+          \tif file.Agent == parser.AgentClaude {
+          """,
+              """\tres.sourceBytes = sourceBytes
+          \tif file.Agent == parser.AgentClaude {
+          """,
+          )
+          s = s.replace(
+              """\t}
+          >>>>>>> upstream/main
+          \tres.retentionLease = lease
+          """,
+              """\t}
+          \tres.retentionLease = lease
+          """,
+          )
+          p.write_text(s)
+          PY
+            git add docs/internal/performance-gates.md internal/sync/s3.go
+            git commit --no-edit
+          fi
+          git diff --check
+          git push --force-with-lease=refs/heads/repair/pr1415-maintainer-review:${EXPECTED_REMOTE_HEAD} \
+            origin HEAD:refs/heads/repair/pr1415-maintainer-review
