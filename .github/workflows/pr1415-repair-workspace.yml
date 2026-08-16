@@ -1,4 +1,4 @@
-name: PR 1415 export current merge conflicts
+name: PR 1415 test checkpoint lifecycle repair
 
 on:
   push:
@@ -7,30 +7,119 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  export:
+  test-and-publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Reproduce merge against current upstream main
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Rebuild reviewed merge and apply checkpoint fix
+        env:
+          EXPECTED_REMOTE_HEAD: ${{ github.sha }}
         run: |
-          set -u
+          set -euo pipefail
           git config user.name "OpenAI"
           git config user.email "noreply@openai.com"
           git remote add upstream https://github.com/kenn-io/agentsview.git
-          git fetch upstream main:refs/remotes/upstream/main
+          git fetch upstream 866f7b69d484abe04decca69f202fb8e9df07a04
           git reset --hard c14a02b5be017d4bf43b7685a31eb09316aaf1d1
-          git merge --no-ff upstream/main -m "Merge upstream main into PR 1415 repair branch" || true
-          git status --short > /tmp/merge-status.txt
-          cp /tmp/merge-status.txt .pr1415-merge-status.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pr1415-current-merge-conflicts
-          path: .
-          include-hidden-files: true
-          retention-days: 1
-          compression-level: 6
+          git merge --no-ff 866f7b69d484abe04decca69f202fb8e9df07a04 \
+            -m "Merge upstream main into PR 1415 repair branch" || true
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_conflicts(path, resolver):
+              p = Path(path)
+              text = p.read_text()
+              out = []
+              pos = 0
+              index = 0
+              while True:
+                  start = text.find("<<<<<<< HEAD\n", pos)
+                  if start < 0:
+                      out.append(text[pos:])
+                      break
+                  middle = text.find("=======\n", start)
+                  end = text.find(">>>>>>> upstream/main\n", middle)
+                  if middle < 0 or end < 0:
+                      raise RuntimeError(f"malformed conflict in {path}")
+                  out.append(text[pos:start])
+                  ours = text[start + len("<<<<<<< HEAD\n"):middle]
+                  theirs = text[middle + len("=======\n"):end]
+                  out.append(resolver(index, ours, theirs))
+                  pos = end + len(">>>>>>> upstream/main\n")
+                  index += 1
+              p.write_text("".join(out))
+
+          replace_conflicts(
+              "docs/internal/performance-gates.md",
+              lambda index, ours, theirs: ours + (
+                  "- `TestCountDuplicatePromptsAllocationGrowthStaysNearLinear`\n"
+                  "  (`internal/signals/heuristics_test.go`) — session-quality analysis must not\n"
+                  "  rebuild token sets for every pair of user prompts.\n"
+              ),
+          )
+
+          replace_conflicts(
+              "internal/sync/s3.go",
+              lambda index, ours, theirs: ours + theirs,
+          )
+
+          def resolve_engine(index, ours, theirs):
+              if index == 0:
+                  return ours.replace(
+                      "\t\t\tif file.ForceParse &&\n",
+                      "\t\t\tif (file.ForceParse || file.ForceFullParse) &&\n",
+                  )
+              if index == 1:
+                  return (
+                      "\tif cacheSkip && !e.forceParseBypassesCache(file) &&\n"
+                      "\t\t!codexForceFullParse && !codexAuditDeepVerify {\n"
+                  )
+              if index == 2:
+                  ours = ours.replace(
+                      "\t// the transcript size. Small files keep the collecting path.\n",
+                      "\t// the transcript size. Small files keep the collecting path. Parse-diff\n"
+                      "\t// uses e.forceParse and must keep the collecting representation so its\n"
+                      "\t// comparison never observes staged placeholders.\n",
+                  )
+                  ours = ours.replace(
+                      "\t\tif e.forceParse || file.ForceParse {\n",
+                      "\t\tif e.forceParseRequested(file) {\n",
+                  )
+                  ours = ours.replace(
+                      "\t\t\tForceParse:  e.forceParse || file.ForceParse,\n",
+                      "\t\t\tForceParse:  e.forceParseRequested(file),\n",
+                  )
+                  return ours
+              raise RuntimeError(f"unexpected engine conflict {index}")
+
+          replace_conflicts("internal/sync/engine.go", resolve_engine)
+          PY
+          git add docs/internal/performance-gates.md internal/sync/engine.go internal/sync/s3.go
+          test -z "$(git diff --name-only --diff-filter=U)"
+          git commit --no-edit
+          test "$(git rev-parse 'HEAD^{tree}')" = \
+            404fdc2a1238ffb7d410b0a03e82dd185fe59e93
+          cat > /tmp/checkpoint.patch.gz.b64 <<'PATCH'
+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
+PATCH
+          base64 -d /tmp/checkpoint.patch.gz.b64 | gzip -d > /tmp/checkpoint.patch
+          git am /tmp/checkpoint.patch
+          git diff --check
+      - name: Run focused Go tests
+        run: |
+          go test ./internal/db ./internal/parser ./internal/sync
+      - name: Publish tested repair branch
+        env:
+          EXPECTED_REMOTE_HEAD: ${{ github.sha }}
+        run: |
+          git push --force-with-lease=refs/heads/repair/pr1415-maintainer-review:${EXPECTED_REMOTE_HEAD} \
+            origin HEAD:refs/heads/repair/pr1415-maintainer-review
