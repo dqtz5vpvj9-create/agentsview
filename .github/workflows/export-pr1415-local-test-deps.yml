@@ -12,6 +12,9 @@ permissions:
 jobs:
   export:
     runs-on: ubuntu-latest
+    env:
+      GOMODCACHE: /tmp/pr1415-gomodcache
+      GOCACHE: /tmp/pr1415-gocache
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v6
@@ -22,6 +25,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/pr1415-local-test-deps/internal/pricing/snapshot
+          mkdir -p "$GOMODCACHE" "$GOCACHE"
           GOROOT=$(go env GOROOT)
           tar -C "$GOROOT" -czf /tmp/pr1415-local-test-deps/go1.26.6-linux-amd64.tar.gz .
           curl -fL \
@@ -31,10 +35,8 @@ jobs:
           go mod download
           make sqlite-vec-header
           cp .sqlite-include/sqlite3.h /tmp/pr1415-local-test-deps/sqlite3.h
-          GOMODCACHE=$(go env GOMODCACHE)
-          tar -C "$(dirname "$GOMODCACHE")" -czf /tmp/pr1415-local-test-deps/gomodcache.tar.gz "$(basename "$GOMODCACHE")"
+          tar -C /tmp -czf /tmp/pr1415-local-test-deps/gomodcache.tar.gz pr1415-gomodcache
           go version
-          sha256sum /tmp/pr1415-local-test-deps/go1.26.6-linux-amd64.tar.gz
           du -h /tmp/pr1415-local-test-deps/gomodcache.tar.gz
       - uses: actions/upload-artifact@v4
         with:
