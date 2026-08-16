@@ -22,7 +22,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/pr1415-local-test-deps/internal/pricing/snapshot
-          mkdir -p /tmp/pr1415-local-test-deps/.sqlite-include
           GOROOT=$(go env GOROOT)
           tar -C "$GOROOT" -czf /tmp/pr1415-local-test-deps/go1.26.6-linux-amd64.tar.gz .
           curl -fL \
@@ -30,7 +29,7 @@ jobs:
             -o /tmp/pr1415-local-test-deps/internal/pricing/snapshot/litellm_snapshot.json.gz
           echo '0e89b636ccf858edbf95a3f6188476b6eab6cf21f66d16a65c2184229ef81cbe  /tmp/pr1415-local-test-deps/internal/pricing/snapshot/litellm_snapshot.json.gz' | sha256sum -c -
           make sqlite-vec-header
-          cp .sqlite-include/sqlite3.h /tmp/pr1415-local-test-deps/.sqlite-include/sqlite3.h
+          cp .sqlite-include/sqlite3.h /tmp/pr1415-local-test-deps/sqlite3.h
           go version
           sha256sum /tmp/pr1415-local-test-deps/go1.26.6-linux-amd64.tar.gz
       - uses: actions/upload-artifact@v4
