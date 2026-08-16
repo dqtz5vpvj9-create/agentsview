@@ -1,0 +1,29 @@
+name: PR 1415 repair workspace
+
+on:
+  push:
+    branches:
+      - repair/pr1415-maintainer-review
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch current upstream main
+        run: |
+          git remote add upstream https://github.com/kenn-io/agentsview.git
+          git fetch upstream main:refs/remotes/upstream/main
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr1415-repair-workspace
+          path: .
+          include-hidden-files: true
+          retention-days: 1
+          compression-level: 6
