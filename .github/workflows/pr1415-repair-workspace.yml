@@ -115,6 +115,8 @@ jobs:
           test "$(git rev-parse 'HEAD^{tree}')" = \
             b5ea93f9348570d182bfb99acaaaefb49e535253
           git diff --check
+      - name: Restore generated Go test inputs
+        run: make pricing-snapshot ensure-embed-dir
       - name: Run focused Go tests
         run: go test ./internal/db ./internal/parser ./internal/sync
       - name: Publish tested repair branch
