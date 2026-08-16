@@ -114,6 +114,21 @@ jobs:
           git commit -m "fix(sync): adopt Codex checkpoints lazily and atomically"
           test "$(git rev-parse 'HEAD^{tree}')" = \
             b5ea93f9348570d182bfb99acaaaefb49e535253
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("internal/sync/checkpoint_review_test.go")
+          text = path.read_text()
+          old = "context.Background(), []string{root}, false,\n\t)"
+          new = "context.Background(), []string{root}, false, nil,\n\t)"
+          if text.count(old) != 1:
+              raise RuntimeError("checkpoint audit call shape changed")
+          path.write_text(text.replace(old, new))
+          PY
+          git add internal/sync/checkpoint_review_test.go
+          git commit --amend --no-edit
+          test "$(git rev-parse 'HEAD^{tree}')" = \
+            e4ef5d0aeee42f96c77a73a474cc91f03efc59ea
           git diff --check
       - name: Restore generated Go test inputs
         run: make pricing-snapshot ensure-embed-dir
