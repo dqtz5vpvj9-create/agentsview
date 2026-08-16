@@ -48,14 +48,15 @@ jobs:
                       output.append(text[pos:])
                       break
                   middle = text.find("=======\n", start)
-                  end = text.find(">>>>>>> upstream/main\n", middle)
-                  if middle < 0 or end < 0:
+                  end_start = text.find(">>>>>>> ", middle)
+                  end = text.find("\n", end_start)
+                  if middle < 0 or end_start < 0 or end < 0:
                       raise RuntimeError(f"malformed conflict in {path}")
                   output.append(text[pos:start])
                   ours = text[start + len("<<<<<<< HEAD\n"):middle]
-                  theirs = text[middle + len("=======\n"):end]
+                  theirs = text[middle + len("=======\n"):end_start]
                   output.append(resolver(index, ours, theirs))
-                  pos = end + len(">>>>>>> upstream/main\n")
+                  pos = end + 1
                   index += 1
               p.write_text("".join(output))
 
