@@ -1,0 +1,33 @@
+name: Export exact PR 1415 head
+
+on:
+  push:
+    branches:
+      - repair/pr1415-maintainer-review
+    paths:
+      - .github/workflows/pr1415-export-a8-source.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: dqtz5vpvj9-create/agentsview
+          ref: a8db72557312c2f99822abb4adaca133a8bb9d35
+          persist-credentials: false
+      - name: Package source without repository metadata
+        run: |
+          set -euo pipefail
+          tar --exclude=.git --exclude=.git/** -czf /tmp/agentsview-a8db7255-source.tar.gz .
+          sha256sum /tmp/agentsview-a8db7255-source.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentsview-a8db7255-source
+          path: /tmp/agentsview-a8db7255-source.tar.gz
+          retention-days: 1
+          compression-level: 0
