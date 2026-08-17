@@ -1,0 +1,33 @@
+name: Export PR 1415 checkpoint test
+
+on:
+  push:
+    branches:
+      - repair/pr1415-maintainer-review
+    paths:
+      - .github/workflows/export-pr1415-checkpoint-test.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: a8db72557312c2f99822abb4adaca133a8bb9d35
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Export one test file
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pr1415-test/internal/sync
+          cp internal/sync/checkpoint_bootstrap_test.go /tmp/pr1415-test/internal/sync/
+          sha256sum /tmp/pr1415-test/internal/sync/checkpoint_bootstrap_test.go > /tmp/pr1415-test/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr1415-checkpoint-test-a8db7255
+          path: /tmp/pr1415-test
+          retention-days: 1
+          compression-level: 0
