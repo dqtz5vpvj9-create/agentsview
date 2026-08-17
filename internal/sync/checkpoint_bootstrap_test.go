@@ -386,15 +386,56 @@ func TestCodexIncrementalResumeHashFailureRetainsCheckpoint(t *testing.T) {
 	require.Equal(t, oldOffset, cp.Offset,
 		"a failed reconstruction must not advance the checkpoint")
 
+	// The failed hash-state reconstruction does not invalidate the content
+	// transaction: the stored projection carries the authoritative full-file
+	// hash, while the disposable checkpoint remains at its previous offset.
+	storedHash, hasHash := database.GetFileHashByAgentPath(path, "codex")
+	require.True(t, hasHash)
+	actualHash, err := ComputeFileHash(path)
+	require.NoError(t, err)
+	require.Equal(t, actualHash, storedHash)
+
+	// Lazy checkpoint adoption leaves an unchanged source on the stat-digest
+	// fast path. Restoring the hasher alone must not rewrite the session or
+	// advance the stale checkpoint.
 	codexResumeHashFn = orig
-	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+	unchanged := engine.SyncAll(t.Context(), nil)
+	require.Zero(t, unchanged.Failed)
+	require.Zero(t, unchanged.Synced)
+	skipped, ok, err := database.GetParserCheckpoint(sessionID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, oldOffset, skipped.Offset)
+
+	// The next real source change reaches checkpoint validation and repairs
+	// the stale optimization state in the same authoritative write.
+	repairBoundary := testjsonl.JoinJSONL(
+		testjsonl.CodexTokenCountJSON(
+			"2024-01-01T10:00:14Z", 240, 60, 160,
+		),
+	)
+	f, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(repairBoundary)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	repaired := engine.SyncAll(t.Context(), nil)
+	require.Zero(t, repaired.Failed)
+	require.Equal(t, 1, repaired.Synced)
 	fixed, ok, err := database.GetParserCheckpoint(sessionID)
 	require.NoError(t, err)
 	require.True(t, ok)
-	require.Greater(t, fixed.Offset, oldOffset,
-		"the next sync must rebuild the checkpoint authoritatively")
-	storedHash, hasHash := database.GetFileHashByAgentPath(path, "codex")
+	require.Greater(t, fixed.Offset, oldOffset)
+	require.Equal(t,
+		int64(len(initial)+len(appended)+len(repairBoundary)),
+		fixed.Offset,
+	)
+	storedHash, hasHash = database.GetFileHashByAgentPath(path, "codex")
 	require.True(t, hasHash)
+	actualHash, err = ComputeFileHash(path)
+	require.NoError(t, err)
+	require.Equal(t, actualHash, storedHash)
 	require.Equal(t, storedHash, fixed.Hash)
 }
 

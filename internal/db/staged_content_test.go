@@ -90,7 +90,7 @@ func (s *scratchStagedResults) InsertEventsTx(
 	ctx context.Context, tx *sql.Tx, sessionID string,
 	positions map[string]StagedToolCallPosition,
 ) error {
-	for toolUseID, pos := range positions {
+	for _, pos := range positions {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO tool_result_events (
 				session_id, tool_call_message_ordinal, call_index,
@@ -108,7 +108,7 @@ func (s *scratchStagedResults) InsertEventsTx(
 			FROM codex_staging.stage_events
 			WHERE tool_use_id = ?
 			ORDER BY seq`,
-			sessionID, pos.Ordinal, pos.CallIndex, toolUseID,
+			sessionID, pos.Ordinal, pos.CallIndex, pos.ToolUseID,
 		); err != nil {
 			return err
 		}
