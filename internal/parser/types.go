@@ -1242,6 +1242,20 @@ type ParsedToolCallUpdate struct {
 	ResultEvents []ParsedToolResultEvent
 }
 
+// ParsedMessageTokenUsageUpdate carries token metadata for an assistant
+// message that was committed before the current append-only chunk. Codex
+// emits a token_count record immediately after a late tool result, so the
+// target assistant message may not be present in the incremental message
+// slice even though its ordinal is known from the stored transcript.
+type ParsedMessageTokenUsageUpdate struct {
+	Ordinal          int
+	TokenUsage       json.RawMessage
+	ContextTokens    int
+	OutputTokens     int
+	HasContextTokens bool
+	HasOutputTokens  bool
+}
+
 // ParsedToolResult holds metadata about a tool result block in a
 // user message (the response to a prior tool_use).
 type ParsedToolResult struct {

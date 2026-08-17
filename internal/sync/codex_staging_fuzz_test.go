@@ -188,20 +188,7 @@ func TestCodexStagedPublishFailureKeepsPriorContent(t *testing.T) {
 			stagedDBMsgs := toDBMessages(pendingWrite{
 				sess: *stagedSess, msgs: stagedMsgs,
 			}, nil)
-			positions := make(map[string]db.StagedToolCallPosition)
-			for _, m := range stagedDBMsgs {
-				for callIdx, tc := range m.ToolCalls {
-					if tc.ToolUseID == "" {
-						continue
-					}
-					positions[tc.ToolUseID] =
-						db.StagedToolCallPosition{
-							ToolUseID: tc.ToolUseID,
-							Ordinal:   m.Ordinal,
-							CallIndex: callIdx,
-						}
-				}
-			}
+			positions := stagedToolCallPositions(stagedDBMsgs)
 			err = database.ReplaceSessionContentStaged(
 				context.Background(), row.ID, stagedDBMsgs, failing,
 				map[string]bool{},
@@ -246,19 +233,7 @@ func TestCodexStagedPublishFailureKeepsPriorContent(t *testing.T) {
 	stagedDBMsgs := toDBMessages(pendingWrite{
 		sess: *stagedSess, msgs: stagedMsgs,
 	}, nil)
-	positions := make(map[string]db.StagedToolCallPosition)
-	for _, m := range stagedDBMsgs {
-		for callIdx, tc := range m.ToolCalls {
-			if tc.ToolUseID == "" {
-				continue
-			}
-			positions[tc.ToolUseID] = db.StagedToolCallPosition{
-				ToolUseID: tc.ToolUseID,
-				Ordinal:   m.Ordinal,
-				CallIndex: callIdx,
-			}
-		}
-	}
+	positions := stagedToolCallPositions(stagedDBMsgs)
 	require.NoError(t, database.ReplaceSessionContentStaged(
 		context.Background(), row.ID, stagedDBMsgs, staged,
 		map[string]bool{},

@@ -55,6 +55,7 @@ type codexCursorState struct {
 	lastTaskEvent            string
 	pendingCalls             [codexCursorMaxPendingCalls]codexPendingToolCall
 	pendingCallCount         uint8
+	pendingCallsOverflow     bool
 }
 
 // MarshalBinary encodes the compact continuation state for persistence.
@@ -62,6 +63,12 @@ type codexCursorState struct {
 // length-prefixed and capped on decode, and the pending-call array is
 // fixed-size.
 func (s *codexCursorState) MarshalBinary() ([]byte, error) {
+	if s.pendingCallsOverflow {
+		return nil, fmt.Errorf(
+			"codex cursor has more than %d unresolved tool calls",
+			codexCursorMaxPendingCalls,
+		)
+	}
 	var buf bytes.Buffer
 	write := func(v any) error {
 		return binary.Write(&buf, binary.LittleEndian, v)
@@ -221,6 +228,7 @@ func (s *codexCursorState) rememberToolCall(id, name string) bool {
 		}
 	}
 	if int(s.pendingCallCount) >= len(s.pendingCalls) {
+		s.pendingCallsOverflow = true
 		return false
 	}
 	s.pendingCalls[s.pendingCallCount] = codexPendingToolCall{

@@ -1359,6 +1359,90 @@ func writeMessagesTx(tx *sql.Tx, msgs []Message) error {
 // reports whether signals were maintained inside the transaction; when
 // false the session's signal version was invalidated and the caller must
 // schedule the debounced full recompute.
+func applyMessageTokenUsageUpdateTx(
+	tx *sql.Tx, sessionID string, update MessageTokenUsageUpdate,
+) (bool, error) {
+	var role, tokenUsage string
+	var contextTokens, outputTokens int
+	var hasContextTokens, hasOutputTokens bool
+	if err := tx.QueryRow(
+		`SELECT role, token_usage, context_tokens, output_tokens,
+		        has_context_tokens, has_output_tokens
+		 FROM messages
+		 WHERE session_id = ? AND ordinal = ?`,
+		sessionID, update.Ordinal,
+	).Scan(
+		&role, &tokenUsage, &contextTokens, &outputTokens,
+		&hasContextTokens, &hasOutputTokens,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, fmt.Errorf(
+				"message usage target %s/%d does not exist",
+				sessionID, update.Ordinal,
+			)
+		}
+		return false, fmt.Errorf(
+			"loading message usage target %s/%d: %w",
+			sessionID, update.Ordinal, err,
+		)
+	}
+	if role != string(parser.RoleAssistant) {
+		return false, fmt.Errorf(
+			"message usage target %s/%d has role %q",
+			sessionID, update.Ordinal, role,
+		)
+	}
+
+	incomingUsage := string(update.TokenUsage)
+	if tokenUsage == incomingUsage &&
+		contextTokens == update.ContextTokens &&
+		outputTokens == update.OutputTokens &&
+		hasContextTokens == update.HasContextTokens &&
+		hasOutputTokens == update.HasOutputTokens {
+		return false, nil
+	}
+	if tokenUsage != "" {
+		return false, fmt.Errorf(
+			"message usage target %s/%d already has different usage",
+			sessionID, update.Ordinal,
+		)
+	}
+
+	result, err := tx.Exec(
+		`UPDATE messages
+		 SET token_usage = ?, context_tokens = ?, output_tokens = ?,
+		     has_context_tokens = ?, has_output_tokens = ?
+		 WHERE session_id = ? AND ordinal = ? AND token_usage = ''`,
+		incomingUsage,
+		update.ContextTokens,
+		update.OutputTokens,
+		update.HasContextTokens,
+		update.HasOutputTokens,
+		sessionID,
+		update.Ordinal,
+	)
+	if err != nil {
+		return false, fmt.Errorf(
+			"updating message usage target %s/%d: %w",
+			sessionID, update.Ordinal, err,
+		)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf(
+			"reading message usage update result %s/%d: %w",
+			sessionID, update.Ordinal, err,
+		)
+	}
+	if rows != 1 {
+		return false, fmt.Errorf(
+			"message usage target %s/%d changed concurrently",
+			sessionID, update.Ordinal,
+		)
+	}
+	return true, nil
+}
+
 func (db *DB) WriteSessionIncremental(
 	sessionID string, msgs []Message, update IncrementalSessionUpdate,
 ) (bool, error) {
@@ -1385,6 +1469,22 @@ func (db *DB) WriteSessionIncremental(
 		return false, err
 	}
 	transcriptChanged := len(msgs) > 0
+	var updatedMessageUsageOrdinals map[int]struct{}
+	for _, usageUpdate := range update.MessageTokenUsageUpdates {
+		changed, err := applyMessageTokenUsageUpdateTx(
+			tx, sessionID, usageUpdate,
+		)
+		if err != nil {
+			return false, err
+		}
+		if changed {
+			if updatedMessageUsageOrdinals == nil {
+				updatedMessageUsageOrdinals = make(map[int]struct{})
+			}
+			updatedMessageUsageOrdinals[usageUpdate.Ordinal] = struct{}{}
+		}
+		transcriptChanged = transcriptChanged || changed
+	}
 	for _, link := range update.SubagentLinks {
 		changed, err := applyToolCallSubagentLinkTx(
 			tx, sessionID, link, update.BlockedResultCategories,
@@ -1436,9 +1536,10 @@ func (db *DB) WriteSessionIncremental(
 	if update.SignalMaintainer != nil {
 		delta, err := update.SignalMaintainer.MaintainTx(
 			context.Background(), signalTxQuery{
-				tx:                   tx,
-				sessionID:            sessionID,
-				insertedResultEvents: insertedResultEvents,
+				tx:                          tx,
+				sessionID:                   sessionID,
+				insertedResultEvents:        insertedResultEvents,
+				updatedMessageUsageOrdinals: updatedMessageUsageOrdinals,
 			},
 		)
 		if err != nil {
@@ -1900,7 +2001,14 @@ func (db *DB) replaceSessionContent(
 	); err != nil {
 		return err
 	}
-	if cp != nil {
+	if cp == nil || blobs == nil {
+		// A full replacement without safe resume state invalidates any
+		// checkpoint for the previous projection. Leaving it behind would
+		// pair a newer committed transcript with an older cursor and hash.
+		if err := deleteParserCheckpointTx(tx, sessionID); err != nil {
+			return err
+		}
+	} else {
 		c := *cp
 		b := *blobs
 		// The checkpoint row is keyed by session id just like the blobs.
@@ -3083,22 +3191,6 @@ func applyToolCallResultUpdateTx(
 		)
 	}
 	return true, inserted, nil
-}
-
-func hasEquivalentToolResultEvent(
-	events []ToolResultEvent, candidate ToolResultEvent, blocked bool,
-) bool {
-	for _, existing := range events {
-		if existing.AgentID != candidate.AgentID ||
-			existing.Status != candidate.Status {
-			continue
-		}
-		if existing.Content == candidate.Content ||
-			(blocked && existing.ContentLength == candidate.ContentLength) {
-			return true
-		}
-	}
-	return false
 }
 
 // SystemMessageFingerprint returns the ordered, comma-separated list of

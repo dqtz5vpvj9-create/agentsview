@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"log"
 	"os"
 
 	"go.kenn.io/agentsview/internal/db"
@@ -37,13 +36,13 @@ const (
 	// The caller must authoritatively reparse and replace stored rows —
 	// never resume and never append against the unverified prefix.
 	codexCheckpointInvalid
-	// codexCheckpointBootstrap means a stored Codex session has no usable
-	// checkpoint (upgrade from an archive written before checkpoints
-	// existed). The caller performs one authoritative full parse whose
-	// content and resume state commit atomically, so the next sync earns
-	// the no-op and append paths instead of skipping by fingerprint
-	// forever.
-	codexCheckpointBootstrap
+	// codexCheckpointMissing means a stored Codex session has no usable
+	// checkpoint (for example, an archive written before checkpoints
+	// existed). Missing optimization state must not turn an unchanged
+	// archive into a migration workload. The caller keeps the existing
+	// freshness gates and creates a checkpoint on the next real source
+	// change that already requires an authoritative parse.
+	codexCheckpointMissing
 )
 
 type codexCheckpointResult struct {
@@ -105,11 +104,7 @@ func (e *Engine) codexCheckpointFingerprint(
 		return res, fmt.Errorf("loading checkpoint %s: %w", inc.ID, err)
 	}
 	if !hasCP || cp.Version != codexCheckpointVersion {
-		// A stored session without a usable checkpoint bootstraps one
-		// regardless of the surrounding pass or a path rewriter: an
-		// upgraded archive's first ordinary sync must repair its resume
-		// state.
-		res.decision = codexCheckpointBootstrap
+		res.decision = codexCheckpointMissing
 		return res, nil
 	}
 	if e.pathRewriter != nil {
@@ -212,6 +207,11 @@ func (e *Engine) codexCheckpointFingerprint(
 		return res, fmt.Errorf("loading checkpoint blobs %s: %w", inc.ID, err)
 	}
 	if !hasBlobs || len(blobs.HashState) == 0 {
+		res.decision = codexCheckpointInvalid
+		return res, nil
+	}
+	stateDigest, err := codexHashStateDigest(blobs.HashState)
+	if err != nil || stateDigest != cp.Hash {
 		res.decision = codexCheckpointInvalid
 		return res, nil
 	}
@@ -386,88 +386,6 @@ func (e *Engine) buildCodexFullParseCheckpoint(
 		Cursor:    pw.checkpoint,
 		HashState: pw.checkpointHashState,
 	}, nil
-}
-
-// persistFullParseCheckpoint stores a session's checkpoint after its full
-// parse rows committed. It uses the hash state and anchor digest the parser
-// captured on its single read pass, so persisting the checkpoint never
-// re-reads the source. It re-reads the committed file size and next ordinal
-// from the database so the checkpoint always matches what a future
-// incremental parse will see.
-func (e *Engine) persistFullParseCheckpoint(
-	ctx context.Context, pw pendingWrite,
-) {
-	if len(pw.checkpoint) == 0 {
-		return
-	}
-	if len(pw.checkpointHashState) == 0 ||
-		pw.checkpointAnchorDigest == "" {
-		// The provider did not carry the single-pass hash/anchor state;
-		// skip persisting rather than re-reading the source.
-		log.Printf(
-			"checkpoint skip %s: parser supplied no single-pass hash state",
-			pw.sess.File.Path,
-		)
-		return
-	}
-	path := pw.sess.File.Path
-	if path == "" {
-		return
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		log.Printf("checkpoint stat %s: %v", path, err)
-		return
-	}
-	lookupPath := path
-	if e.pathRewriter != nil {
-		lookupPath = e.pathRewriter(path)
-	}
-	inc, ok := e.db.GetSessionForIncremental(
-		lookupPath, string(pw.sess.Agent),
-	)
-	if !ok {
-		// The session row committed but has no incremental bookkeeping
-		// (e.g. zero messages); do not persist a resume state that could
-		// disagree with the stored cursor.
-		return
-	}
-	// The parser state covers exactly the parsed snapshot
-	// [0, pw.sess.File.Size); the checkpoint must describe exactly the
-	// committed prefix. If the committed size disagrees with the snapshot
-	// the state is unusable — never persist it.
-	committed := inc.FileSize
-	if committed <= 0 || committed > info.Size() ||
-		committed != pw.sess.File.Size {
-		log.Printf(
-			"checkpoint bounds %s: committed=%d snapshot=%d live=%d",
-			path, committed, pw.sess.File.Size, info.Size(),
-		)
-		return
-	}
-	committedHash, err := codexHashStateDigest(pw.checkpointHashState)
-	if err != nil {
-		log.Printf("checkpoint digest %s: %v", path, err)
-		return
-	}
-	cp, blobs := buildCodexCheckpoint(
-		inc.ID,
-		string(pw.sess.Agent),
-		e.effectiveSourcePath(path),
-		uint64(pw.sess.File.Inode),
-		uint64(pw.sess.File.Device),
-		pw.sess.File.Mtime,
-		pw.sess.File.ChangeTime,
-		committed,
-		pw.checkpoint,
-		pw.checkpointHashState,
-		committedHash,
-		inc.NextOrdinal,
-		pw.checkpointAnchorDigest,
-	)
-	if err := e.db.UpsertParserCheckpoint(*cp, blobs); err != nil {
-		log.Printf("checkpoint persist %s: %v", path, err)
-	}
 }
 
 // buildCodexCheckpoint assembles the checkpoint metadata row and the lazy

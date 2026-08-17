@@ -93,14 +93,19 @@ type SignalQuery interface {
 	// previously stored events already carry findings, and rescanning the
 	// call's whole history makes repeated updates quadratic.
 	InsertedResultEvents(toolUseID string) []ToolResultEvent
+	// MessageTokenUsageUpdated reports whether this transaction actually
+	// changed the token metadata of the named committed message. Identical
+	// replays must not fold the same token-drop compaction twice.
+	MessageTokenUsageUpdated(ordinal int) bool
 }
 
 // signalTxQuery implements SignalQuery over the incremental write
 // transaction.
 type signalTxQuery struct {
-	tx                   *sql.Tx
-	sessionID            string
-	insertedResultEvents map[string][]ToolResultEvent
+	tx                          *sql.Tx
+	sessionID                   string
+	insertedResultEvents        map[string][]ToolResultEvent
+	updatedMessageUsageOrdinals map[int]struct{}
 }
 
 func (q signalTxQuery) Session(
@@ -361,6 +366,11 @@ func (q signalTxQuery) InsertedResultEvents(
 	toolUseID string,
 ) []ToolResultEvent {
 	return q.insertedResultEvents[toolUseID]
+}
+
+func (q signalTxQuery) MessageTokenUsageUpdated(ordinal int) bool {
+	_, ok := q.updatedMessageUsageOrdinals[ordinal]
+	return ok
 }
 
 // TranscriptRevision returns a session's stored transcript revision. The

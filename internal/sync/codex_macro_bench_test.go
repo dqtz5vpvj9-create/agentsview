@@ -472,19 +472,7 @@ func TestMacroCodexStagedParseMemoryGates(t *testing.T) {
 			dbMsgs := toDBMessages(pendingWrite{
 				sess: *sess, msgs: msgs,
 			}, nil)
-			positions := make(map[string]db.StagedToolCallPosition)
-			for _, m := range dbMsgs {
-				for callIdx, tc := range m.ToolCalls {
-					if tc.ToolUseID == "" {
-						continue
-					}
-					positions[tc.ToolUseID] = db.StagedToolCallPosition{
-						ToolUseID: tc.ToolUseID,
-						Ordinal:   m.Ordinal,
-						CallIndex: callIdx,
-					}
-				}
-			}
+			positions := stagedToolCallPositions(dbMsgs)
 			require.NoError(t, database.ReplaceSessionContentStaged(
 				context.Background(), row.ID, dbMsgs, staged,
 				map[string]bool{},
@@ -642,19 +630,7 @@ func TestMacroCodexStaged64MBLine(t *testing.T) {
 	dbMsgs := toDBMessages(pendingWrite{
 		sess: *sess, msgs: msgs,
 	}, nil)
-	positions := make(map[string]db.StagedToolCallPosition)
-	for _, m := range dbMsgs {
-		for callIdx, tc := range m.ToolCalls {
-			if tc.ToolUseID == "" {
-				continue
-			}
-			positions[tc.ToolUseID] = db.StagedToolCallPosition{
-				ToolUseID: tc.ToolUseID,
-				Ordinal:   m.Ordinal,
-				CallIndex: callIdx,
-			}
-		}
-	}
+	positions := stagedToolCallPositions(dbMsgs)
 	require.NoError(t, database.ReplaceSessionContentStaged(
 		context.Background(), row.ID, dbMsgs, staged,
 		map[string]bool{},

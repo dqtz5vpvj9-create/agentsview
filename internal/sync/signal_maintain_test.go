@@ -27,8 +27,9 @@ type fakeSignalQuery struct {
 	// callEvents is the call's full stored history, returned by
 	// CallResultEvents. inserted maps a tool_use_id to the events this
 	// transaction inserted, returned by InsertedResultEvents.
-	callEvents []db.ToolResultEvent
-	inserted   map[string][]db.ToolResultEvent
+	callEvents          []db.ToolResultEvent
+	inserted            map[string][]db.ToolResultEvent
+	updatedUsageOrdinal map[int]bool
 }
 
 func (f *fakeSignalQuery) Session(context.Context) (*db.Session, error) {
@@ -67,6 +68,10 @@ func (f *fakeSignalQuery) InsertedResultEvents(
 	toolUseID string,
 ) []db.ToolResultEvent {
 	return f.inserted[toolUseID]
+}
+
+func (f *fakeSignalQuery) MessageTokenUsageUpdated(ordinal int) bool {
+	return f.updatedUsageOrdinal[ordinal]
 }
 
 // newTestMaintainer builds a maintainer stamped with the current quality
@@ -603,6 +608,119 @@ func TestIncrementalSignalMaintainerParityWithFullResync(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, db.CurrentQualitySignalVersion, sess.QualitySignalVersion)
 	_ = state
+}
+
+// TestIncrementalSignalMaintainerHandlesCommittedUsageUpdate proves the
+// real Codex late-output shape (function_call_output followed by token_count)
+// stays on the bounded delta path. The usage belongs to an assistant message
+// committed before the checkpoint, so maintenance must fold its token-derived
+// state without loading the historical transcript.
+func TestIncrementalSignalMaintainerHandlesCommittedUsageUpdate(t *testing.T) {
+	root := t.TempDir()
+	day := filepath.Join(root, "2024", "01", "01")
+	require.NoError(t, os.MkdirAll(day, 0o755))
+	path := filepath.Join(
+		day, "rollout-2024-01-01T10-00-00-"+signalMaintainUUID+".jsonl",
+	)
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			signalMaintainUUID, "/workspace/project", "codex_cli_rs",
+			"2024-01-01T10:00:00Z",
+		),
+		testjsonl.CodexTurnContextJSON(
+			"gpt-5.4", "2024-01-01T10:00:00Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"user", "first turn", "2024-01-01T10:00:01Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"assistant", "first response", "2024-01-01T10:00:02Z",
+		),
+		testjsonl.CodexTokenCountJSON(
+			"2024-01-01T10:00:03Z", 1000, 20, 100,
+		),
+		testjsonl.CodexMsgJSON(
+			"user", "run the command", "2024-01-01T10:00:04Z",
+		),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"exec_command", "call_usage", nil,
+			"2024-01-01T10:00:05Z",
+		),
+	)
+	require.NoError(t, os.WriteFile(path, []byte(initial), 0o644))
+
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+
+	appended := testjsonl.JoinJSONL(
+		testjsonl.CodexFunctionCallOutputJSON(
+			"call_usage", "command complete", "2024-01-01T10:00:06Z",
+		),
+		testjsonl.CodexTokenCountJSON(
+			"2024-01-01T10:00:07Z", 500, 30, 50,
+		),
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(appended)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	loadsBefore := database.MessagesLoadCount()
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+	require.Equal(t, loadsBefore, database.MessagesLoadCount(),
+		"late result plus committed usage must not load session history")
+
+	sessionID := "codex:" + signalMaintainUUID
+	incrementalSession, err := database.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, incrementalSession)
+	require.True(t, incrementalSession.LastWriteIncremental)
+	require.Equal(t, db.CurrentQualitySignalVersion,
+		incrementalSession.QualitySignalVersion)
+	require.Equal(t, 1, incrementalSession.CompactionCount,
+		"the committed usage update must contribute token-drop compaction state")
+
+	incrementalMessages, err := database.GetAllMessages(t.Context(), sessionID)
+	require.NoError(t, err)
+	var usageMessage *db.Message
+	for i := range incrementalMessages {
+		if len(incrementalMessages[i].ToolCalls) > 0 &&
+			incrementalMessages[i].ToolCalls[0].ToolUseID == "call_usage" {
+			usageMessage = &incrementalMessages[i]
+			break
+		}
+	}
+	require.NotNil(t, usageMessage)
+	require.True(t, usageMessage.HasContextTokens)
+	require.Equal(t, 500, usageMessage.ContextTokens)
+
+	// A fresh authoritative import of the complete file must produce the
+	// same observable signal state and message token metadata.
+	fullDatabase := openTestDB(t)
+	fullEngine := NewEngine(fullDatabase, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(fullEngine.Close)
+	require.Equal(t, 1, fullEngine.SyncAll(t.Context(), nil).Synced)
+	fullSession, err := fullDatabase.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, fullSession)
+	require.Equal(t, snapshotSessionSignals(fullSession),
+		snapshotSessionSignals(incrementalSession))
+	fullMessages, err := fullDatabase.GetAllMessages(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.Equal(t, fullMessages, incrementalMessages)
 }
 
 // TestIncrementalSignalMaintainerDeclinesForUserMessage verifies the

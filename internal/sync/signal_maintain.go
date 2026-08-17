@@ -25,6 +25,10 @@ type incrementalSignalMaintainer struct {
 	appended []db.Message
 	// resultUpdates carries the sanitized late tool-result updates.
 	resultUpdates []db.ToolCallResultUpdate
+	// messageUsageUpdates carries token metadata attached to assistant
+	// messages committed before this incremental batch. These updates are
+	// ordered before appended messages in the canonical transcript.
+	messageUsageUpdates []db.MessageTokenUsageUpdate
 	// preWriteRevision is the transcript revision before this write's
 	// bump; the persisted state token must match it.
 	preWriteRevision string
@@ -50,6 +54,7 @@ func (e *Engine) newIncrementalSignalMaintainer(
 	inc *incrementalUpdate,
 	appended []db.Message,
 	resultUpdates []db.ToolCallResultUpdate,
+	messageUsageUpdates []db.MessageTokenUsageUpdate,
 	preWriteRevision, preWriteSecretsVersion string,
 ) db.SignalMaintainer {
 	return &incrementalSignalMaintainer{
@@ -57,6 +62,7 @@ func (e *Engine) newIncrementalSignalMaintainer(
 		sessionID:              inc.sessionID,
 		appended:               appended,
 		resultUpdates:          resultUpdates,
+		messageUsageUpdates:    messageUsageUpdates,
 		preWriteRevision:       preWriteRevision,
 		preWriteSecretsVersion: preWriteSecretsVersion,
 		qualitySignalVersion:   db.CurrentQualitySignalVersion,
@@ -213,6 +219,25 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 	compactionDelta := 0
 	lastTokens := nextState.LastValidTokens
 	appendedHasContextData := false
+
+	// A resumed Codex tail may carry token_count for the final assistant
+	// message committed before the checkpoint. That message is already
+	// represented in the compact state, but its token-derived contribution
+	// is not. Apply the usage update before later appended messages so the
+	// compaction detector sees canonical message order without loading the
+	// historical transcript.
+	for _, usage := range m.messageUsageUpdates {
+		if !q.MessageTokenUsageUpdated(usage.Ordinal) ||
+			!usage.HasContextTokens {
+			continue
+		}
+		appendedHasContextData = true
+		if lastTokens > 0 &&
+			float64(usage.ContextTokens) < 0.7*float64(lastTokens) {
+			compactionDelta++
+		}
+		lastTokens = usage.ContextTokens
+	}
 	for _, msg := range m.appended {
 		msgIndex++
 		if msg.IsSystem {

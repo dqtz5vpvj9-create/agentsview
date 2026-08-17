@@ -360,13 +360,16 @@ func TestCollectAndBatchKeepsFanoutUnderOneLeaseUntilOneWrite(t *testing.T) {
 }
 
 func TestStartWorkersFlushesBelowBatchUnderAdmissionPressure(t *testing.T) {
-	const agent parser.AgentType = "retention-test"
+	// Codex-format providers retain the weighted source size during parse.
+	// Non-Codex providers intentionally use unit admission; the separate
+	// TestParseRetentionAdmissionIsCodexOnly pins that design boundary.
+	const agent = parser.AgentTraeX
 	provider := &directStreamingProvider{
 		ProviderBase: parser.ProviderBase{Def: parser.AgentDef{Type: agent}},
 		parseOutcome: parser.ParseOutcome{
 			Results: []parser.ParseResultOutcome{{
 				Result: parser.ParseResult{Session: parser.ParsedSession{
-					ID: "retention-test:session", Agent: agent,
+					ID: "traex:retention-test-session", Agent: agent,
 				}},
 			}},
 			ResultSetComplete: true,
@@ -476,4 +479,20 @@ func TestStartWorkersCancellationReleasesAdmissionWaiters(t *testing.T) {
 	next, err := budget.acquire(t.Context(), defaultParseRetentionBytes)
 	require.NoError(t, err, "canceled waiters must not leak weighted capacity")
 	next.Release()
+}
+
+func TestParseRetentionAdmissionIsCodexOnly(t *testing.T) {
+	const sourceBytes = int64(32 << 20)
+	assert.Equal(t, sourceBytes, parseRetentionAdmissionBytes(
+		parser.DiscoveredFile{Agent: parser.AgentCodex}, sourceBytes,
+	))
+	assert.Equal(t, sourceBytes, parseRetentionAdmissionBytes(
+		parser.DiscoveredFile{Agent: parser.AgentTraeX}, sourceBytes,
+	))
+	assert.Equal(t, int64(1), parseRetentionAdmissionBytes(
+		parser.DiscoveredFile{Agent: parser.AgentClaude}, sourceBytes,
+	))
+	assert.Equal(t, int64(1), parseRetentionAdmissionBytes(
+		parser.DiscoveredFile{Agent: parser.AgentGemini}, sourceBytes,
+	))
 }

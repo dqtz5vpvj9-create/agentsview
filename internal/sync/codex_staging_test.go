@@ -47,6 +47,40 @@ func TestDrainResultsReleasesStagedScratchAndGCGuard(t *testing.T) {
 		"draining must remove the staged scratch file")
 }
 
+func TestCodexStagingBlockedContentNeverEntersScratch(t *testing.T) {
+	dir := t.TempDir()
+	sink, err := newCodexStagingSink(dir, map[string]bool{"Bash": true})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, sink.Close()) }()
+
+	sink.AppendMessage(parser.ParsedMessage{ToolCalls: []parser.ParsedToolCall{{
+		ToolUseID: "call_secret",
+		ToolName:  "exec_command",
+		Category:  "Bash",
+	}}})
+	const secret = "AKIA7QHWN2DKR4FYPLJM blocked payload"
+	sink.AppendToolResultEvent("call_secret", parser.ParsedToolResultEvent{
+		ToolUseID: "call_secret",
+		Source:    "function_call_output",
+		Content:   secret,
+	})
+	require.NoError(t, sink.Err())
+
+	var content string
+	var length, blanked int
+	require.NoError(t, sink.scratch.QueryRow(
+		`SELECT content, content_length, blanked FROM stage_events LIMIT 1`,
+	).Scan(&content, &length, &blanked))
+	require.Empty(t, content)
+	require.Equal(t, len(secret), length)
+	require.Equal(t, 1, blanked)
+
+	raw, err := os.ReadFile(sink.path)
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), secret,
+		"blocked raw content must not be recoverable from scratch storage")
+}
+
 func TestStagedCodexParseOutcomeCopiesFingerprintHash(t *testing.T) {
 	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122b04"
 	root := t.TempDir()
@@ -575,19 +609,7 @@ func assertCodexStagedParity(t *testing.T, uuid, content string) {
 		rowL.ID, legacyDBMsgs, updateL, findingsL,
 	))
 
-	positions := make(map[string]db.StagedToolCallPosition)
-	for _, m := range stagedDBMsgs {
-		for callIdx, tc := range m.ToolCalls {
-			if tc.ToolUseID == "" {
-				continue
-			}
-			positions[tc.ToolUseID] = db.StagedToolCallPosition{
-				ToolUseID: tc.ToolUseID,
-				Ordinal:   m.Ordinal,
-				CallIndex: callIdx,
-			}
-		}
-	}
+	positions := stagedToolCallPositions(stagedDBMsgs)
 	// The publish transaction resolves each summary once and runs this
 	// closure before commit, so the content-failure-aware signals and
 	// findings persist atomically with the rows they describe.

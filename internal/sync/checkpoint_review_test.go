@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding"
-	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -57,11 +56,10 @@ func TestCodexCheckpointHashStateBoundedToCommittedOffset(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, int64(len(initial)), before.Offset)
 
-	// Model a rollout append after the full parse/DB commit but before
-	// persistFullParseCheckpoint runs. The persisted state must still
-	// cover exactly the committed snapshot, never the appended bytes:
-	// build the snapshot-bounded hash state and anchor digest the way the
-	// parser's single-pass tee would have captured them.
+	// Appending after the atomic content/checkpoint commit leaves the stored
+	// checkpoint anchored to the original committed prefix. The next sync
+	// resumes from that state and advances both content and checkpoint in one
+	// transaction.
 	tail := testjsonl.JoinJSONL(testjsonl.CodexFunctionCallOutputJSON(
 		"call_race", "done", "2024-01-01T10:00:03Z",
 	))
@@ -71,47 +69,18 @@ func TestCodexCheckpointHashStateBoundedToCommittedOffset(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	snapshotHash := sha256.New()
-	_, err = snapshotHash.Write([]byte(initial))
-	require.NoError(t, err)
-	snapshotState, err := snapshotHash.(encoding.BinaryMarshaler).
-		MarshalBinary()
-	require.NoError(t, err)
-	anchor := initial[max(0, len(initial)-128<<10):]
-	anchorSum := sha256.Sum256([]byte(anchor))
-
-	blobs, ok, err := database.GetParserCheckpointBlobs("codex:" + uuid)
+	afterAppend, ok, err := database.GetParserCheckpoint("codex:" + uuid)
 	require.NoError(t, err)
 	require.True(t, ok)
+	require.Equal(t, int64(len(initial)), afterAppend.Offset)
 
-	engine.persistFullParseCheckpoint(context.Background(), pendingWrite{
-		sess: parser.ParsedSession{
-			ID:    "codex:" + uuid,
-			Agent: parser.AgentCodex,
-			File: parser.FileInfo{
-				Path: path,
-				Size: int64(len(initial)),
-				Hash: before.Hash,
-			},
-		},
-		checkpoint:             blobs.Cursor,
-		checkpointHashState:    snapshotState,
-		checkpointAnchorDigest: hex.EncodeToString(anchorSum[:]),
-	})
-
-	after, ok, err := database.GetParserCheckpoint("codex:" + uuid)
+	beforeBlobs, ok, err := database.GetParserCheckpointBlobs("codex:" + uuid)
 	require.NoError(t, err)
 	require.True(t, ok)
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	require.Equal(t, int64(len(initial)), after.Offset,
-		"DB still commits only the original prefix")
-
-	afterBlobs, ok, err := database.GetParserCheckpointBlobs("codex:" + uuid)
-	require.NoError(t, err)
-	require.True(t, ok)
 	_, resumedHash, err := codexResumeHash(
-		path, after.Offset, info.Size(), afterBlobs.HashState,
+		path, afterAppend.Offset, info.Size(), beforeBlobs.HashState,
 	)
 	require.NoError(t, err)
 	actualHash, err := ComputeFileHash(path)

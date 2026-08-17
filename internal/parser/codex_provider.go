@@ -410,7 +410,7 @@ func (p *codexProvider) ParseIncremental(
 	if err != nil {
 		return IncrementalOutcome{}, IncrementalNeedsFullParse, err
 	}
-	inode, device := sourceFileIdentity(info)
+	inode, device := sourceFileIdentityForPath(path, info)
 	if (req.Fingerprint.Inode != 0 && req.Fingerprint.Inode != inode) ||
 		(req.Fingerprint.Device != 0 && req.Fingerprint.Device != device) ||
 		info.Size() < req.Fingerprint.Size {
@@ -447,6 +447,7 @@ func (p *codexProvider) ParseIncremental(
 			info,
 			req.Fingerprint.Size,
 			seed,
+			req.StoredPendingUsageOrdinal,
 		)
 	} else {
 		result, err = p.parseSessionFromSnapshot(
@@ -457,6 +458,7 @@ func (p *codexProvider) ParseIncremental(
 			f,
 			info,
 			req.Fingerprint.Size,
+			req.StoredPendingUsageOrdinal,
 		)
 	}
 	if err != nil {
@@ -505,19 +507,20 @@ func (p *codexProvider) ParseIncremental(
 		)
 	}
 	return IncrementalOutcome{
-		SessionID:            req.SessionID,
-		Messages:             result.messages,
-		ToolCallUpdates:      result.toolCallUpdates,
-		NextCursor:           nextCursor,
-		EndedAt:              result.endedAt,
-		ConsumedBytes:        result.consumedBytes,
-		MessageCount:         len(result.messages),
-		UserMessageCount:     codexProviderUserMessageCount(result.messages),
-		TotalOutputTokens:    totalOut,
-		PeakContextTokens:    peakCtx,
-		HasTotalOutputTokens: hasTotalOut,
-		HasPeakContextTokens: hasPeakCtx,
-		TerminationStatus:    termination,
+		SessionID:                req.SessionID,
+		Messages:                 result.messages,
+		ToolCallUpdates:          result.toolCallUpdates,
+		MessageTokenUsageUpdates: result.messageUsageUpdates,
+		NextCursor:               nextCursor,
+		EndedAt:                  result.endedAt,
+		ConsumedBytes:            result.consumedBytes,
+		MessageCount:             len(result.messages),
+		UserMessageCount:         codexProviderUserMessageCount(result.messages),
+		TotalOutputTokens:        totalOut,
+		PeakContextTokens:        peakCtx,
+		HasTotalOutputTokens:     hasTotalOut,
+		HasPeakContextTokens:     hasPeakCtx,
+		TerminationStatus:        termination,
 	}, IncrementalApplied, nil
 }
 
@@ -878,7 +881,7 @@ func (s codexSourceSet) Fingerprint(
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
-	inode, device := sourceFileIdentity(info)
+	inode, device := sourceFileIdentityForPath(path, info)
 	mtime := info.ModTime().UnixNano()
 	if s.agent == AgentCodex {
 		mtime = CodexEffectiveMtime(path, mtime)

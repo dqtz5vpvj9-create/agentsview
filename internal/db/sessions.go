@@ -2545,24 +2545,41 @@ type IncrementalInfo struct {
 	PeakContextTokens    int
 	HasTotalOutputTokens bool
 	HasPeakContextTokens bool
+	// PendingUsageOrdinal identifies the last committed assistant message in
+	// the current turn whose token usage has not yet been persisted. Codex
+	// incremental tails use it to apply the token_count that follows a late
+	// tool result without reparsing the committed prefix.
+	PendingUsageOrdinal *int
+}
+
+// MessageTokenUsageUpdate applies token metadata to an assistant message
+// that was committed in an earlier incremental batch.
+type MessageTokenUsageUpdate struct {
+	Ordinal          int
+	TokenUsage       json.RawMessage
+	ContextTokens    int
+	OutputTokens     int
+	HasContextTokens bool
+	HasOutputTokens  bool
 }
 
 type IncrementalSessionUpdate struct {
-	EndedAt               *string
-	TerminationStatus     *string
-	MsgCount              int
-	UserMsgCount          int
-	FileSize              int64
-	FileMtime             int64
-	FileHash              *string
-	NextOrdinal           int
-	LastEntryUUID         string
-	TotalOutputTokens     int
-	PeakContextTokens     int
-	HasTotalOutputTokens  bool
-	HasPeakContextTokens  bool
-	SubagentLinks         []ToolCallSubagentLink
-	ToolCallResultUpdates []ToolCallResultUpdate
+	EndedAt                  *string
+	TerminationStatus        *string
+	MsgCount                 int
+	UserMsgCount             int
+	FileSize                 int64
+	FileMtime                int64
+	FileHash                 *string
+	NextOrdinal              int
+	LastEntryUUID            string
+	TotalOutputTokens        int
+	PeakContextTokens        int
+	HasTotalOutputTokens     bool
+	HasPeakContextTokens     bool
+	SubagentLinks            []ToolCallSubagentLink
+	ToolCallResultUpdates    []ToolCallResultUpdate
+	MessageTokenUsageUpdates []MessageTokenUsageUpdate
 	// Checkpoint/CheckpointBlobs are the machine-local parser checkpoint
 	// metadata and lazy payload to persist in the same transaction as this
 	// delta. nil keeps any existing checkpoint.
@@ -2614,7 +2631,7 @@ func (db *DB) GetSessionForIncremental(
 	}
 
 	var info IncrementalInfo
-	var fs, fm, fi, fd sql.NullInt64
+	var fs, fm, fi, fd, pendingUsageOrdinal sql.NullInt64
 	var firstMsg, lastEntryUUID sql.NullString
 	var linearParse sql.NullBool
 	err = db.getReader().QueryRow(
@@ -2626,7 +2643,19 @@ func (db *DB) GetSessionForIncremental(
 			message_count, user_message_count,
 			first_message,
 			total_output_tokens, peak_context_tokens,
-			has_total_output_tokens, has_peak_context_tokens
+			has_total_output_tokens, has_peak_context_tokens,
+			(SELECT m.ordinal
+			 FROM messages m
+			 WHERE m.session_id = s.id
+			   AND m.role = 'assistant'
+			   AND (m.token_usage IS NULL OR length(m.token_usage) = 0)
+			   AND m.ordinal > COALESCE((
+			       SELECT MAX(u.ordinal)
+			       FROM messages u
+			       WHERE u.session_id = s.id AND u.role = 'user'
+			   ), -1)
+			 ORDER BY m.ordinal DESC
+			 LIMIT 1)
 		 FROM sessions s
 		 LEFT JOIN session_project_identity_snapshots snap
 		   ON snap.session_id = s.id
@@ -2644,6 +2673,7 @@ func (db *DB) GetSessionForIncremental(
 		&firstMsg,
 		&info.TotalOutputTokens, &info.PeakContextTokens,
 		&info.HasTotalOutputTokens, &info.HasPeakContextTokens,
+		&pendingUsageOrdinal,
 	)
 	if err != nil {
 		return nil, false
@@ -2668,6 +2698,10 @@ func (db *DB) GetSessionForIncremental(
 	}
 	if fd.Valid {
 		info.FileDevice = fd.Int64
+	}
+	if pendingUsageOrdinal.Valid {
+		ordinal := int(pendingUsageOrdinal.Int64)
+		info.PendingUsageOrdinal = &ordinal
 	}
 	info.HasTotalOutputTokens =
 		info.HasTotalOutputTokens || info.TotalOutputTokens != 0

@@ -6,10 +6,27 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestStagedToolCallKeyIsSQLiteTextSafeAndUnambiguous(t *testing.T) {
+	key := StagedToolCallKey("call_a", 0)
+	require.NotContains(t, key, "\x00")
+	require.True(t, strings.HasPrefix(key, "6:call_a:"))
+
+	keys := map[string]struct{}{
+		StagedToolCallKey("a", 12):   {},
+		StagedToolCallKey("a1", 2):   {},
+		StagedToolCallKey("a:1", 2):  {},
+		StagedToolCallKey("a", 1):    {},
+		StagedToolCallKey("a", 2):    {},
+		StagedToolCallKey("a:1", 20): {},
+	}
+	require.Len(t, keys, 6)
+}
 
 // scratchStagedResults is a minimal StagedToolResults backed by a real
 // scratch SQLite file, so the publish transaction's ATTACH and
@@ -91,8 +108,7 @@ func (s *scratchStagedResults) InsertEventsTx(
 			FROM codex_staging.stage_events
 			WHERE tool_use_id = ?
 			ORDER BY seq`,
-			sessionID, pos.Ordinal, pos.CallIndex, pos.ToolUseID,
-			toolUseID,
+			sessionID, pos.Ordinal, pos.CallIndex, toolUseID,
 		); err != nil {
 			return err
 		}
@@ -177,6 +193,51 @@ func TestReplaceSessionContentStagedAttachLifecycle(t *testing.T) {
 	require.Len(t, msgs[0].ToolCalls[0].ResultEvents, 1)
 	require.Equal(t, "second output",
 		msgs[0].ToolCalls[0].ResultEvents[0].Content)
+}
+
+func TestReplaceSessionContentStagedIdenticalPublishKeepsRevision(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "staged-idempotent.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+
+	const sessionID = "codex:idempotent"
+	require.NoError(t, database.UpsertSession(Session{
+		ID: sessionID, Agent: "codex", Project: "project", Machine: "local",
+		MessageCount: 1,
+	}))
+	publish := func() {
+		t.Helper()
+		staged := newScratchStagedResults(t)
+		staged.AddEvent(t, "call_1", "same output")
+		require.NoError(t, database.ReplaceSessionContentStaged(
+			context.Background(), sessionID, []Message{{
+				SessionID: sessionID, Ordinal: 0, Role: "assistant",
+				Content: "running", HasToolUse: true,
+				ToolCalls: []ToolCall{{
+					SessionID: sessionID, ToolUseID: "call_1",
+					ToolName: "exec_command", Category: "Bash", CallIndex: 0,
+				}},
+			}}, staged, map[string]bool{},
+			func(map[string]bool) (SessionSignalUpdate, []SecretFinding, error) {
+				return SessionSignalUpdate{}, nil, nil
+			},
+		))
+	}
+
+	publish()
+	first, err := database.GetSession(context.Background(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	require.NotNil(t, first.TranscriptRevision)
+	firstRevision := *first.TranscriptRevision
+
+	publish()
+	second, err := database.GetSession(context.Background(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, second)
+	require.NotNil(t, second.TranscriptRevision)
+	require.Equal(t, firstRevision, *second.TranscriptRevision,
+		"an identical staged verification must not bump transcript revision")
 }
 
 func TestReplaceSessionContentStagedWithCheckpointUsesPrefixedSessionID(t *testing.T) {

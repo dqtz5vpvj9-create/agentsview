@@ -4108,6 +4108,78 @@ func TestWriteSessionIncrementalToolCallResultUpdate(t *testing.T) {
 		"idempotent replay must not bump the transcript revision")
 }
 
+func TestWriteSessionIncrementalLateResultAndCommittedUsageAreAtomic(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			ToolUseID: "call_cmd",
+		}},
+	})
+
+	update := IncrementalSessionUpdate{
+		MsgCount:    1,
+		NextOrdinal: 1,
+		ToolCallResultUpdates: []ToolCallResultUpdate{{
+			ToolUseID: "call_cmd",
+			Events: []ToolResultEvent{{
+				ToolUseID:     "call_cmd",
+				Source:        "function_call_output",
+				Content:       "command finished",
+				ContentLength: len("command finished"),
+			}},
+		}},
+		MessageTokenUsageUpdates: []MessageTokenUsageUpdate{{
+			Ordinal:          0,
+			TokenUsage:       json.RawMessage(`{"input_tokens":100000,"output_tokens":250}`),
+			ContextTokens:    100000,
+			OutputTokens:     250,
+			HasContextTokens: true,
+			HasOutputTokens:  true,
+		}},
+	}
+	_, werr := d.WriteSessionIncremental("s1", nil, update)
+	require.NoError(t, werr)
+
+	var tokenUsage, result string
+	var contextTokens, outputTokens int
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT token_usage, context_tokens, output_tokens
+		FROM messages WHERE session_id = ? AND ordinal = ?`,
+		"s1", 0,
+	).Scan(&tokenUsage, &contextTokens, &outputTokens))
+	assert.JSONEq(t, `{"input_tokens":100000,"output_tokens":250}`, tokenUsage)
+	assert.Equal(t, 100000, contextTokens)
+	assert.Equal(t, 250, outputTokens)
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT COALESCE(result_content, '') FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "call_cmd",
+	).Scan(&result))
+	assert.Equal(t, "command finished", result)
+
+	sess, err := d.GetSession(context.Background(), "s1")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TranscriptRevision)
+	assert.Equal(t, "2", *sess.TranscriptRevision)
+
+	_, werr = d.WriteSessionIncremental("s1", nil, update)
+	require.NoError(t, werr, "identical late-result usage replay must be idempotent")
+	sess, err = d.GetSession(context.Background(), "s1")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TranscriptRevision)
+	assert.Equal(t, "2", *sess.TranscriptRevision)
+}
+
 func TestWriteSessionIncrementalResultEventIndexesAreMonotonic(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "s1", "proj")

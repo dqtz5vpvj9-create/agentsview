@@ -870,6 +870,71 @@ func TestCodexProviderIncrementalCustomToolOutputUpdatesStoredCall(t *testing.T)
 	}
 }
 
+func TestCodexProviderIncrementalLateOutputAttachesCommittedUsage(t *testing.T) {
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229f8"
+	prefix := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/workspace/project-a", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexTurnContextJSON("gpt-5.4", tsEarlyS1),
+		testjsonl.CodexMsgJSON("user", "inspect the repository", tsEarlyS1),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"shell", "call_late", map[string]any{"cmd": "git status"}, tsEarlyS5,
+		),
+	)
+	tail := testjsonl.JoinJSONL(
+		testjsonl.CodexFunctionCallOutputJSON(
+			"call_late", "working tree clean", tsLate,
+		),
+		testjsonl.CodexTokenCountJSON(tsLateS5, 100_000, 250, 64_000),
+	)
+
+	root := t.TempDir()
+	path := writeCodexProviderSessionContent(t, root, uuid, prefix)
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	source := requireCodexProviderSource(t, provider, uuid)
+	prefixFingerprint, err := provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+	full, err := provider.Parse(context.Background(), ParseRequest{
+		Source: source, Fingerprint: prefixFingerprint,
+	})
+	require.NoError(t, err)
+	require.Len(t, full.Results, 1)
+	require.Len(t, full.Results[0].Result.Messages, 2)
+	assert.Equal(t, RoleAssistant, full.Results[0].Result.Messages[1].Role)
+
+	appendCodexProviderContent(t, path, tail)
+	fingerprint, err := provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+	pendingUsageOrdinal := 1
+	outcome, status, err := provider.ParseIncremental(
+		context.Background(), IncrementalRequest{
+			Source:                    source,
+			Fingerprint:               fingerprint,
+			SessionID:                 "codex:" + uuid,
+			Offset:                    prefixFingerprint.Size,
+			StartOrdinal:              2,
+			StoredPendingUsageOrdinal: &pendingUsageOrdinal,
+		},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, IncrementalApplied, status)
+	assert.False(t, outcome.ForceReplace)
+	assert.Empty(t, outcome.Messages)
+	require.Len(t, outcome.ToolCallUpdates, 1)
+	assert.Equal(t, "call_late", outcome.ToolCallUpdates[0].ToolUseID)
+	require.Len(t, outcome.MessageTokenUsageUpdates, 1)
+	usage := outcome.MessageTokenUsageUpdates[0]
+	assert.Equal(t, 1, usage.Ordinal)
+	assert.Equal(t, 100_000, usage.ContextTokens)
+	assert.Equal(t, 250, usage.OutputTokens)
+	assert.True(t, usage.HasContextTokens)
+	assert.True(t, usage.HasOutputTokens)
+	assert.NotEmpty(t, usage.TokenUsage)
+}
+
 func TestCodexProviderColdIncrementalStagesRetryCursorVersions(t *testing.T) {
 	root := t.TempDir()
 	uuid := "019eb791-cf7d-75c1-8439-9ed74c1229ed"

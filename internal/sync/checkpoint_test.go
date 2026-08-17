@@ -79,9 +79,14 @@ func TestCodexCheckpointIncrementalResumeAdvancesCheckpoint(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	appended := testjsonl.JoinJSONL(testjsonl.CodexFunctionCallOutputJSON(
-		"call_cp", "done", "2024-01-01T10:00:03Z",
-	))
+	appended := testjsonl.JoinJSONL(
+		testjsonl.CodexFunctionCallOutputJSON(
+			"call_cp", "done", "2024-01-01T10:00:03Z",
+		),
+		testjsonl.CodexTokenCountJSON(
+			"2024-01-01T10:00:04Z", 100_000, 250, 64_000,
+		),
+	)
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
 	require.NoError(t, err)
 	_, err = f.WriteString(appended)
@@ -102,6 +107,10 @@ func TestCodexCheckpointIncrementalResumeAdvancesCheckpoint(t *testing.T) {
 	require.Len(t, msgs[1].ToolCalls, 1)
 	assert.Equal(t, "done", msgs[1].ToolCalls[0].ResultContent)
 	require.Len(t, msgs[1].ToolCalls[0].ResultEvents, 1)
+	assert.Equal(t, 100_000, msgs[1].ContextTokens)
+	assert.Equal(t, 250, msgs[1].OutputTokens)
+	assert.NotEmpty(t, msgs[1].TokenUsage,
+		"the token_count following a late result must update the committed assistant")
 
 	after, ok, err := env.db.GetParserCheckpoint("codex:" + checkpointTestUUID)
 	require.NoError(t, err)

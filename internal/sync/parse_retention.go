@@ -136,6 +136,19 @@ func releaseParseRetentionLeases(leases []*parseRetentionLease) {
 	}
 }
 
+// parseRetentionAdmissionBytes applies the byte-weighted memory admission to
+// Codex-family sources only. Other providers retain the archive worker
+// parallelism they had before Codex checkpointing; their source size still
+// remains available separately for metrics and batch accounting.
+func parseRetentionAdmissionBytes(
+	file parser.DiscoveredFile, sourceBytes int64,
+) int64 {
+	if isCodexFormatAgent(file.Agent) {
+		return sourceBytes
+	}
+	return 1
+}
+
 func parseRetentionSourceBytes(file parser.DiscoveredFile) int64 {
 	if file.SourceSize > 0 {
 		return file.SourceSize

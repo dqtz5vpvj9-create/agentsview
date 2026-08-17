@@ -1002,14 +1002,20 @@ type IncrementalRequest struct {
 	// the appended assistant head continues exactly this message id.
 	// nil keeps the conservative fallback.
 	StoredLastClaudeMessageID *string
+	// StoredPendingUsageOrdinal is the last assistant message without token
+	// usage in the current turn, as resolved from the committed transcript.
+	// Codex uses it to attach a token_count that follows a late tool result
+	// without re-reading or rebuilding the committed prefix.
+	StoredPendingUsageOrdinal *int
 }
 
 // IncrementalOutcome is the append-only parse output.
 type IncrementalOutcome struct {
-	SessionID       string
-	Messages        []ParsedMessage
-	SubagentLinks   []ClaudeSubagentLink
-	ToolCallUpdates []ParsedToolCallUpdate
+	SessionID                string
+	Messages                 []ParsedMessage
+	SubagentLinks            []ClaudeSubagentLink
+	ToolCallUpdates          []ParsedToolCallUpdate
+	MessageTokenUsageUpdates []ParsedMessageTokenUsageUpdate
 	// NextCursor is the provider's continuation state after consuming the
 	// appended tail, for persistence alongside the committed offset.
 	NextCursor           []byte

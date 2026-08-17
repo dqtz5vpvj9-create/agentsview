@@ -325,6 +325,9 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session
     ON tool_calls(session_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_session_tool_use
+    ON tool_calls(session_id, tool_use_id)
+    WHERE tool_use_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session_category
     ON tool_calls(session_id, category);
 -- idx_tool_calls_message backs the ON DELETE CASCADE from

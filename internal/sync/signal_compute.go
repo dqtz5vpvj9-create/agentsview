@@ -47,13 +47,21 @@ func patchToolCallRowsWithContentFailures(
 		return
 	}
 	idx := 0
+	callOccurrences := make(map[string]int)
 	for _, m := range msgs {
 		for _, tc := range m.ToolCalls {
 			if idx >= len(toolRows) {
 				return
 			}
-			if tc.ToolUseID != "" && failures[tc.ToolUseID] &&
-				toolRows[idx].EventStatus == "" {
+			failed := false
+			if tc.ToolUseID != "" {
+				occurrence := callOccurrences[tc.ToolUseID]
+				callOccurrences[tc.ToolUseID] = occurrence + 1
+				failed = failures[db.StagedToolCallKey(
+					tc.ToolUseID, occurrence,
+				)] || failures[tc.ToolUseID]
+			}
+			if failed && toolRows[idx].EventStatus == "" {
 				toolRows[idx].ContentFailure = true
 			}
 			idx++

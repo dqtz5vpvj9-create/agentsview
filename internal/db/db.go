@@ -2533,6 +2533,15 @@ func (db *DB) migrateColumns() error {
 			"creating idx_tool_calls_file_path: %w", err,
 		)
 	}
+	if _, err := w.Exec(
+		`CREATE INDEX IF NOT EXISTS idx_tool_calls_session_tool_use
+		 ON tool_calls(session_id, tool_use_id)
+		 WHERE tool_use_id IS NOT NULL`,
+	); err != nil {
+		return fmt.Errorf(
+			"creating idx_tool_calls_session_tool_use: %w", err,
+		)
+	}
 
 	if _, err := w.Exec(
 		`CREATE INDEX IF NOT EXISTS idx_sessions_termination_status

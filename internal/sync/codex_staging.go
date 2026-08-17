@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"sync"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 
@@ -36,21 +38,26 @@ type codexStagingSink struct {
 	scratch *sql.DB
 	path    string
 
-	// blocked marks categories whose stored content is blanked; staged
-	// rows keep the raw content plus a blank flag so the publish mirrors
-	// the legacy write exactly.
+	// blocked marks categories whose stored content is blanked. Their raw
+	// content never enters scratch storage; only digest, original length,
+	// ordering metadata, and summary participation are retained.
 	blocked map[string]bool
 
-	// categoryByCall tracks each emitted call's category.
-	categoryByCall map[string]string
+	// Calls use an occurrence-qualified staging key because provider call IDs
+	// can repeat within one transcript. currentCallKey maps a raw call ID to
+	// the most recently emitted instance, matching the collecting sink's
+	// event-time association without reassigning earlier staged rows.
+	currentCallKey    map[string]string
+	callOccurrences   map[string]int
+	categoryByCallKey map[string]string
 
 	// findings collects definite findings from result-event content as
 	// it streams by; findingPos records the coordinates to patch after
 	// ordinal finalization.
-	findings    []db.SecretFinding
-	findingPos  []stagedFindingPos
-	eventByCall map[string]int64
-	eventSeq    int64
+	findings       []db.SecretFinding
+	findingPos     []stagedFindingPos
+	eventByCallKey map[string]int64
+	eventSeq       int64
 	// contentFailures records per-call content-failure verdicts captured
 	// while the publish transaction resolves summaries, so the engine can
 	// fold them into the signal pass after the atomic publish.
@@ -93,31 +100,73 @@ func (s *codexStagingSink) ValidationStats() db.ValidationStats {
 }
 
 type stagedFindingPos struct {
-	toolUseID  string
+	stageKey   string
 	eventIndex int
 }
 
+// codexStagingFilePrefix identifies scratch files owned by AgentsView.
+const codexStagingFilePrefix = "agentsview-codex-stage-"
+
+// prepareCodexStagingDir creates the private scratch directory and removes
+// abandoned files older than one day. Recent files may belong to another
+// running AgentsView process and are left untouched.
+func prepareCodexStagingDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("creating codex staging directory: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("securing codex staging directory: %w", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("reading codex staging directory: %w", err)
+	}
+	cutoff := time.Now().Add(-24 * time.Hour)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), codexStagingFilePrefix) {
+			continue
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, entry.Name()))
+	}
+	return nil
+}
+
 // checkCodexStagingSpace fails a staged parse before it writes a byte when
-// the scratch directory has less than a conservative floor of free space.
-// The scratch holds the event rows plus indexes, so a nearly-full disk
-// must fail the sync loudly (the archive keeps its prior content) instead
-// of surfacing as a mid-parse I/O error with a partial scratch.
-func checkCodexStagingSpace(dir string) error {
+// the scratch directory cannot hold a conservative estimate of the staged
+// database plus SQLite overhead. The minimum protects small test/configured
+// sources; large sources scale the requirement with their actual size.
+func checkCodexStagingSpace(dir string, sourceBytes int64) error {
 	if dir == "" {
 		dir = os.TempDir()
 	}
 	available, ok, err := stagingDirFreeBytes(dir)
 	if err != nil || !ok {
-		// Filesystems without a capacity query (or an unreadable
-		// scratch dir) fail open here; the CreateTemp below reports
-		// real errors.
+		// Filesystems without a capacity query fail open here; CreateTemp and
+		// SQLite report concrete write errors without changing the archive.
 		return nil
 	}
-	const stagedScratchMinFree = 256 << 20
-	if available < stagedScratchMinFree {
+	const (
+		stagedScratchMinFree  = int64(256 << 20)
+		stagedScratchOverhead = int64(64 << 20)
+	)
+	required := stagedScratchMinFree
+	if sourceBytes > 0 {
+		scaled := sourceBytes + sourceBytes/2 + stagedScratchOverhead
+		if scaled > required {
+			required = scaled
+		}
+	}
+	if int64(available) < required {
 		return fmt.Errorf(
-			"codex staging: %s has %dMiB free, need at least %dMiB",
-			dir, available/(1<<20), stagedScratchMinFree/(1<<20),
+			"codex staging: %s has %dMiB free, need at least %dMiB for a %dMiB source",
+			dir, available/(1<<20), required/(1<<20), sourceBytes/(1<<20),
 		)
 	}
 	return nil
@@ -180,6 +229,7 @@ func beginStagedColdSync() func() {
 const codexStagingSchema = `
 CREATE TABLE stage_events (
     seq INTEGER PRIMARY KEY,
+    call_key TEXT NOT NULL,
     tool_use_id TEXT NOT NULL,
     agent_id TEXT NOT NULL DEFAULT '',
     subagent_session_id TEXT NOT NULL DEFAULT '',
@@ -189,9 +239,10 @@ CREATE TABLE stage_events (
     raw_content_digest BLOB NOT NULL,
     content_length INTEGER NOT NULL,
     timestamp TEXT NOT NULL DEFAULT '',
-    blanked INTEGER NOT NULL DEFAULT 0
+    blanked INTEGER NOT NULL DEFAULT 0,
+    summary_participates INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX idx_stage_events_call ON stage_events(tool_use_id, seq);`
+CREATE INDEX idx_stage_events_call ON stage_events(call_key, seq);`
 
 // newCodexStagingSink opens a scratch SQLite database for one streaming
 // parse. The caller must Close it once the staged write has published.
@@ -200,11 +251,19 @@ CREATE INDEX idx_stage_events_call ON stage_events(tool_use_id, seq);`
 func newCodexStagingSink(
 	dir string,
 	blocked map[string]bool,
+	sourceSize ...int64,
 ) (*codexStagingSink, error) {
-	if err := checkCodexStagingSpace(dir); err != nil {
+	if err := prepareCodexStagingDir(dir); err != nil {
 		return nil, err
 	}
-	f, err := os.CreateTemp(dir, "agentsview-codex-stage-*.sqlite")
+	var sourceBytes int64
+	if len(sourceSize) > 0 {
+		sourceBytes = sourceSize[0]
+	}
+	if err := checkCodexStagingSpace(dir, sourceBytes); err != nil {
+		return nil, err
+	}
+	f, err := os.CreateTemp(dir, codexStagingFilePrefix+"*.sqlite")
 	if err != nil {
 		return nil, fmt.Errorf("creating codex staging file: %w", err)
 	}
@@ -221,7 +280,7 @@ func newCodexStagingSink(
 	for _, pragma := range []string{
 		"PRAGMA journal_mode=OFF",
 		"PRAGMA synchronous=OFF",
-		"PRAGMA temp_store=MEMORY",
+		"PRAGMA temp_store=FILE",
 	} {
 		if _, err := scratch.Exec(pragma); err != nil {
 			scratch.Close()
@@ -239,8 +298,10 @@ func newCodexStagingSink(
 		scratch:             scratch,
 		path:                path,
 		blocked:             blocked,
-		categoryByCall:      make(map[string]string),
-		eventByCall:         make(map[string]int64),
+		currentCallKey:      make(map[string]string),
+		callOccurrences:     make(map[string]int),
+		categoryByCallKey:   make(map[string]string),
+		eventByCallKey:      make(map[string]int64),
 	}, nil
 }
 
@@ -351,7 +412,11 @@ func releaseStagedGCGuards(guards []func()) {
 func (s *codexStagingSink) AppendMessage(m parser.ParsedMessage) {
 	for _, tc := range m.ToolCalls {
 		if tc.ToolUseID != "" {
-			s.categoryByCall[tc.ToolUseID] = tc.Category
+			occurrence := s.callOccurrences[tc.ToolUseID]
+			s.callOccurrences[tc.ToolUseID] = occurrence + 1
+			stageKey := db.StagedToolCallKey(tc.ToolUseID, occurrence)
+			s.currentCallKey[tc.ToolUseID] = stageKey
+			s.categoryByCallKey[stageKey] = tc.Category
 		}
 	}
 	s.CodexCollectingSink.AppendMessage(m)
@@ -388,7 +453,8 @@ func (s *codexStagingSink) AppendToolResultEvent(
 	// from the collecting path, which has always dropped full-parse
 	// orphans. Late outputs still merge through the incremental append
 	// path on later syncs, unchanged.
-	if _, ok := s.categoryByCall[callID]; !ok {
+	stageKey, ok := s.currentCallKey[callID]
+	if !ok {
 		s.CodexCollectingSink.AppendToolResultEvent(callID, ev)
 		return
 	}
@@ -401,9 +467,9 @@ func (s *codexStagingSink) AppendToolResultEvent(
 	var exists int
 	err := s.scratch.QueryRow(
 		`SELECT 1 FROM stage_events
-		 WHERE tool_use_id = ? AND agent_id = ? AND status = ?
+		 WHERE call_key = ? AND agent_id = ? AND status = ?
 		   AND raw_content_digest = ? LIMIT 1`,
-		callID, ev.AgentID, ev.Status, rawContentDigest[:],
+		stageKey, ev.AgentID, ev.Status, rawContentDigest[:],
 	).Scan(&exists)
 	if err == nil {
 		return // equivalent event already staged
@@ -425,10 +491,11 @@ func (s *codexStagingSink) AppendToolResultEvent(
 		}
 	}
 	blanked := 0
-	if s.blocked[s.categoryByCall[callID]] {
+	if s.blocked[s.categoryByCallKey[stageKey]] {
 		blanked = 1
 	}
 	contentLength := len(ev.Content)
+	summaryParticipates := strings.TrimSpace(ev.Content) != ""
 	if blanked == 0 {
 		// The collecting path sanitizes result-event content in the central
 		// db validation pass. Staged events bypass that pass because the
@@ -443,15 +510,21 @@ func (s *codexStagingSink) AppendToolResultEvent(
 		s.addValidationStats(db.SanitizeToolCall(&toolCall))
 		ev.Content = toolCall.ResultEvents[0].Content
 		contentLength = toolCall.ResultEvents[0].ContentLength
+	} else {
+		// Blocked content must not be recoverable from an abandoned scratch
+		// database after a crash. The digest and original length preserve
+		// deduplication and result_content_length parity without storing bytes.
+		ev.Content = ""
 	}
 	if _, err := s.scratch.Exec(
 		`INSERT INTO stage_events (
-		     seq, tool_use_id, agent_id, subagent_session_id,
+		     seq, call_key, tool_use_id, agent_id, subagent_session_id,
 		     source, status, content, raw_content_digest, content_length,
-		     timestamp, blanked
-		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		seq, callID, ev.AgentID, subagent, ev.Source, ev.Status,
+		     timestamp, blanked, summary_participates
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		seq, stageKey, callID, ev.AgentID, subagent, ev.Source, ev.Status,
 		ev.Content, rawContentDigest[:], contentLength, tsStr, blanked,
+		summaryParticipates,
 	); err != nil {
 		s.fail(err)
 		return
@@ -463,9 +536,9 @@ func (s *codexStagingSink) AppendToolResultEvent(
 	if blanked != 0 {
 		storedContent = ""
 	}
-	eventIndex := int(s.eventByCall[callID])
-	s.eventByCall[callID]++
-	s.addEventFindings(callID, eventIndex, storedContent)
+	eventIndex := int(s.eventByCallKey[stageKey])
+	s.eventByCallKey[stageKey]++
+	s.addEventFindings(stageKey, eventIndex, storedContent)
 
 	// The in-memory model keeps a unique placeholder instead of the
 	// content: downstream conversions stay shape-compatible and the
@@ -475,7 +548,7 @@ func (s *codexStagingSink) AppendToolResultEvent(
 }
 
 func (s *codexStagingSink) addEventFindings(
-	toolUseID string, eventIndex int, content string,
+	stageKey string, eventIndex int, content string,
 ) {
 	if content == "" {
 		return
@@ -493,7 +566,7 @@ func (s *codexStagingSink) addEventFindings(
 			RulesVersion:  secrets.DefiniteRulesVersion(),
 		})
 		s.findingPos = append(s.findingPos, stagedFindingPos{
-			toolUseID:  toolUseID,
+			stageKey:   stageKey,
 			eventIndex: eventIndex,
 		})
 	}
@@ -508,7 +581,7 @@ func (s *codexStagingSink) Findings(
 	out := make([]db.SecretFinding, len(s.findings))
 	for i, f := range s.findings {
 		f.SessionID = sessionID
-		pos, ok := positions[s.findingPos[i].toolUseID]
+		pos, ok := positions[s.findingPos[i].stageKey]
 		if ok {
 			f.MessageOrdinal = pos.Ordinal
 			callIdx := pos.CallIndex
@@ -535,7 +608,7 @@ func (s *codexStagingSink) InsertEventsTx(
 	if s.stageErr != nil {
 		return s.stageErr
 	}
-	for toolUseID, pos := range messageOrdinals {
+	for stageKey, pos := range messageOrdinals {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO tool_result_events (
 				session_id, tool_call_message_ordinal, call_index,
@@ -553,14 +626,13 @@ func (s *codexStagingSink) InsertEventsTx(
 			       CASE WHEN timestamp = '' THEN NULL ELSE timestamp END,
 			       row_number() OVER (ORDER BY seq) - 1
 			FROM codex_staging.stage_events
-			WHERE tool_use_id = ?
+			WHERE call_key = ?
 			ORDER BY seq`,
-			sessionID, pos.Ordinal, pos.CallIndex, pos.ToolUseID,
-			toolUseID,
+			sessionID, pos.Ordinal, pos.CallIndex, stageKey,
 		); err != nil {
 			return fmt.Errorf(
 				"publishing staged events for %s/%s: %w",
-				sessionID, toolUseID, err,
+				sessionID, pos.ToolUseID, err,
 			)
 		}
 	}
@@ -577,17 +649,31 @@ func (s *codexStagingSink) InsertEventsTx(
 // call's content-failure verdict (see ContentFailures), so the engine's
 // post-publish signal fold never resolves summaries a second time.
 func (s *codexStagingSink) ResolveSummary(
-	ctx context.Context, toolUseID string,
+	ctx context.Context, stageKey string,
 ) (summary string, contentLength int, err error) {
 	if s.stageErr != nil {
 		return "", 0, s.stageErr
 	}
+	blocked := s.blocked[s.categoryByCallKey[stageKey]]
+	if blocked {
+		contentLength, err = s.resolveBlockedSummaryLength(ctx, stageKey)
+		if err != nil {
+			return "", 0, err
+		}
+		if s.contentFailures == nil {
+			s.contentFailures = make(map[string]bool)
+		}
+		s.contentFailures[stageKey] = signals.IsFailure(signals.ToolCallRow{
+			Category: s.categoryByCallKey[stageKey],
+		})
+		return "", contentLength, nil
+	}
 	rows, err := s.scratch.QueryContext(ctx, `
-		SELECT agent_id, content
+		SELECT agent_id, content, summary_participates
 		FROM stage_events
-		WHERE tool_use_id = ?
+		WHERE call_key = ?
 		ORDER BY seq`,
-		toolUseID,
+		stageKey,
 	)
 	if err != nil {
 		return "", 0, err
@@ -599,16 +685,19 @@ func (s *codexStagingSink) ResolveSummary(
 	var order []string
 	latest := make(map[string]string)
 	var lastAnon string
+	hasAnon := false
 	for rows.Next() {
 		var agentID, content string
-		if err := rows.Scan(&agentID, &content); err != nil {
+		var participates bool
+		if err := rows.Scan(&agentID, &content, &participates); err != nil {
 			return "", 0, err
 		}
-		if strings.TrimSpace(content) == "" {
+		if !participates {
 			continue
 		}
 		agent := strings.TrimSpace(agentID)
 		if agent == "" {
+			hasAnon = true
 			lastAnon = content
 			continue
 		}
@@ -629,46 +718,106 @@ func (s *codexStagingSink) ResolveSummary(
 		summary = lastAnon
 	case len(parts) == 1:
 		summary = parts[0][strings.IndexByte(parts[0], '\n')+1:]
-		if lastAnon != "" {
+		if hasAnon {
 			summary += "\n\n" + lastAnon
 		}
 	default:
 		summary = strings.Join(parts, "\n\n")
-		if lastAnon != "" {
+		if hasAnon {
 			summary += "\n\n" + lastAnon
 		}
 	}
-	blocked := s.blocked[s.categoryByCall[toolUseID]]
 	contentLength = len(summary)
-	if !blocked {
-		// Agent labels become part of result_content but are not themselves
-		// result-event content. Sanitize the assembled summary as the normal
-		// message validation pass does after SummarizeToolResultEvents.
-		toolCall := db.ToolCall{
-			ResultContent:       summary,
-			ResultContentLength: contentLength,
-		}
-		s.addValidationStats(db.SanitizeToolCall(&toolCall))
-		summary = toolCall.ResultContent
-		contentLength = toolCall.ResultContentLength
+	// Agent labels become part of result_content but are not themselves
+	// result-event content. Sanitize the assembled summary as the normal
+	// message validation pass does after SummarizeToolResultEvents.
+	toolCall := db.ToolCall{
+		ResultContent:       summary,
+		ResultContentLength: contentLength,
 	}
-	verdictContent := summary
-	if blocked {
-		// The legacy path blanks blocked summaries before computing
-		// signals (pairToolResultEventSummaries), so a status-less
-		// blocked call is never a content failure regardless of its raw
-		// output. Evaluate the verdict against the same empty content.
-		verdictContent = ""
-	}
+	s.addValidationStats(db.SanitizeToolCall(&toolCall))
+	summary = toolCall.ResultContent
+	contentLength = toolCall.ResultContentLength
 	verdict := signals.IsFailure(signals.ToolCallRow{
-		Category:      s.categoryByCall[toolUseID],
-		ResultContent: verdictContent,
+		Category:      s.categoryByCallKey[stageKey],
+		ResultContent: summary,
 	})
 	if s.contentFailures == nil {
 		s.contentFailures = make(map[string]bool)
 	}
-	s.contentFailures[toolUseID] = verdict
+	s.contentFailures[stageKey] = verdict
 	return summary, contentLength, nil
+}
+
+func (s *codexStagingSink) resolveBlockedSummaryLength(
+	ctx context.Context, stageKey string,
+) (int, error) {
+	rows, err := s.scratch.QueryContext(ctx, `
+		SELECT agent_id, content_length, summary_participates
+		FROM stage_events
+		WHERE call_key = ?
+		ORDER BY seq`,
+		stageKey,
+	)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	order := make([]string, 0)
+	latestByAgent := make(map[string]int)
+	lastAnonLength := 0
+	allHaveAgentID := true
+	for rows.Next() {
+		var agentID string
+		var length int
+		var participates bool
+		if err := rows.Scan(&agentID, &length, &participates); err != nil {
+			return 0, err
+		}
+		if !participates {
+			continue
+		}
+		agentID = strings.TrimSpace(agentID)
+		if agentID == "" {
+			allHaveAgentID = false
+			lastAnonLength = length
+			continue
+		}
+		if _, ok := latestByAgent[agentID]; !ok {
+			order = append(order, agentID)
+		}
+		latestByAgent[agentID] = length
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	if len(latestByAgent) <= 1 {
+		if len(latestByAgent) == 0 {
+			return lastAnonLength, nil
+		}
+		length := latestByAgent[order[0]]
+		if lastAnonLength > 0 {
+			length += 2 + lastAnonLength
+		}
+		return length, nil
+	}
+	parts := make([]int, 0, len(order)+1)
+	for _, agentID := range order {
+		parts = append(parts, len(agentID)+2+latestByAgent[agentID])
+	}
+	if !allHaveAgentID && lastAnonLength > 0 {
+		parts = append(parts, lastAnonLength)
+	}
+	total := 0
+	for i, length := range parts {
+		if i > 0 {
+			total += 2
+		}
+		total += length
+	}
+	return total, nil
 }
 
 // ContentFailures returns the per-call content-failure verdicts captured

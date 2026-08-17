@@ -16,15 +16,12 @@ import (
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
 
-// TestCodexCheckpointBootstrapForUpgradedArchive pins the upgrade path:
-// an existing Codex archive (data version current, content committed) that
-// predates parser checkpoints must earn a checkpoint on its next ordinary
-// sync — one authoritative full parse that commits content and resume
-// state together — without forceParse or ResyncAll. After the bootstrap,
-// no-op syncs read no transcript bytes and appends read only the tail.
-// Deleting the bootstrap branch (falling back to the fingerprint skip)
-// makes this test fail because the checkpoint row never reappears.
-func TestCodexCheckpointBootstrapForUpgradedArchive(t *testing.T) {
+// TestCodexCheckpointAdoptionIsLazyForUpgradedArchive pins the upgrade path:
+// deleting the machine-local checkpoint from an already stored Codex session
+// must leave unchanged archives on the existing stat-digest fast path. The
+// checkpoint is adopted on the next real source change, when an authoritative
+// parse is already required.
+func TestCodexCheckpointAdoptionIsLazyForUpgradedArchive(t *testing.T) {
 	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122b05"
 	root := writeCodexParityRoot(t, uuid)
 	sessionID := "codex:" + uuid
@@ -40,7 +37,7 @@ func TestCodexCheckpointBootstrapForUpgradedArchive(t *testing.T) {
 	})
 	t.Cleanup(engine.Close)
 
-	// Initial cold sync: content plus a checkpoint.
+	// Initial cold sync commits content and a checkpoint.
 	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
 	cp, ok, err := database.GetParserCheckpoint(sessionID)
 	require.NoError(t, err)
@@ -50,40 +47,28 @@ func TestCodexCheckpointBootstrapForUpgradedArchive(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, before)
 
-	// Simulate a v88 archive written before checkpoints existed: the
-	// session content stays, the checkpoint rows are gone, and the data
-	// version remains current (88).
+	// Simulate an archive written before parser checkpoints existed.
 	require.NoError(t, database.DeleteParserCheckpoint(sessionID))
-	_, ok, err = database.GetParserCheckpoint(sessionID)
-	require.NoError(t, err)
-	require.False(t, ok)
 
-	// Ordinary sync (no forceParse, no ResyncAll): the bootstrap must
-	// re-establish the checkpoint while preserving the stored content.
-	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
-	cp, ok, err = database.GetParserCheckpoint(sessionID)
-	require.NoError(t, err)
-	require.True(t, ok, "the bootstrap must recreate the checkpoint")
-	require.Equal(t, codexCheckpointVersion, cp.Version)
-	after, err := database.GetAllMessages(t.Context(), sessionID)
-	require.NoError(t, err)
-	require.Equal(t, before, after,
-		"the bootstrap must preserve the stored projection")
-
-	// The next sync is a true no-op: zero writes and no transcript read.
+	// An unchanged archive stays on the current-main stat-digest path. It
+	// neither rewrites the session nor eagerly migrates optimization state.
 	if runtime.GOOS == "linux" {
 		rcharBefore := processRchar(t)
 		stats := engine.SyncAll(t.Context(), nil)
-		require.Zero(t, stats.Synced, "post-bootstrap sync must skip")
-		require.Less(t, processRchar(t)-rcharBefore, int64(1<<20),
-			"the no-op sync must not read the transcript")
+		require.Zero(t, stats.Synced)
+		require.Less(t, processRchar(t)-rcharBefore, int64(1<<20))
 	} else {
 		require.Zero(t, engine.SyncAll(t.Context(), nil).Synced)
 	}
+	_, ok, err = database.GetParserCheckpoint(sessionID)
+	require.NoError(t, err)
+	require.False(t, ok, "unchanged archives must not be eagerly migrated")
+	afterSkip, err := database.GetAllMessages(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.Equal(t, before, afterSkip)
 
-	// An appended late output resumes from the checkpoint: only the new
-	// tail (plus the bounded anchor) is read, and the merged rows match
-	// an authoritative full parse of the same bytes.
+	// A real append already requires parsing. The same authoritative write
+	// adopts a checkpoint atomically with the updated projection.
 	path := filepath.Join(
 		root, "2024", "01", "01",
 		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl",
@@ -92,6 +77,9 @@ func TestCodexCheckpointBootstrapForUpgradedArchive(t *testing.T) {
 		testjsonl.CodexFunctionCallOutputJSON(
 			"call_a", "late output", "2024-01-01T10:00:13Z",
 		),
+		testjsonl.CodexTokenCountJSON(
+			"2024-01-01T10:00:14Z", 240, 60, 160,
+		),
 	)
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
 	require.NoError(t, err)
@@ -99,27 +87,20 @@ func TestCodexCheckpointBootstrapForUpgradedArchive(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	if runtime.GOOS == "linux" {
-		rcharBefore := processRchar(t)
-		stats := engine.SyncAll(t.Context(), nil)
-		require.Zero(t, stats.Failed)
-		require.Equal(t, 1, stats.Synced)
-		require.Less(t, processRchar(t)-rcharBefore, int64(256<<10),
-			"the append must read only the bounded tail and anchor")
-	} else {
-		stats := engine.SyncAll(t.Context(), nil)
-		require.Zero(t, stats.Failed)
-		require.Equal(t, 1, stats.Synced)
-	}
+	stats := engine.SyncAll(t.Context(), nil)
+	require.Zero(t, stats.Failed)
+	require.Equal(t, 1, stats.Synced)
+	cp, ok, err = database.GetParserCheckpoint(sessionID)
+	require.NoError(t, err)
+	require.True(t, ok, "a real source change must adopt a checkpoint")
+	require.Equal(t, codexCheckpointVersion, cp.Version)
 
-	// Authoritative parity for the appended tail.
+	// Authoritative full-parse parity for the changed source.
 	cfg := parser.ProviderConfig{Roots: []string{root}, Machine: "local"}
 	provider, ok := parser.NewProvider(parser.AgentCodex, cfg)
 	require.True(t, ok)
 	source, found, err := provider.FindSource(
-		context.Background(), parser.FindSourceRequest{
-			FullSessionID: sessionID,
-		},
+		context.Background(), parser.FindSourceRequest{FullSessionID: sessionID},
 	)
 	require.NoError(t, err)
 	require.True(t, found)
@@ -128,31 +109,20 @@ func TestCodexCheckpointBootstrapForUpgradedArchive(t *testing.T) {
 		cfg, source, collecting,
 	)
 	require.NoError(t, err)
-	var wantEvents int
-	for _, m := range msgs {
-		for _, tc := range m.ToolCalls {
-			if tc.ToolUseID == "call_a" {
-				wantEvents = len(tc.ResultEvents)
-			}
-		}
-	}
-	require.Equal(t, 2, wantEvents,
-		"the authoritative parse sees both call_a outputs")
 	stored, err := database.GetAllMessages(t.Context(), sessionID)
 	require.NoError(t, err)
-	for _, m := range stored {
-		for _, tc := range m.ToolCalls {
-			if tc.ToolUseID == "call_a" {
-				require.Len(t, tc.ResultEvents, wantEvents,
-					"the append must merge exactly the authoritative result")
-				require.Equal(t, "late output",
-					tc.ResultEvents[len(tc.ResultEvents)-1].Content)
-			}
+	for i := range stored {
+		stored[i].ID = 0
+		stored[i].SessionID = ""
+		for j := range stored[i].ToolCalls {
+			stored[i].ToolCalls[j].MessageID = 0
+			stored[i].ToolCalls[j].SessionID = ""
 		}
 	}
+	require.Equal(t, toDBMessages(pendingWrite{msgs: msgs}, nil), stored)
 }
 
-func TestCodexCheckpointBootstrapIgnoresMatchingSkipEntry(t *testing.T) {
+func TestCodexCheckpointMissingHonorsMatchingSkipEntry(t *testing.T) {
 	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122c07"
 	root := writeCodexParityRoot(t, uuid)
 	sessionID := "codex:" + uuid
@@ -171,8 +141,6 @@ func TestCodexCheckpointBootstrapIgnoresMatchingSkipEntry(t *testing.T) {
 	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
 	require.NoError(t, database.DeleteParserCheckpoint(sessionID))
 
-	// Plant the exact skip-cache entry a warm process would carry; the
-	// bootstrap decision must win over the cache short-circuit.
 	path := filepath.Join(
 		root, "2024", "01", "01",
 		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl",
@@ -181,36 +149,29 @@ func TestCodexCheckpointBootstrapIgnoresMatchingSkipEntry(t *testing.T) {
 	provider, ok := parser.NewProvider(parser.AgentCodex, cfg)
 	require.True(t, ok)
 	source, found, err := provider.FindSource(
-		context.Background(), parser.FindSourceRequest{
-			FullSessionID: sessionID,
-		},
+		context.Background(), parser.FindSourceRequest{FullSessionID: sessionID},
 	)
 	require.NoError(t, err)
 	require.True(t, found)
 	fingerprint, err := provider.Fingerprint(context.Background(), source)
 	require.NoError(t, err)
 	file := parser.DiscoveredFile{
-		Path:            path,
-		Agent:           parser.AgentCodex,
-		ProviderSource:  &source,
-		ProviderProcess: true,
+		Path: path, Agent: parser.AgentCodex,
+		ProviderSource: &source, ProviderProcess: true,
 	}
 	cacheKey := providerProcessCacheKey(
 		file, source, fingerprint, provider.Capabilities().Sync,
 	)
-	engine.InjectSkipCache(map[string]int64{
-		cacheKey: fingerprint.MTimeNS,
-	})
+	engine.InjectSkipCache(map[string]int64{cacheKey: fingerprint.MTimeNS})
 
-	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced,
-		"the bootstrap must not be swallowed by a matching skip entry")
-	cp, ok, err := database.GetParserCheckpoint(sessionID)
+	require.Zero(t, engine.SyncAll(t.Context(), nil).Synced,
+		"missing optimization state must not defeat a valid skip entry")
+	_, ok, err = database.GetParserCheckpoint(sessionID)
 	require.NoError(t, err)
-	require.True(t, ok, "the bootstrap must recreate the checkpoint")
-	require.Equal(t, codexCheckpointVersion, cp.Version)
+	require.False(t, ok)
 }
 
-func TestCodexCheckpointInvalidRebuildsDespiteWarmGates(t *testing.T) {
+func TestCodexCheckpointInvalidIsDiscardedOnNextSourceChange(t *testing.T) {
 	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122c08"
 	root := writeCodexParityRoot(t, uuid)
 	sessionID := "codex:" + uuid
@@ -231,9 +192,6 @@ func TestCodexCheckpointInvalidRebuildsDespiteWarmGates(t *testing.T) {
 	t.Cleanup(engine.Close)
 
 	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
-	require.Zero(t, engine.SyncAll(t.Context(), nil).Synced,
-		"second pass must be a warm no-op")
-
 	cp, ok, err := database.GetParserCheckpoint(sessionID)
 	require.NoError(t, err)
 	require.True(t, ok)
@@ -244,18 +202,25 @@ func TestCodexCheckpointInvalidRebuildsDespiteWarmGates(t *testing.T) {
 	corrupted.Hash = "corrupted-proof"
 	require.NoError(t, database.UpsertParserCheckpoint(corrupted, blobs))
 
-	// An unchanged source whose checkpoint proof no longer matches the
-	// archive must take an authoritative rebuild; the stat-digest and
-	// verified-source fast paths must not skip it.
-	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
-	fixed, ok, err := database.GetParserCheckpoint(sessionID)
+	// Stat-digest freshness may skip an unchanged source without consulting
+	// disposable checkpoint state. A real source change reaches checkpoint
+	// validation, rejects the corrupted proof, and performs a full repair.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
 	require.NoError(t, err)
-	require.True(t, ok)
-	require.NotEqual(t, "corrupted-proof", fixed.Hash,
-		"the rebuild must repair the checkpoint proof")
-	storedHash, hasHash := database.GetFileHashByAgentPath(path, "codex")
-	require.True(t, hasHash)
-	require.Equal(t, storedHash, fixed.Hash)
+	_, err = f.WriteString(testjsonl.CodexMsgJSON(
+		"user", "changed", "2024-01-01T10:00:13Z",
+	))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+	_, ok, err = database.GetParserCheckpoint(sessionID)
+	require.NoError(t, err)
+	require.False(t, ok,
+		"an unsafe full-parse boundary must discard the invalid checkpoint")
+	stored, err := database.GetAllMessages(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.Equal(t, "changed", stored[len(stored)-1].Content)
 }
 
 func TestCodexCheckpointAuditDeepVerifiesDespiteWarmGates(t *testing.T) {

@@ -645,6 +645,21 @@ func NewEngine(
 		maps.Copy(providerModes, cfg.ProviderMigrationModes)
 	}
 
+	stagedCodexDir := cfg.CodexStagingDir
+	if stagedCodexDir == "" {
+		dbPath := database.Path()
+		if dbPath != "" && dbPath != ":memory:" {
+			stagedCodexDir = filepath.Join(
+				filepath.Dir(dbPath), "scratch", "codex",
+			)
+		}
+	}
+	if stagedCodexDir != "" {
+		if err := prepareCodexStagingDir(stagedCodexDir); err != nil {
+			log.Printf("preparing codex staging directory: %v", err)
+		}
+	}
+
 	if cfg.ScanProtectedPaths {
 		// Parsers extract project names by probing recorded cwds for git
 		// roots; that guard is package-level because extraction runs deep
@@ -663,7 +678,7 @@ func NewEngine(
 		machine:                 cfg.Machine,
 		blockedResultCategories: blockedCategorySet(cfg.BlockedResultCategories),
 		stagedCodexMin:          stagedCodexMinBytes(cfg.StagedCodexParseMinBytes),
-		stagedCodexDir:          cfg.CodexStagingDir,
+		stagedCodexDir:          stagedCodexDir,
 		cwdFilter:               newCwdPrefixFilter(cfg.IncludeCwdPrefixes),
 		scanProtectedPaths:      cfg.ScanProtectedPaths,
 		homeDir:                 userHomeDirOrEmpty(),
@@ -8009,19 +8024,6 @@ func (e *Engine) collectAndBatch(
 			stats.cwdFilteredSessions += outcome.cwdFiltered
 			progress.MessagesIndexed += outcome.writtenMessages
 			stats.messagesIndexed = progress.MessagesIndexed
-			// Persist full-parse checkpoints only for rows whose session
-			// commit succeeded, mirroring the freshness-digest gate: an
-			// unconfirmed checkpoint would let a later append resume from a
-			// prefix that was never durably parsed.
-			for i, pw := range pending {
-				if len(pw.checkpoint) == 0 {
-					continue
-				}
-				if i >= len(outcome.written) || !outcome.written[i] {
-					continue
-				}
-				e.persistFullParseCheckpoint(ctx, pw)
-			}
 		}()
 		pending = pending[:0]
 		pendingBytes = 0
@@ -8521,14 +8523,15 @@ func drainResults(results <-chan syncJob, remaining int) {
 // incremental JSONL parse, used to partially update the
 // session row without overwriting unrelated columns.
 type incrementalUpdate struct {
-	sessionID       string
-	project         string
-	sourceProject   string
-	machine         string
-	cwd             string
-	msgs            []parser.ParsedMessage
-	links           []parser.ClaudeSubagentLink
-	toolCallUpdates []parser.ParsedToolCallUpdate
+	sessionID           string
+	project             string
+	sourceProject       string
+	machine             string
+	cwd                 string
+	msgs                []parser.ParsedMessage
+	links               []parser.ClaudeSubagentLink
+	toolCallUpdates     []parser.ParsedToolCallUpdate
+	messageUsageUpdates []parser.ParsedMessageTokenUsageUpdate
 	// checkpoint is the machine-local parser checkpoint to persist in the
 	// same transaction as this incremental delta. nil keeps the existing
 	// checkpoint (or leaves none).
@@ -8969,42 +8972,21 @@ func (e *Engine) processProviderFile(
 		source.ProjectHint = file.Project
 	}
 
-	// Codex checkpoint decision: evaluate the persisted checkpoint before
-	// any freshness fast path. A stored Codex session whose checkpoint is
-	// missing (upgraded archive) or whose proof failed must take one
-	// authoritative full parse; the verified-source, stat-digest,
-	// single-session, watermark, and skip-cache gates must not swallow
-	// that rebuild. A proven-unchanged checkpoint likewise wins over the
-	// generic gates and returns the same confirmed-unchanged skip.
+	// Codex checkpoint decision: an invalid proof requires an authoritative
+	// replacement. A missing checkpoint is merely absent optimization state:
+	// unchanged upgraded archives keep the existing stat/content freshness
+	// gates and earn a checkpoint lazily on their next real source change.
 	var fingerprint parser.SourceFingerprint
 	var codexCheckpoint *db.ParserCheckpoint
 	var codexSeed []byte
 	var codexFullHash string
 	var codexHashState []byte
 	codexForceFullParse := false
+	codexLazyBootstrap := false
 	codexProvenUnchanged := false
-	codexAuditDeepVerify := e.checkpointAudit.Load()
+	codexAuditDeepVerify := e.checkpointAudit.Load() &&
+		isCodexFormatAgent(file.Agent)
 	var codexUnchangedMtime int64
-	if isCodexFormatAgent(file.Agent) {
-		cpResult, cpErr := e.codexCheckpointFingerprint(ctx, source, file)
-		if cpErr != nil {
-			log.Printf("codex checkpoint %s: %v", file.Path, cpErr)
-		} else {
-			switch cpResult.decision {
-			case codexCheckpointUnchanged:
-				codexProvenUnchanged = true
-				codexUnchangedMtime = cpResult.fingerprint.MTimeNS
-			case codexCheckpointAppend:
-				fingerprint = cpResult.fingerprint
-				codexCheckpoint = cpResult.checkpoint
-				codexSeed = cpResult.seed
-				codexFullHash = cpResult.fingerprint.Hash
-				codexHashState = cpResult.hashState
-			case codexCheckpointBootstrap, codexCheckpointInvalid:
-				codexForceFullParse = true
-			}
-		}
-	}
 	verifiedCapture, verifiedMtime, verifiedFresh, verifiedStateOK :=
 		e.verifiedProviderSourceState(provider, source, file)
 	if !codexForceFullParse && !codexProvenUnchanged &&
@@ -9084,6 +9066,34 @@ func (e *Engine) processProviderFile(
 				skip:  true,
 				mtime: freshMTime,
 			}, true
+		}
+	}
+
+	// Consult the heavier checkpoint tables only after the free in-memory and
+	// persisted stat-digest gates have declined. This preserves current-main
+	// warm-sweep behavior while still proving appends before any full content
+	// fingerprint read. Audit mode deliberately bypasses this optimization and
+	// takes the authoritative full-parse path below.
+	if isCodexFormatAgent(file.Agent) && !codexAuditDeepVerify {
+		cpResult, cpErr := e.codexCheckpointFingerprint(ctx, source, file)
+		if cpErr != nil {
+			log.Printf("codex checkpoint %s: %v", file.Path, cpErr)
+		} else {
+			switch cpResult.decision {
+			case codexCheckpointUnchanged:
+				codexProvenUnchanged = true
+				codexUnchangedMtime = cpResult.fingerprint.MTimeNS
+			case codexCheckpointAppend:
+				fingerprint = cpResult.fingerprint
+				codexCheckpoint = cpResult.checkpoint
+				codexSeed = cpResult.seed
+				codexFullHash = cpResult.fingerprint.Hash
+				codexHashState = cpResult.hashState
+			case codexCheckpointMissing:
+				codexLazyBootstrap = true
+			case codexCheckpointInvalid:
+				codexForceFullParse = true
+			}
 		}
 	}
 
@@ -9354,7 +9364,7 @@ func (e *Engine) processProviderFile(
 	// stored messages instead of appending on top of stale rows.
 	var incRes processResult
 	var incOK bool
-	if codexForceFullParse {
+	if codexForceFullParse || codexLazyBootstrap {
 		incRes = processResult{forceReplace: true}
 	} else if codexAuditDeepVerify {
 		// The audit content-hashes the full source below and repairs only
@@ -9443,7 +9453,9 @@ func (e *Engine) processProviderFile(
 	// bounds the parsed payload and attach it to every result carrying that
 	// data. A result still classified as a skip below releases it immediately.
 	sourceBytes := parseRetentionSourceBytes(file)
-	lease, err := e.retentionBudget().acquire(ctx, sourceBytes)
+	lease, err := e.retentionBudget().acquire(
+		ctx, parseRetentionAdmissionBytes(file, sourceBytes),
+	)
 	if err != nil {
 		return processResult{err: err}, true
 	}
@@ -9462,7 +9474,7 @@ func (e *Engine) processProviderFile(
 		sourceBytes > e.stagedCodexMin &&
 		!e.forceParse {
 		stagedSink, err = newCodexStagingSink(
-			e.stagedCodexDir, e.blockedResultCategories,
+			e.stagedCodexDir, e.blockedResultCategories, sourceBytes,
 		)
 		if err != nil {
 			lease.Release()
@@ -11520,7 +11532,7 @@ func (e *Engine) tryProviderIncrementalAppend(
 
 	parseFn := func(
 		_ string, inc *db.IncrementalInfo,
-	) ([]parser.ParsedMessage, []parser.ClaudeSubagentLink, []parser.ParsedToolCallUpdate, time.Time, int64, *string, []byte, error) {
+	) ([]parser.ParsedMessage, []parser.ClaudeSubagentLink, []parser.ParsedToolCallUpdate, []parser.ParsedMessageTokenUsageUpdate, time.Time, int64, *string, []byte, error) {
 		// The Claude parser needs the stored tail's provider message id
 		// so its queued-command masking fallback fires only for a real
 		// same-message.id continuation; without it, every routine queued
@@ -11546,17 +11558,18 @@ func (e *Engine) tryProviderIncrementalAppend(
 				StoredSessionKind:         inc.SessionKind,
 				StoredClaudeLinearParse:   inc.ClaudeLinearParse,
 				StoredLastClaudeMessageID: storedLastClaudeMessageID,
+				StoredPendingUsageOrdinal: inc.PendingUsageOrdinal,
 			},
 		)
 		if perr != nil {
-			return nil, nil, nil, time.Time{}, 0, nil, nil, perr
+			return nil, nil, nil, nil, time.Time{}, 0, nil, nil, perr
 		}
 		switch status {
 		case parser.IncrementalNeedsFullParse:
 			if outcome.ForceReplace {
 				// Signal the shared helper to fall back to a
 				// full parse that replaces stored messages.
-				return nil, nil, nil, time.Time{}, 0, nil, nil,
+				return nil, nil, nil, nil, time.Time{}, 0, nil, nil,
 					parser.ErrIncrementalNeedsFullParse
 			}
 			// A plain full-parse fallback without a replace request.
@@ -11564,9 +11577,9 @@ func (e *Engine) tryProviderIncrementalAppend(
 			// fallbacks (a DAG fork can drop or re-branch stored
 			// rows), so this branch serves providers that only need
 			// an append-preserving full parse.
-			return nil, nil, nil, time.Time{}, 0, nil, nil, parser.ErrDAGDetected
+			return nil, nil, nil, nil, time.Time{}, 0, nil, nil, parser.ErrDAGDetected
 		case parser.IncrementalNoNewData:
-			return nil, nil, nil, time.Time{}, 0, nil, nil, nil
+			return nil, nil, nil, nil, time.Time{}, 0, nil, nil, nil
 		default:
 			var terminationStatus *string
 			if outcome.TerminationStatus != nil {
@@ -11575,6 +11588,7 @@ func (e *Engine) tryProviderIncrementalAppend(
 			}
 			return outcome.Messages, outcome.SubagentLinks,
 				outcome.ToolCallUpdates,
+				outcome.MessageTokenUsageUpdates,
 				outcome.EndedAt, outcome.ConsumedBytes, terminationStatus,
 				outcome.NextCursor, nil
 		}
@@ -11594,7 +11608,7 @@ func (e *Engine) tryProviderIncrementalAppend(
 // only complete, valid JSON lines so it can be used as a safe resume offset.
 type incrementalParseFunc func(
 	path string, inc *db.IncrementalInfo,
-) ([]parser.ParsedMessage, []parser.ClaudeSubagentLink, []parser.ParsedToolCallUpdate, time.Time, int64, *string, []byte, error)
+) ([]parser.ParsedMessage, []parser.ClaudeSubagentLink, []parser.ParsedToolCallUpdate, []parser.ParsedMessageTokenUsageUpdate, time.Time, int64, *string, []byte, error)
 
 // tryIncrementalJSONL attempts an incremental parse of an
 // append-only JSONL file by reading only bytes appended since
@@ -11713,12 +11727,14 @@ func (e *Engine) tryIncrementalJSONL(
 	// incremental results below and released on every decline (fall-through to
 	// a full parse re-acquires at the provider parse seam) or skip return.
 	sourceBytes := parseRetentionSourceBytes(file)
-	lease, leaseErr := e.retentionBudget().acquire(ctx, sourceBytes)
+	lease, leaseErr := e.retentionBudget().acquire(
+		ctx, parseRetentionAdmissionBytes(file, sourceBytes),
+	)
 	if leaseErr != nil {
 		return processResult{err: leaseErr}, true
 	}
 
-	newMsgs, links, toolCallUpdates, endedAt, consumed, terminationStatus, cursor, err := parseFn(
+	newMsgs, links, toolCallUpdates, messageUsageUpdates, endedAt, consumed, terminationStatus, cursor, err := parseFn(
 		file.Path, inc,
 	)
 	if err != nil {
@@ -11823,6 +11839,38 @@ func (e *Engine) tryIncrementalJSONL(
 		}
 	}
 
+	totalOut := inc.TotalOutputTokens
+	peakCtx := inc.PeakContextTokens
+	hasTotalOut := inc.HasTotalOutputTokens
+	hasPeakCtx := inc.HasPeakContextTokens
+	for _, m := range newMsgs {
+		msgHasCtx, msgHasOut := m.TokenPresence()
+		// Accumulate from per-message values already bounded to the
+		// per-message clamp the central pass applies to the stored rows, so
+		// a corrupt new message cannot inflate the session aggregates past
+		// what the persisted rows justify (parity with the full path, which
+		// re-derives message-derived totals from the clamped rows).
+		if msgHasOut {
+			totalOut += clampedTokens(m.OutputTokens)
+			hasTotalOut = true
+		}
+		if ctx := clampedTokens(m.ContextTokens); msgHasCtx &&
+			(!hasPeakCtx || ctx > peakCtx) {
+			peakCtx = ctx
+			hasPeakCtx = true
+		}
+	}
+	for _, usageUpdate := range messageUsageUpdates {
+		if usageUpdate.HasOutputTokens {
+			totalOut += clampedTokens(usageUpdate.OutputTokens)
+			hasTotalOut = true
+		}
+		if ctx := clampedTokens(usageUpdate.ContextTokens); usageUpdate.HasContextTokens && (!hasPeakCtx || ctx > peakCtx) {
+			peakCtx = ctx
+			hasPeakCtx = true
+		}
+	}
+
 	if len(newMsgs) == 0 {
 		// No new messages, but advance the offset past
 		// non-message lines (progress events, metadata)
@@ -11840,6 +11888,7 @@ func (e *Engine) tryIncrementalJSONL(
 					cwd:                  inc.Cwd,
 					links:                links,
 					toolCallUpdates:      toolCallUpdates,
+					messageUsageUpdates:  messageUsageUpdates,
 					checkpoint:           nextCheckpoint,
 					checkpointBlobs:      nextCheckpointBlobs,
 					endedAt:              endedAt,
@@ -11851,10 +11900,10 @@ func (e *Engine) tryIncrementalJSONL(
 					fileHash:             incHash,
 					nextOrdinal:          inc.NextOrdinal,
 					lastEntryUUID:        inc.LastEntryUUID,
-					totalOutputTokens:    inc.TotalOutputTokens,
-					peakContextTokens:    inc.PeakContextTokens,
-					hasTotalOutputTokens: inc.HasTotalOutputTokens,
-					hasPeakContextTokens: inc.HasPeakContextTokens,
+					totalOutputTokens:    totalOut,
+					peakContextTokens:    peakCtx,
+					hasTotalOutputTokens: hasTotalOut,
+					hasPeakContextTokens: hasPeakCtx,
 				},
 				retentionLease: lease,
 			}, true
@@ -11930,28 +11979,6 @@ func (e *Engine) tryIncrementalJSONL(
 		agent, inc.ID, len(newMsgs), inc.FileSize,
 	)
 
-	totalOut := inc.TotalOutputTokens
-	peakCtx := inc.PeakContextTokens
-	hasTotalOut := inc.HasTotalOutputTokens
-	hasPeakCtx := inc.HasPeakContextTokens
-	for _, m := range newMsgs {
-		msgHasCtx, msgHasOut := m.TokenPresence()
-		// Accumulate from per-message values already bounded to the
-		// per-message clamp the central pass applies to the stored rows, so
-		// a corrupt new message cannot inflate the session aggregates past
-		// what the persisted rows justify (parity with the full path, which
-		// re-derives message-derived totals from the clamped rows).
-		if msgHasOut {
-			totalOut += clampedTokens(m.OutputTokens)
-			hasTotalOut = true
-		}
-		if ctx := clampedTokens(m.ContextTokens); msgHasCtx &&
-			(!hasPeakCtx || ctx > peakCtx) {
-			peakCtx = ctx
-			hasPeakCtx = true
-		}
-	}
-
 	return processResult{
 		sourceBytes: sourceBytes,
 		incremental: &incrementalUpdate{
@@ -11963,6 +11990,7 @@ func (e *Engine) tryIncrementalJSONL(
 			msgs:                 newMsgs,
 			links:                links,
 			toolCallUpdates:      toolCallUpdates,
+			messageUsageUpdates:  messageUsageUpdates,
 			checkpoint:           nextCheckpoint,
 			checkpointBlobs:      nextCheckpointBlobs,
 			endedAt:              endedAt,
@@ -14256,18 +14284,23 @@ type localGitIdentity struct {
 	worktreeKind   export.WorktreeRelationship
 }
 
-// stagedToolCallPositions maps every tool_use_id in the message model to
-// its final message/call coordinates for the staged publish.
+// stagedToolCallPositions maps every occurrence-qualified staging key in the
+// message model to its final message/call coordinates. Provider call IDs can
+// repeat, so raw tool_use_id alone cannot identify a staged event target.
 func stagedToolCallPositions(
 	msgs []db.Message,
 ) map[string]db.StagedToolCallPosition {
 	positions := make(map[string]db.StagedToolCallPosition)
+	callOccurrences := make(map[string]int)
 	for _, m := range msgs {
 		for callIdx, tc := range m.ToolCalls {
 			if tc.ToolUseID == "" {
 				continue
 			}
-			positions[tc.ToolUseID] = db.StagedToolCallPosition{
+			occurrence := callOccurrences[tc.ToolUseID]
+			callOccurrences[tc.ToolUseID] = occurrence + 1
+			stageKey := db.StagedToolCallKey(tc.ToolUseID, occurrence)
+			positions[stageKey] = db.StagedToolCallPosition{
 				ToolUseID: tc.ToolUseID,
 				Ordinal:   m.Ordinal,
 				CallIndex: callIdx,
@@ -14426,6 +14459,20 @@ func (e *Engine) writeBatchBulkWithOutcome(
 		update, findings := computeSignalsAndSecrets(s, msgs)
 		e.phaseStats.ScanNanos.Add(int64(time.Since(tScan)))
 		snapshotProject := pw.sess.Project
+		var checkpoint *db.ParserCheckpoint
+		var checkpointBlobs *db.ParserCheckpointBlobs
+		if isCodexFormatAgent(pw.sess.Agent) {
+			var checkpointErr error
+			checkpoint, checkpointBlobs, checkpointErr =
+				e.buildCodexFullParseCheckpoint(pw.sess.File.Path, pw)
+			if checkpointErr != nil {
+				log.Printf(
+					"checkpoint build %s: %v",
+					pw.sess.File.Path, checkpointErr,
+				)
+				checkpoint, checkpointBlobs = nil, nil
+			}
+		}
 		writes = append(writes, db.SessionBatchWrite{
 			Session:     s,
 			Messages:    msgs,
@@ -14438,6 +14485,8 @@ func (e *Engine) writeBatchBulkWithOutcome(
 			Findings:                findings,
 			DataVersion:             dataVersionForWrite(pw),
 			ReplaceMessages:         replaceMessages,
+			Checkpoint:              checkpoint,
+			CheckpointBlobs:         checkpointBlobs,
 		})
 		pendingIndexes = append(pendingIndexes, pendingIndex)
 		pendingByID[s.ID] = pw
@@ -14978,6 +15027,7 @@ func shouldReplaceFullParseMessages(
 ) bool {
 	return forceReplace || pw.forceReplace || pw.needsRetry || stale ||
 		revivingSourceMissing ||
+		isCodexFormatAgent(pw.sess.Agent) ||
 		pw.sess.Agent == parser.AgentCowork ||
 		// Copilot execution start/completion records arrive after the
 		// assistant tool-call message and attach result events to it. An
@@ -15128,6 +15178,19 @@ func (e *Engine) writeIncremental(
 			Events:    toolCall.ResultEvents,
 		}
 	}
+	messageUsageUpdates := make(
+		[]db.MessageTokenUsageUpdate, len(inc.messageUsageUpdates),
+	)
+	for i, update := range inc.messageUsageUpdates {
+		messageUsageUpdates[i] = db.MessageTokenUsageUpdate{
+			Ordinal:          update.Ordinal,
+			TokenUsage:       append([]byte(nil), update.TokenUsage...),
+			ContextTokens:    clampedTokens(update.ContextTokens),
+			OutputTokens:     clampedTokens(update.OutputTokens),
+			HasContextTokens: update.HasContextTokens,
+			HasOutputTokens:  update.HasOutputTokens,
+		}
+	}
 
 	signalsMaintained := false
 	var maintainer db.SignalMaintainer
@@ -15142,7 +15205,7 @@ func (e *Engine) writeIncremental(
 			); err == nil {
 				maintainer = e.newIncrementalSignalMaintainer(
 					inc, dbMsgs, toolCallResultUpdates,
-					preRev, preSecrets,
+					messageUsageUpdates, preRev, preSecrets,
 				)
 			}
 		}
@@ -15151,25 +15214,26 @@ func (e *Engine) writeIncremental(
 		inc.sessionID,
 		dbMsgs,
 		db.IncrementalSessionUpdate{
-			EndedAt:                 endedAt,
-			TerminationStatus:       inc.terminationStatus,
-			MsgCount:                msgCount,
-			UserMsgCount:            userMsgCount,
-			FileSize:                inc.fileSize,
-			FileMtime:               inc.fileMtime,
-			FileHash:                strPtr(inc.fileHash),
-			NextOrdinal:             inc.nextOrdinal,
-			LastEntryUUID:           inc.lastEntryUUID,
-			TotalOutputTokens:       inc.totalOutputTokens,
-			PeakContextTokens:       inc.peakContextTokens,
-			HasTotalOutputTokens:    inc.hasTotalOutputTokens,
-			HasPeakContextTokens:    inc.hasPeakContextTokens,
-			SubagentLinks:           subagentLinks,
-			ToolCallResultUpdates:   toolCallResultUpdates,
-			Checkpoint:              inc.checkpoint,
-			CheckpointBlobs:         inc.checkpointBlobs,
-			BlockedResultCategories: e.blockedResultCategories,
-			SignalMaintainer:        maintainer,
+			EndedAt:                  endedAt,
+			TerminationStatus:        inc.terminationStatus,
+			MsgCount:                 msgCount,
+			UserMsgCount:             userMsgCount,
+			FileSize:                 inc.fileSize,
+			FileMtime:                inc.fileMtime,
+			FileHash:                 strPtr(inc.fileHash),
+			NextOrdinal:              inc.nextOrdinal,
+			LastEntryUUID:            inc.lastEntryUUID,
+			TotalOutputTokens:        inc.totalOutputTokens,
+			PeakContextTokens:        inc.peakContextTokens,
+			HasTotalOutputTokens:     inc.hasTotalOutputTokens,
+			HasPeakContextTokens:     inc.hasPeakContextTokens,
+			SubagentLinks:            subagentLinks,
+			ToolCallResultUpdates:    toolCallResultUpdates,
+			MessageTokenUsageUpdates: messageUsageUpdates,
+			Checkpoint:               inc.checkpoint,
+			CheckpointBlobs:          inc.checkpointBlobs,
+			BlockedResultCategories:  e.blockedResultCategories,
+			SignalMaintainer:         maintainer,
 		},
 	)
 	if err != nil {
@@ -15326,8 +15390,22 @@ func (e *Engine) writeSessionFullWithResolver(
 		}
 	} else {
 		update, findings := computeSignalsAndSecrets(s, msgs)
-		if err := e.db.ReplaceSessionContent(
-			s.ID, msgs, update, findings,
+		var checkpoint *db.ParserCheckpoint
+		var checkpointBlobs *db.ParserCheckpointBlobs
+		if isCodexFormatAgent(pw.sess.Agent) {
+			var checkpointErr error
+			checkpoint, checkpointBlobs, checkpointErr =
+				e.buildCodexFullParseCheckpoint(pw.sess.File.Path, pw)
+			if checkpointErr != nil {
+				log.Printf(
+					"checkpoint build %s: %v",
+					pw.sess.File.Path, checkpointErr,
+				)
+				checkpoint, checkpointBlobs = nil, nil
+			}
+		}
+		if err := e.db.ReplaceSessionContentWithCheckpoint(
+			s.ID, msgs, update, findings, checkpoint, checkpointBlobs,
 		); err != nil {
 			log.Printf(
 				"replace messages for %s: %v",
@@ -15365,10 +15443,6 @@ func (e *Engine) writeSessionFullWithResolver(
 		log.Printf("revive source-missing session %s: %v", s.ID, err)
 		return err
 	}
-	if len(pw.checkpoint) > 0 {
-		e.persistFullParseCheckpoint(context.Background(), pw)
-	}
-
 	return nil
 }
 

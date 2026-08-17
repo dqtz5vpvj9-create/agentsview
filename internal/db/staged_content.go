@@ -2,10 +2,13 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/binary"
 	"fmt"
 	"log"
+	"strconv"
 )
 
 // StagedToolResults is the publish-side handle for tool-result rows staged
@@ -51,6 +54,20 @@ type StagedToolCallPosition struct {
 	ToolUseID string
 	Ordinal   int
 	CallIndex int
+}
+
+// StagedToolCallKey returns the internal staging key for one occurrence of a
+// provider call ID. Provider call IDs are not guaranteed unique within a
+// transcript, so staged rows use occurrence identity while the published
+// tool_use_id remains unchanged.
+func StagedToolCallKey(toolUseID string, occurrence int) string {
+	// Use a printable, length-prefixed key. Embedded NUL bytes are legal in
+	// Go strings but are not a safe SQLite TEXT identity across every
+	// go-sqlite3 binding path: a bound value may be observed only up to the
+	// first NUL on a later connection. The byte length keeps the encoding
+	// unambiguous even when the provider call ID itself contains colons.
+	return strconv.Itoa(len(toolUseID)) + ":" + toolUseID + ":" +
+		strconv.Itoa(occurrence)
 }
 
 // stagedAttachName is the schema name the scratch database is attached
@@ -99,6 +116,192 @@ func (db *DB) ReplaceSessionContentStagedWithCheckpoint(
 	)
 }
 
+func writeStagedDigestString(h interface{ Write([]byte) (int, error) }, value string) {
+	var size [8]byte
+	binary.LittleEndian.PutUint64(size[:], uint64(len(value)))
+	_, _ = h.Write(size[:])
+	_, _ = h.Write([]byte(value))
+}
+
+func writeStagedDigestInt(h interface{ Write([]byte) (int, error) }, value int64) {
+	var encoded [8]byte
+	binary.LittleEndian.PutUint64(encoded[:], uint64(value))
+	_, _ = h.Write(encoded[:])
+}
+
+// stagedSessionContentDigestTx hashes every parser-owned transcript field while
+// ignoring SQLite row IDs. It lets a forced staged verification prove that the
+// normalized content is unchanged and avoid delete/reinsert revision churn.
+func stagedSessionContentDigestTx(
+	tx *sql.Tx, sessionID string,
+) ([sha256.Size]byte, error) {
+	h := sha256.New()
+	rows, err := tx.Query(`
+		SELECT ordinal, role, content, thinking_text, COALESCE(timestamp, ''),
+		       has_thinking, has_tool_use, content_length, is_system, model,
+		       token_usage, context_tokens, output_tokens,
+		       has_context_tokens, has_output_tokens,
+		       claude_message_id, claude_request_id, source_type,
+		       source_subtype, prompt_source, source_uuid,
+		       source_parent_uuid, is_sidechain, is_compact_boundary
+		FROM messages WHERE session_id = ? ORDER BY ordinal`, sessionID)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	for rows.Next() {
+		var ordinal, hasThinking, hasToolUse, contentLength, isSystem int64
+		var contextTokens, outputTokens, hasContext, hasOutput int64
+		var isSidechain, isCompact int64
+		var role, content, thinking, timestamp, model, tokenUsage string
+		var claudeMessageID, claudeRequestID, sourceType, sourceSubtype string
+		var promptSource, sourceUUID, sourceParentUUID string
+		if err := rows.Scan(
+			&ordinal, &role, &content, &thinking, &timestamp,
+			&hasThinking, &hasToolUse, &contentLength, &isSystem, &model,
+			&tokenUsage, &contextTokens, &outputTokens, &hasContext, &hasOutput,
+			&claudeMessageID, &claudeRequestID, &sourceType, &sourceSubtype,
+			&promptSource, &sourceUUID, &sourceParentUUID, &isSidechain, &isCompact,
+		); err != nil {
+			rows.Close()
+			return [sha256.Size]byte{}, err
+		}
+		writeStagedDigestString(h, "message")
+		for _, value := range []int64{
+			ordinal, hasThinking, hasToolUse, contentLength, isSystem,
+			contextTokens, outputTokens, hasContext, hasOutput,
+			isSidechain, isCompact,
+		} {
+			writeStagedDigestInt(h, value)
+		}
+		for _, value := range []string{
+			role, content, thinking, timestamp, model, tokenUsage,
+			claudeMessageID, claudeRequestID, sourceType, sourceSubtype,
+			promptSource, sourceUUID, sourceParentUUID,
+		} {
+			writeStagedDigestString(h, value)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return [sha256.Size]byte{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return [sha256.Size]byte{}, err
+	}
+
+	rows, err = tx.Query(`
+		SELECT m.ordinal, COALESCE(tc.call_index, 0), tc.tool_name, tc.category,
+		       COALESCE(tc.tool_use_id, ''), COALESCE(tc.input_json, ''),
+		       COALESCE(tc.skill_name, ''),
+		       COALESCE(tc.result_content_length, 0),
+		       COALESCE(tc.result_content, ''),
+		       COALESCE(tc.subagent_session_id, ''), COALESCE(tc.file_path, '')
+		FROM tool_calls tc JOIN messages m ON m.id = tc.message_id
+		WHERE tc.session_id = ?
+		ORDER BY m.ordinal, COALESCE(tc.call_index, 0), tc.id`, sessionID)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	for rows.Next() {
+		var ordinal, callIndex, resultLength int64
+		var toolName, category, toolUseID, inputJSON, skillName string
+		var resultContent, subagentSessionID, filePath string
+		if err := rows.Scan(
+			&ordinal, &callIndex, &toolName, &category, &toolUseID,
+			&inputJSON, &skillName, &resultLength, &resultContent,
+			&subagentSessionID, &filePath,
+		); err != nil {
+			rows.Close()
+			return [sha256.Size]byte{}, err
+		}
+		writeStagedDigestString(h, "tool_call")
+		writeStagedDigestInt(h, ordinal)
+		writeStagedDigestInt(h, callIndex)
+		writeStagedDigestInt(h, resultLength)
+		for _, value := range []string{
+			toolName, category, toolUseID, inputJSON, skillName,
+			resultContent, subagentSessionID, filePath,
+		} {
+			writeStagedDigestString(h, value)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return [sha256.Size]byte{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return [sha256.Size]byte{}, err
+	}
+
+	rows, err = tx.Query(`
+		SELECT tool_call_message_ordinal, call_index,
+		       COALESCE(tool_use_id, ''), COALESCE(agent_id, ''),
+		       COALESCE(subagent_session_id, ''), source, status, content,
+		       content_length, COALESCE(timestamp, ''), event_index
+		FROM tool_result_events WHERE session_id = ?
+		ORDER BY tool_call_message_ordinal, call_index, event_index, id`, sessionID)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	for rows.Next() {
+		var ordinal, callIndex, contentLength, eventIndex int64
+		var toolUseID, agentID, subagentID, source, status, content, timestamp string
+		if err := rows.Scan(
+			&ordinal, &callIndex, &toolUseID, &agentID, &subagentID,
+			&source, &status, &content, &contentLength, &timestamp, &eventIndex,
+		); err != nil {
+			rows.Close()
+			return [sha256.Size]byte{}, err
+		}
+		writeStagedDigestString(h, "event")
+		writeStagedDigestInt(h, ordinal)
+		writeStagedDigestInt(h, callIndex)
+		writeStagedDigestInt(h, contentLength)
+		writeStagedDigestInt(h, eventIndex)
+		for _, value := range []string{
+			toolUseID, agentID, subagentID, source, status, content, timestamp,
+		} {
+			writeStagedDigestString(h, value)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return [sha256.Size]byte{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return [sha256.Size]byte{}, err
+	}
+
+	var digest [sha256.Size]byte
+	copy(digest[:], h.Sum(nil))
+	return digest, nil
+}
+
+func commitStagedCheckpointOnly(
+	ctx context.Context, conn *sql.Conn, sessionID string,
+	cp *ParserCheckpoint, blobs *ParserCheckpointBlobs,
+) error {
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if cp == nil || blobs == nil {
+		if err := deleteParserCheckpointTx(tx, sessionID); err != nil {
+			return err
+		}
+	} else {
+		c := *cp
+		b := *blobs
+		c.SessionID = sessionID
+		b.SessionID = sessionID
+		if err := upsertParserCheckpointTx(tx, c, b); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (db *DB) replaceSessionContentStaged(
 	ctx context.Context,
 	sessionID string, msgs []Message,
@@ -135,12 +338,30 @@ func (db *DB) replaceSessionContentStaged(
 	if err != nil {
 		return err
 	}
+	contentBefore, err := stagedSessionContentDigestTx(tx, sessionID)
+	if err != nil {
+		return fmt.Errorf("fingerprinting stored staged content: %w", err)
+	}
 	var pendingRecallRevocations recallEvidenceRevocationEvents
 
 	if err := replaceSessionMessagesTxStaged(
 		tx, sessionID, msgs, staged, blocked,
 	); err != nil {
 		return err
+	}
+	contentAfter, err := stagedSessionContentDigestTx(tx, sessionID)
+	if err != nil {
+		return fmt.Errorf("fingerprinting proposed staged content: %w", err)
+	}
+	if contentBefore == contentAfter {
+		// Keep the existing row identities, revision, export marker, and recall
+		// evidence. Only the machine-local checkpoint may need to advance.
+		if err := tx.Rollback(); err != nil {
+			return err
+		}
+		return commitStagedCheckpointOnly(
+			ctx, conn, sessionID, cp, blobs,
+		)
 	}
 	// Summary resolution above recorded per-call content-failure
 	// verdicts; fold them into the final signal update and findings now,
@@ -177,7 +398,11 @@ func (db *DB) replaceSessionContentStaged(
 	); err != nil {
 		return err
 	}
-	if cp != nil {
+	if cp == nil || blobs == nil {
+		if err := deleteParserCheckpointTx(tx, sessionID); err != nil {
+			return err
+		}
+	} else {
 		c := *cp
 		b := *blobs
 		// The checkpoint row is keyed by session id just like the blobs;
@@ -247,6 +472,7 @@ func replaceSessionMessagesTxStaged(
 	}
 
 	positions := make(map[string]StagedToolCallPosition)
+	callOccurrences := make(map[string]int)
 	chunk := make([]ToolCall, 0, toolCallStagedChunkSize)
 	var chunkBytes int64
 	flush := func() error {
@@ -275,13 +501,16 @@ func replaceSessionMessagesTxStaged(
 				CallIndex:         callIdx,
 			}
 			if tc.ToolUseID != "" {
-				positions[tc.ToolUseID] = StagedToolCallPosition{
+				occurrence := callOccurrences[tc.ToolUseID]
+				callOccurrences[tc.ToolUseID] = occurrence + 1
+				stageKey := StagedToolCallKey(tc.ToolUseID, occurrence)
+				positions[stageKey] = StagedToolCallPosition{
 					ToolUseID: tc.ToolUseID,
 					Ordinal:   m.Ordinal,
 					CallIndex: callIdx,
 				}
 				summary, length, err := staged.ResolveSummary(
-					context.Background(), tc.ToolUseID,
+					context.Background(), stageKey,
 				)
 				if err != nil {
 					return fmt.Errorf(
