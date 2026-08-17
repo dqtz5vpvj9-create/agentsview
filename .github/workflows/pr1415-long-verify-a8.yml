@@ -1,0 +1,98 @@
+name: Long verify repaired PR 1415 head
+
+on:
+  push:
+    branches:
+      - repair/pr1415-maintainer-review
+    paths:
+      - .github/workflows/pr1415-long-verify-a8.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR1415_REF: a8db72557312c2f99822abb4adaca133a8bb9d35
+  CGO_ENABLED: "1"
+
+jobs:
+  full-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: dqtz5vpvj9-create/agentsview
+          ref: ${{ env.PR1415_REF }}
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Restore exact pricing snapshot
+        run: |
+          set -euo pipefail
+          mkdir -p internal/pricing/snapshot
+          curl -fL \
+            https://raw.githubusercontent.com/kenn-io/agentsview/db257992fb8e3048af8c1cec9da738c28b4fe603/litellm_snapshot.json.gz \
+            -o internal/pricing/snapshot/litellm_snapshot.json.gz
+          echo '0e89b636ccf858edbf95a3f6188476b6eab6cf21f66d16a65c2184229ef81cbe  internal/pricing/snapshot/litellm_snapshot.json.gz' | sha256sum -c -
+      - name: Prepare SQLite build
+        run: make sqlite-vec-header
+      - name: Run full repository tests
+        run: go test -tags fts5 ./... -count=1 -timeout=45m
+
+  affected-race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: dqtz5vpvj9-create/agentsview
+          ref: ${{ env.PR1415_REF }}
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Restore exact pricing snapshot
+        run: |
+          set -euo pipefail
+          mkdir -p internal/pricing/snapshot
+          curl -fL \
+            https://raw.githubusercontent.com/kenn-io/agentsview/db257992fb8e3048af8c1cec9da738c28b4fe603/litellm_snapshot.json.gz \
+            -o internal/pricing/snapshot/litellm_snapshot.json.gz
+          echo '0e89b636ccf858edbf95a3f6188476b6eab6cf21f66d16a65c2184229ef81cbe  internal/pricing/snapshot/litellm_snapshot.json.gz' | sha256sum -c -
+      - name: Prepare SQLite build
+        run: make sqlite-vec-header
+      - name: Run race tests for affected packages
+        run: |
+          go test -race -tags fts5 \
+            ./internal/parser ./internal/db ./internal/signals ./internal/sync \
+            -count=1 -timeout=45m
+
+  bench-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: dqtz5vpvj9-create/agentsview
+          ref: ${{ env.PR1415_REF }}
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Restore exact pricing snapshot
+        run: |
+          set -euo pipefail
+          mkdir -p internal/pricing/snapshot
+          curl -fL \
+            https://raw.githubusercontent.com/kenn-io/agentsview/db257992fb8e3048af8c1cec9da738c28b4fe603/litellm_snapshot.json.gz \
+            -o internal/pricing/snapshot/litellm_snapshot.json.gz
+          echo '0e89b636ccf858edbf95a3f6188476b6eab6cf21f66d16a65c2184229ef81cbe  internal/pricing/snapshot/litellm_snapshot.json.gz' | sha256sum -c -
+      - name: Prepare SQLite build
+        run: make sqlite-vec-header
+      - name: Run repository benchmark gate
+        run: make bench-gate
