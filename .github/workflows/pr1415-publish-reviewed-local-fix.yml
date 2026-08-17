@@ -1,13 +1,94 @@
 name: Publish reviewed PR 1415 local fix
 
 on:
+  push:
+    branches:
+      - repair/pr1415-maintainer-review
+    paths:
+      - .github/workflows/pr1415-publish-reviewed-local-fix.yml
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  paused:
+  verify:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Publisher disabled after the verified PR update."
+      - name: Check out immutable patch source
+        uses: actions/checkout@v4
+        with:
+          ref: repair/pr1415-maintainer-review
+          path: patch-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out PR branch without write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: stack/5-codex-staged-imports
+          path: target
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify patch hashes and resulting tree
+        env:
+          EXPECTED_BASE: c14a02b5be017d4bf43b7685a31eb09316aaf1d1
+          EXPECTED_XZ_SHA256: 59b898e1f606d6af3bd14e431848d4530a56f7bafc0195f72f4bc6acb143de2c
+          EXPECTED_PATCH_SHA256: fbe3f9c7194a192936419d8e097de9629ba1f53c41935bded8ca4a0f23b37134
+          EXPECTED_TREE: efdb7554636191d1e741827df52f2fa82267bdd2
+        run: |
+          set -euo pipefail
+          cat patch-source/.github/pr1415/patches/fix-review-followup-v2.xz.b64.part.* > /tmp/pr1415.patch.xz.b64
+          base64 --decode /tmp/pr1415.patch.xz.b64 > /tmp/pr1415.patch.xz
+          echo "$EXPECTED_XZ_SHA256  /tmp/pr1415.patch.xz" | sha256sum --check --strict
+          xz --decompress --stdout /tmp/pr1415.patch.xz > /tmp/pr1415.patch
+          echo "$EXPECTED_PATCH_SHA256  /tmp/pr1415.patch" | sha256sum --check --strict
+          cd target
+          test "$(git rev-parse HEAD)" = "$EXPECTED_BASE"
+          git config core.hooksPath /dev/null
+          git config user.name Shinn
+          git config user.email 453821056@qq.com
+          git am --3way /tmp/pr1415.patch
+          test "$(git rev-parse HEAD^{tree})" = "$EXPECTED_TREE"
+          git diff --check HEAD^ HEAD
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out immutable patch source
+        uses: actions/checkout@v4
+        with:
+          ref: repair/pr1415-maintainer-review
+          path: patch-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out PR branch for fast-forward publication
+        uses: actions/checkout@v4
+        with:
+          ref: stack/5-codex-staged-imports
+          path: target
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Publish exact verified tree
+        env:
+          EXPECTED_BASE: c14a02b5be017d4bf43b7685a31eb09316aaf1d1
+          EXPECTED_XZ_SHA256: 59b898e1f606d6af3bd14e431848d4530a56f7bafc0195f72f4bc6acb143de2c
+          EXPECTED_PATCH_SHA256: fbe3f9c7194a192936419d8e097de9629ba1f53c41935bded8ca4a0f23b37134
+          EXPECTED_TREE: efdb7554636191d1e741827df52f2fa82267bdd2
+        run: |
+          set -euo pipefail
+          cat patch-source/.github/pr1415/patches/fix-review-followup-v2.xz.b64.part.* > /tmp/pr1415.patch.xz.b64
+          base64 --decode /tmp/pr1415.patch.xz.b64 > /tmp/pr1415.patch.xz
+          echo "$EXPECTED_XZ_SHA256  /tmp/pr1415.patch.xz" | sha256sum --check --strict
+          xz --decompress --stdout /tmp/pr1415.patch.xz > /tmp/pr1415.patch
+          echo "$EXPECTED_PATCH_SHA256  /tmp/pr1415.patch" | sha256sum --check --strict
+          cd target
+          test "$(git rev-parse HEAD)" = "$EXPECTED_BASE"
+          git config core.hooksPath /dev/null
+          git config user.name Shinn
+          git config user.email 453821056@qq.com
+          git am --3way /tmp/pr1415.patch
+          test "$(git rev-parse HEAD^{tree})" = "$EXPECTED_TREE"
+          git push origin HEAD:refs/heads/stack/5-codex-staged-imports
