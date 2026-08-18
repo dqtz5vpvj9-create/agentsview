@@ -1,4 +1,4 @@
-name: Verify PR 1415 occurrence repairs
+name: Verify and publish PR 1415 occurrence repairs
 
 on:
   push:
@@ -14,6 +14,12 @@ permissions:
 concurrency:
   group: verify-pr1415-occurrence-fixes
   cancel-in-progress: true
+
+env:
+  EXPECTED_BASE: 09b43810514e9b511dd0ba4156ea655f1c379621
+  EXPECTED_XZ_SHA256: eff1c1c16ab34dd350a91ea86c09642531c4f4875fcb2152cd713b884325b8d6
+  EXPECTED_PATCH_SHA256: 45f6a2f178648f10c86834d8e13a8a872019b5e3978994f0564c4490b837ba0c
+  EXPECTED_TREE: ff0a5674226cb8110ae193510bf0cf80b204b0b7
 
 jobs:
   verify:
@@ -35,7 +41,7 @@ jobs:
       - name: Check out exact PR head
         uses: actions/checkout@v5
         with:
-          ref: 09b43810514e9b511dd0ba4156ea655f1c379621
+          ref: ${{ env.EXPECTED_BASE }}
           path: target
           persist-credentials: false
           fetch-depth: 1
@@ -45,11 +51,6 @@ jobs:
           cache: true
           cache-dependency-path: target/go.sum
       - name: Verify and apply exact patch
-        env:
-          EXPECTED_BASE: 09b43810514e9b511dd0ba4156ea655f1c379621
-          EXPECTED_XZ_SHA256: eff1c1c16ab34dd350a91ea86c09642531c4f4875fcb2152cd713b884325b8d6
-          EXPECTED_PATCH_SHA256: 45f6a2f178648f10c86834d8e13a8a872019b5e3978994f0564c4490b837ba0c
-          EXPECTED_TREE: ff0a5674226cb8110ae193510bf0cf80b204b0b7
         run: |
           set -euo pipefail
           cat patch-source/.github/pr1415/patches/occurrence-fixes.xz.b64.part.* > /tmp/pr1415.patch.xz.b64
@@ -129,3 +130,49 @@ jobs:
               --arg description "$description" \
               --arg context "pr1415-occurrence/$MODE" \
               '{state:$state,target_url:$target_url,description:$description,context:$context}')"
+
+  publish:
+    name: fast-forward PR branch
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out immutable patch source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: patch-source
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Check out exact PR head
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.EXPECTED_BASE }}
+          path: target
+          persist-credentials: true
+          fetch-depth: 0
+      - name: Verify tree, commit, and fast-forward push
+        run: |
+          set -euo pipefail
+          cat patch-source/.github/pr1415/patches/occurrence-fixes.xz.b64.part.* > /tmp/pr1415.patch.xz.b64
+          base64 --decode /tmp/pr1415.patch.xz.b64 > /tmp/pr1415.patch.xz
+          echo "$EXPECTED_XZ_SHA256  /tmp/pr1415.patch.xz" | sha256sum --check --strict
+          xz --decompress --stdout /tmp/pr1415.patch.xz > /tmp/pr1415.patch
+          echo "$EXPECTED_PATCH_SHA256  /tmp/pr1415.patch" | sha256sum --check --strict
+          cd target
+          test "$(git rev-parse HEAD)" = "$EXPECTED_BASE"
+          git config core.hooksPath /dev/null
+          git apply --check /tmp/pr1415.patch
+          git apply /tmp/pr1415.patch
+          git diff --check
+          git add --all
+          test "$(git write-tree)" = "$EXPECTED_TREE"
+          git config user.name Shinn
+          git config user.email 453821056@qq.com
+          git commit \
+            -m "fix(codex): qualify incremental call occurrences" \
+            -m "Persist unresolved Codex call coordinates through the cursor and apply late results by normalized message ordinal and call index. Keep occurrence-local summary state and signal maintenance isolated when providers reuse call IDs." \
+            -m "Preserve runaway windows as they leave the mutable tail and block token-usage backfill across genuine user boundaries."
+          git push origin HEAD:refs/heads/stack/5-codex-staged-imports
