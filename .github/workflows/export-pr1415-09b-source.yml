@@ -1,34 +1,13 @@
-name: Export PR 1415 current source
+name: Completed PR 1415 source export
 
 on:
-  push:
-    branches:
-      - repair/pr1415-maintainer-review
-    paths:
-      - .github/workflows/export-pr1415-09b-source.yml
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  export:
+  completed:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: 09b43810514e9b511dd0ba4156ea655f1c379621
-          persist-credentials: false
-          fetch-depth: 1
-      - name: Export source without repository metadata
-        run: |
-          set -euo pipefail
-          tar --exclude=.git -czf /tmp/pr1415-09b4381-source.tar.gz .
-          sha256sum /tmp/pr1415-09b4381-source.tar.gz > /tmp/SHA256SUMS
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pr1415-09b4381-source
-          path: |
-            /tmp/pr1415-09b4381-source.tar.gz
-            /tmp/SHA256SUMS
-          retention-days: 1
-          compression-level: 0
+      - run: echo "PR 1415 source export completed."
