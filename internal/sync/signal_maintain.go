@@ -115,22 +115,27 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 	modified := make(map[signals.CallPos]signals.ToolFact)
 	deleteKeys := make([]db.FindingDeleteKey, 0, len(m.resultUpdates))
 	var insertFindings []db.SecretFinding
-	useIDs := make([]string, 0, len(m.resultUpdates))
+	positions := make([]db.ToolCallPosition, 0, len(m.resultUpdates))
 	for _, u := range m.resultUpdates {
 		if u.ToolUseID != "" {
-			useIDs = append(useIDs, u.ToolUseID)
+			positions = append(positions, u.Position)
 		}
 	}
-	callFacts, err := q.ToolCallsByUseID(ctx, useIDs)
+	callFacts, err := q.ToolCallsByPosition(ctx, positions)
 	if err != nil {
 		return nil, err
 	}
-	factByUseID := make(map[string]db.ToolCallSignalFact, len(callFacts))
+	factByPosition := make(
+		map[db.ToolCallPosition]db.ToolCallSignalFact, len(callFacts),
+	)
 	for _, f := range callFacts {
-		factByUseID[f.ToolUseID] = f
+		factByPosition[db.ToolCallPosition{
+			MessageOrdinal: f.MessageOrdinal,
+			CallIndex:      f.CallIndex,
+		}] = f
 	}
 	for _, u := range m.resultUpdates {
-		fact, ok := factByUseID[u.ToolUseID]
+		fact, ok := factByPosition[u.Position]
 		if !ok {
 			continue // update targeted nothing stored
 		}
@@ -160,7 +165,7 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 		// When any event exists the full compute scans events instead of
 		// the result_content summary, so the summary-derived finding must
 		// go and the inserted events are scanned with their real indexes.
-		events := q.InsertedResultEvents(u.ToolUseID)
+		events := q.InsertedResultEvents(u.Position)
 		if len(events) == 0 {
 			continue
 		}

@@ -2601,11 +2601,19 @@ type ToolCallSubagentLink struct {
 	HasResult         bool
 }
 
-// ToolCallResultUpdate carries result events for a tool call that already
-// exists in the database. Incremental parsers use it when an appended output
-// record refers to a call from an earlier sync batch.
+// ToolCallPosition identifies one stored tool-call occurrence by its stable
+// normalized message ordinal and call index.
+type ToolCallPosition struct {
+	MessageOrdinal int
+	CallIndex      int
+}
+
+// ToolCallResultUpdate carries result events for one exact tool-call occurrence
+// that already exists in the database. ToolUseID remains a provider identity
+// check; Position is the authoritative target when providers reuse call IDs.
 type ToolCallResultUpdate struct {
 	ToolUseID string
+	Position  ToolCallPosition
 	Events    []ToolResultEvent
 }
 

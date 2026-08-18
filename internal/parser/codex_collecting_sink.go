@@ -15,6 +15,7 @@ import (
 type CodexCollectingSink struct {
 	messages             []ParsedMessage
 	callRefs             map[string]codexToolCallRef
+	callRefsByPosition   map[ParsedToolCallPosition]codexToolCallRef
 	toolCallUpdates      []ParsedToolCallUpdate
 	orphanNotificationIx map[string]int
 	nextOrdinal          int
@@ -23,12 +24,13 @@ type CodexCollectingSink struct {
 func NewCodexCollectingSink(startOrdinal int) *CodexCollectingSink {
 	return &CodexCollectingSink{
 		callRefs:             make(map[string]codexToolCallRef),
+		callRefsByPosition:   make(map[ParsedToolCallPosition]codexToolCallRef),
 		orphanNotificationIx: make(map[string]int),
 		nextOrdinal:          startOrdinal,
 	}
 }
 
-func (s *CodexCollectingSink) AppendMessage(m ParsedMessage) {
+func (s *CodexCollectingSink) AppendMessage(m ParsedMessage) int {
 	m.Ordinal = s.nextOrdinal
 	s.nextOrdinal++
 	s.messages = append(s.messages, m)
@@ -37,11 +39,17 @@ func (s *CodexCollectingSink) AppendMessage(m ParsedMessage) {
 		if callID == "" {
 			continue
 		}
-		s.callRefs[callID] = codexToolCallRef{
+		ref := codexToolCallRef{
 			messageIndex: len(s.messages) - 1,
 			callIndex:    callIdx,
 		}
+		s.callRefs[callID] = ref
+		s.callRefsByPosition[ParsedToolCallPosition{
+			MessageOrdinal: m.Ordinal,
+			CallIndex:      callIdx,
+		}] = ref
 	}
+	return m.Ordinal
 }
 
 func (s *CodexCollectingSink) ReserveOrdinal() int {
@@ -71,22 +79,28 @@ func (s *CodexCollectingSink) InsertMessage(m ParsedMessage) int {
 			s.callRefs[callID] = ref
 		}
 	}
+	for position, ref := range s.callRefsByPosition {
+		if ref.messageIndex >= idx {
+			ref.messageIndex++
+			s.callRefsByPosition[position] = ref
+		}
+	}
 	return idx
 }
 
 func (s *CodexCollectingSink) AppendToolResultEvent(
-	callID string, ev ParsedToolResultEvent,
+	callID string, target *ParsedToolCallPosition, ev ParsedToolResultEvent,
 ) {
 	if callID == "" {
 		return
 	}
-	ref, ok := s.callRefs[callID]
-	if !ok ||
-		ref.messageIndex < 0 || ref.messageIndex >= len(s.messages) {
-		s.appendToolCallUpdate(callID, ev)
+	ref, ok := s.callRef(callID, target)
+	if !ok {
+		s.appendToolCallUpdate(callID, target, ev)
 		return
 	}
-	if ref.callIndex < 0 ||
+	if ref.messageIndex < 0 || ref.messageIndex >= len(s.messages) ||
+		ref.callIndex < 0 ||
 		ref.callIndex >= len(s.messages[ref.messageIndex].ToolCalls) {
 		return
 	}
@@ -103,15 +117,34 @@ func (s *CodexCollectingSink) AppendToolResultEvent(
 	tc.ResultEvents = append(tc.ResultEvents, ev)
 }
 
+func (s *CodexCollectingSink) callRef(
+	callID string, target *ParsedToolCallPosition,
+) (codexToolCallRef, bool) {
+	if target == nil {
+		ref, ok := s.callRefs[callID]
+		return ref, ok
+	}
+	ref, ok := s.callRefsByPosition[*target]
+	if !ok || ref.messageIndex < 0 || ref.messageIndex >= len(s.messages) ||
+		ref.callIndex < 0 || ref.callIndex >= len(s.messages[ref.messageIndex].ToolCalls) {
+		return codexToolCallRef{}, false
+	}
+	if s.messages[ref.messageIndex].ToolCalls[ref.callIndex].ToolUseID != callID {
+		return codexToolCallRef{}, false
+	}
+	return ref, true
+}
+
 func (s *CodexCollectingSink) appendToolCallUpdate(
-	callID string, ev ParsedToolResultEvent,
+	callID string, target *ParsedToolCallPosition, ev ParsedToolResultEvent,
 ) {
 	if ev.ToolUseID == "" {
 		ev.ToolUseID = callID
 	}
 	for i := range s.toolCallUpdates {
 		update := &s.toolCallUpdates[i]
-		if update.ToolUseID != callID {
+		if update.ToolUseID != callID ||
+			!sameParsedToolCallTarget(update, target) {
 			continue
 		}
 		if hasEquivalentCallResultEvent(update.ResultEvents, ev) {
@@ -120,24 +153,38 @@ func (s *CodexCollectingSink) appendToolCallUpdate(
 		update.ResultEvents = append(update.ResultEvents, ev)
 		return
 	}
-	s.toolCallUpdates = append(s.toolCallUpdates, ParsedToolCallUpdate{
+	update := ParsedToolCallUpdate{
 		ToolUseID:    callID,
 		ResultEvents: []ParsedToolResultEvent{ev},
-	})
+	}
+	if target != nil {
+		update.MessageOrdinal = target.MessageOrdinal
+		update.CallIndex = target.CallIndex
+		update.TargetKnown = true
+	}
+	s.toolCallUpdates = append(s.toolCallUpdates, update)
+}
+
+func sameParsedToolCallTarget(
+	update *ParsedToolCallUpdate, target *ParsedToolCallPosition,
+) bool {
+	if target == nil {
+		return !update.TargetKnown
+	}
+	return update.TargetKnown &&
+		update.MessageOrdinal == target.MessageOrdinal &&
+		update.CallIndex == target.CallIndex
 }
 
 func (s *CodexCollectingSink) SetCallSubagentSessionID(
-	callID, sessionID string,
+	callID string, target *ParsedToolCallPosition, sessionID string,
 ) {
 	if callID == "" || sessionID == "" {
 		return
 	}
-	ref, ok := s.callRefs[callID]
-	if !ok ||
-		ref.messageIndex < 0 || ref.messageIndex >= len(s.messages) {
-		return
-	}
-	if ref.callIndex < 0 ||
+	ref, ok := s.callRef(callID, target)
+	if !ok || ref.messageIndex < 0 || ref.messageIndex >= len(s.messages) ||
+		ref.callIndex < 0 ||
 		ref.callIndex >= len(s.messages[ref.messageIndex].ToolCalls) {
 		return
 	}

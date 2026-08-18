@@ -15175,7 +15175,11 @@ func (e *Engine) writeIncremental(
 		e.anomalies.recordSanitize(db.SanitizeToolCall(&toolCall))
 		toolCallResultUpdates[i] = db.ToolCallResultUpdate{
 			ToolUseID: update.ToolUseID,
-			Events:    toolCall.ResultEvents,
+			Position: db.ToolCallPosition{
+				MessageOrdinal: update.MessageOrdinal,
+				CallIndex:      update.CallIndex,
+			},
+			Events: toolCall.ResultEvents,
 		}
 	}
 	messageUsageUpdates := make(

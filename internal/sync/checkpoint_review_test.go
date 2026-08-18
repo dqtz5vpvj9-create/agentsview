@@ -370,3 +370,82 @@ func TestCodexCheckpointAuditRepairsSameStatRewrite(t *testing.T) {
 	require.Len(t, msgs, 1)
 	require.Equal(t, "bravo request", msgs[0].Content)
 }
+
+func TestCodexIncrementalDuplicateCallIDTargetsExactOccurrence(t *testing.T) {
+	const (
+		uuid   = "019eb791-cf7d-75c1-8439-9ed74c122daa"
+		callID = "reused-call"
+	)
+	root := t.TempDir()
+	day := filepath.Join(root, "2024", "01", "01")
+	require.NoError(t, os.MkdirAll(day, 0o755))
+	path := filepath.Join(
+		day, "rollout-2024-01-01T10-00-00-"+uuid+".jsonl",
+	)
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/workspace/project", "codex_cli_rs",
+			"2024-01-01T10:00:00Z",
+		),
+		testjsonl.CodexTurnContextJSON(
+			"gpt-5.4", "2024-01-01T10:00:01Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"user", "run twice", "2024-01-01T10:00:02Z",
+		),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"exec_command", callID, nil, "2024-01-01T10:00:03Z",
+		),
+		testjsonl.CodexFunctionCallOutputJSON(
+			callID, "first result", "2024-01-01T10:00:04Z",
+		),
+		testjsonl.CodexTokenCountJSON(
+			"2024-01-01T10:00:05Z", 100, 10, 80,
+		),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"exec_command", callID, nil, "2024-01-01T10:00:06Z",
+		),
+	)
+	require.NoError(t, os.WriteFile(path, []byte(initial), 0o644))
+
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+
+	tail := testjsonl.JoinJSONL(
+		testjsonl.CodexFunctionCallOutputJSON(
+			callID, "second result", "2024-01-01T10:00:07Z",
+		),
+		testjsonl.CodexTokenCountJSON(
+			"2024-01-01T10:00:08Z", 200, 20, 160,
+		),
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(tail)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	stats := engine.SyncAll(t.Context(), nil)
+	require.Zero(t, stats.Failed)
+	require.Equal(t, 1, stats.Synced)
+
+	sess, err := database.GetSessionFull(t.Context(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.True(t, sess.LastWriteIncremental)
+	msgs, err := database.GetAllMessages(t.Context(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.Len(t, msgs, 3)
+	require.Len(t, msgs[1].ToolCalls, 1)
+	require.Len(t, msgs[2].ToolCalls, 1)
+	require.Equal(t, "first result", msgs[1].ToolCalls[0].ResultContent)
+	require.Equal(t, "second result", msgs[2].ToolCalls[0].ResultContent)
+	require.NotEmpty(t, msgs[2].TokenUsage)
+}

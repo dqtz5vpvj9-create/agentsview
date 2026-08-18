@@ -59,7 +59,7 @@ func TestCodexStagingBlockedContentNeverEntersScratch(t *testing.T) {
 		Category:  "Bash",
 	}}})
 	const secret = "AKIA7QHWN2DKR4FYPLJM blocked payload"
-	sink.AppendToolResultEvent("call_secret", parser.ParsedToolResultEvent{
+	sink.AppendToolResultEvent("call_secret", nil, parser.ParsedToolResultEvent{
 		ToolUseID: "call_secret",
 		Source:    "function_call_output",
 		Content:   secret,

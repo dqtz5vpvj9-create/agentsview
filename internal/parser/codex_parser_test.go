@@ -639,7 +639,7 @@ func TestParseCodexSession_FunctionCalls(t *testing.T) {
 		line := `{"timestamp":"2026-07-08T03:20:43.376Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_abc","output":"Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess."}}`
 
 		b := newCodexSessionBuilder(false, NewCodexCollectingSink(0))
-		b.rememberToolCall("call_abc", "exec_command")
+		b.rememberToolCall("call_abc", "exec_command", &ParsedToolCallPosition{MessageOrdinal: 1, CallIndex: 0})
 		assert.False(t, b.codexIncrementalNeedsFullParse(line))
 	})
 
@@ -3550,4 +3550,35 @@ func TestParseCodexSession_TurnAbortedNotCountedAsUser(t *testing.T) {
 		assert.NotContains(t, m.Content, "<turn_aborted>",
 			"<turn_aborted> synthetic must be filtered from message list")
 	}
+}
+
+func TestCodexDuplicateCallIDsAttachOutputsByOccurrence(t *testing.T) {
+	const callID = "reused-call"
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			"duplicate-call-ids", "/tmp", "user", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "run both", tsEarlyS1),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"exec_command", callID, nil, tsEarlyS5,
+		),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"apply_patch", callID, nil, tsLate,
+		),
+		testjsonl.CodexFunctionCallOutputJSON(
+			callID, "first result", tsLateS5,
+		),
+		testjsonl.CodexFunctionCallOutputJSON(
+			callID, "second result", "2024-01-01T10:01:06Z",
+		),
+	)
+
+	_, msgs := runCodexParserTest(t, "duplicate-call-ids.jsonl", content, false)
+	require.Len(t, msgs, 3)
+	require.Len(t, msgs[1].ToolCalls, 1)
+	require.Len(t, msgs[2].ToolCalls, 1)
+	require.Len(t, msgs[1].ToolCalls[0].ResultEvents, 1)
+	require.Len(t, msgs[2].ToolCalls[0].ResultEvents, 1)
+	assert.Equal(t, "first result", msgs[1].ToolCalls[0].ResultEvents[0].Content)
+	assert.Equal(t, "second result", msgs[2].ToolCalls[0].ResultEvents[0].Content)
 }

@@ -44,10 +44,11 @@ type codexStagingSink struct {
 	blocked map[string]bool
 
 	// Calls use an occurrence-qualified staging key because provider call IDs
-	// can repeat within one transcript. currentCallKey maps a raw call ID to
-	// the most recently emitted instance, matching the collecting sink's
-	// event-time association without reassigning earlier staged rows.
+	// can repeat within one transcript. callKeyByPosition is authoritative;
+	// currentCallKey is only the compatibility fallback for events that do not
+	// carry a parser-resolved occurrence.
 	currentCallKey    map[string]string
+	callKeyByPosition map[parser.ParsedToolCallPosition]string
 	callOccurrences   map[string]int
 	categoryByCallKey map[string]string
 
@@ -299,6 +300,7 @@ func newCodexStagingSink(
 		path:                path,
 		blocked:             blocked,
 		currentCallKey:      make(map[string]string),
+		callKeyByPosition:   make(map[parser.ParsedToolCallPosition]string),
 		callOccurrences:     make(map[string]int),
 		categoryByCallKey:   make(map[string]string),
 		eventByCallKey:      make(map[string]int64),
@@ -409,24 +411,31 @@ func releaseStagedGCGuards(guards []func()) {
 	}
 }
 
-func (s *codexStagingSink) AppendMessage(m parser.ParsedMessage) {
-	for _, tc := range m.ToolCalls {
-		if tc.ToolUseID != "" {
-			occurrence := s.callOccurrences[tc.ToolUseID]
-			s.callOccurrences[tc.ToolUseID] = occurrence + 1
-			stageKey := db.StagedToolCallKey(tc.ToolUseID, occurrence)
-			s.currentCallKey[tc.ToolUseID] = stageKey
-			s.categoryByCallKey[stageKey] = tc.Category
+func (s *codexStagingSink) AppendMessage(m parser.ParsedMessage) int {
+	ordinal := s.CodexCollectingSink.AppendMessage(m)
+	for callIndex, tc := range m.ToolCalls {
+		if tc.ToolUseID == "" {
+			continue
 		}
+		occurrence := s.callOccurrences[tc.ToolUseID]
+		s.callOccurrences[tc.ToolUseID] = occurrence + 1
+		stageKey := db.StagedToolCallKey(tc.ToolUseID, occurrence)
+		s.currentCallKey[tc.ToolUseID] = stageKey
+		s.callKeyByPosition[parser.ParsedToolCallPosition{
+			MessageOrdinal: ordinal,
+			CallIndex:      callIndex,
+		}] = stageKey
+		s.categoryByCallKey[stageKey] = tc.Category
 	}
-	s.CodexCollectingSink.AppendMessage(m)
+	return ordinal
 }
 
 // AppendToolResultEvent stages the full event row and the per-call summary
 // state, then records a contentless placeholder in the in-memory model so
 // downstream conversions stay shape-compatible without retaining content.
 func (s *codexStagingSink) AppendToolResultEvent(
-	callID string, ev parser.ParsedToolResultEvent,
+	callID string, target *parser.ParsedToolCallPosition,
+	ev parser.ParsedToolResultEvent,
 ) {
 	if callID == "" || s.stageErr != nil {
 		return
@@ -453,9 +462,14 @@ func (s *codexStagingSink) AppendToolResultEvent(
 	// from the collecting path, which has always dropped full-parse
 	// orphans. Late outputs still merge through the incremental append
 	// path on later syncs, unchanged.
-	stageKey, ok := s.currentCallKey[callID]
+	stageKey, ok := "", false
+	if target != nil {
+		stageKey, ok = s.callKeyByPosition[*target]
+	} else {
+		stageKey, ok = s.currentCallKey[callID]
+	}
 	if !ok {
-		s.CodexCollectingSink.AppendToolResultEvent(callID, ev)
+		s.CodexCollectingSink.AppendToolResultEvent(callID, target, ev)
 		return
 	}
 	// The legacy deduplication compares raw parser content before the central
@@ -544,7 +558,7 @@ func (s *codexStagingSink) AppendToolResultEvent(
 	// content: downstream conversions stay shape-compatible and the
 	// collecting dedup treats every staged event as distinct.
 	ev.Content = fmt.Sprintf("staged:%d", seq)
-	s.CodexCollectingSink.AppendToolResultEvent(callID, ev)
+	s.CodexCollectingSink.AppendToolResultEvent(callID, target, ev)
 }
 
 func (s *codexStagingSink) addEventFindings(

@@ -554,3 +554,104 @@ func TestFoldToolHealthRunawayHistoricalStaysLatched(t *testing.T) {
 	assert.True(t, next.RunawayHistorical,
 		"windows that fully exited the trailing window stay latched")
 }
+
+func TestSeedRunawayWindowCrossingRetainedBoundaryStaysHistorical(t *testing.T) {
+	calls := make([]ToolCallRow, 47)
+	for i := range calls {
+		calls[i] = ToolCallRow{
+			ToolName:       "read_file",
+			Category:       "Read",
+			InputJSON:      fmt.Sprintf(`{"path":"/tmp/%d"}`, i),
+			ResultContent:  "ok",
+			MessageOrdinal: i,
+		}
+	}
+	// The qualifying 12-call window starts before the retained-tail cut
+	// (47-35=12) and ends after it. All six failures are already older than
+	// the final 12-call mutable region, so the signal must be historical.
+	for i := 6; i < 18; i++ {
+		calls[i].ToolName = "exec_command"
+		calls[i].Category = "Bash"
+		calls[i].InputJSON = `{"command":"run"}`
+		if i >= 12 {
+			calls[i].ResultContent = "failed"
+			calls[i].EventStatus = "errored"
+		}
+	}
+
+	state := SeedIncrementalState(calls, nil, "", "", nil, nil, 0, 0)
+	require.True(t, state.RunawayHistorical,
+		"an immutable runaway window crossing the retained boundary must latch")
+
+	appended := make([]ToolCallRow, 36)
+	for i := range appended {
+		appended[i] = ToolCallRow{
+			ToolName:       "read_file",
+			Category:       "Read",
+			InputJSON:      fmt.Sprintf(`{"path":"/healthy/%d"}`, i),
+			ResultContent:  "ok",
+			MessageOrdinal: len(calls) + i,
+		}
+	}
+	next, out, ok := state.FoldToolHealth(appended, nil, ToolHealthRow{})
+	require.True(t, ok)
+	assert.True(t, next.RunawayHistorical)
+	assert.Equal(t, 1, out.RunawayToolLoopCount)
+}
+
+func TestFoldRunawayWindowCrossingNewRetainedBoundaryLatches(t *testing.T) {
+	calls := make([]ToolCallRow, 35)
+	for i := range calls {
+		calls[i] = ToolCallRow{
+			ToolName:       "read_file",
+			Category:       "Read",
+			InputJSON:      fmt.Sprintf(`{"path":"/initial/%d"}`, i),
+			ResultContent:  "ok",
+			MessageOrdinal: i,
+		}
+	}
+	// This qualifying window is positions [12,24). At seed time the final
+	// call is still inside the 12-call mutable region, so it must remain
+	// reevaluable instead of being latched prematurely.
+	for i := 18; i < 24; i++ {
+		calls[i].ToolName = "exec_command"
+		calls[i].Category = "Bash"
+		calls[i].InputJSON = `{"command":"run"}`
+		calls[i].ResultContent = "failed"
+		calls[i].EventStatus = "errored"
+	}
+	state := SeedIncrementalState(calls, nil, "", "", nil, nil, 0, 0)
+	require.False(t, state.RunawayHistorical)
+
+	appendHealthy := func(start, count int) []ToolCallRow {
+		rows := make([]ToolCallRow, count)
+		for i := range rows {
+			rows[i] = ToolCallRow{
+				ToolName:       "read_file",
+				Category:       "Read",
+				InputJSON:      fmt.Sprintf(`{"path":"/healthy/%d"}`, start+i),
+				ResultContent:  "ok",
+				MessageOrdinal: start + i,
+			}
+		}
+		return rows
+	}
+
+	// Eighteen appends move the retained-tail cut to absolute position 18,
+	// through the middle of the qualifying [12,24) window. The window has
+	// simultaneously become older than the mutable region and must be latched
+	// before its left half is discarded.
+	firstAppend := appendHealthy(len(calls), 18)
+	next, out, ok := state.FoldToolHealth(firstAppend, nil, ToolHealthRow{})
+	require.True(t, ok)
+	assert.True(t, next.RunawayHistorical)
+	assert.Equal(t, 1, out.RunawayToolLoopCount)
+
+	// Once the original window has completely left retained facts, later
+	// healthy appends must not erase the historical signal.
+	secondAppend := appendHealthy(len(calls)+len(firstAppend), 35)
+	final, out, ok := next.FoldToolHealth(secondAppend, nil, ToolHealthRow{})
+	require.True(t, ok)
+	assert.True(t, final.RunawayHistorical)
+	assert.Equal(t, 1, out.RunawayToolLoopCount)
+}

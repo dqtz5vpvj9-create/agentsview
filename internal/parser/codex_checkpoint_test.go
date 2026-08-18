@@ -28,8 +28,8 @@ func TestCodexCursorStateCheckpointRoundTrip(t *testing.T) {
 		},
 		lastTaskEvent: "task_complete",
 	}
-	seed.rememberToolCall("call_1", "exec_command")
-	seed.rememberToolCall("call_2", "apply_patch")
+	seed.rememberToolCall("call_1", "exec_command", &ParsedToolCallPosition{MessageOrdinal: 1, CallIndex: 0})
+	seed.rememberToolCall("call_2", "apply_patch", &ParsedToolCallPosition{MessageOrdinal: 2, CallIndex: 0})
 
 	blob, err := seed.MarshalBinary()
 	require.NoError(t, err)
@@ -194,4 +194,97 @@ func TestCodexParseCarriesSinglePassHashState(t *testing.T) {
 	wantFull := sha256.Sum256(full)
 	assert.Equal(t, wantFull[:], resumed.Sum(nil),
 		"resuming the captured state must reproduce the full-file hash")
+}
+
+func TestCodexCursorPendingDuplicateIDsAreFIFO(t *testing.T) {
+	var state codexCursorState
+	first := &ParsedToolCallPosition{MessageOrdinal: 1, CallIndex: 0}
+	second := &ParsedToolCallPosition{MessageOrdinal: 2, CallIndex: 0}
+	require.True(t, state.rememberToolCall("reused", "exec_command", first))
+	require.True(t, state.rememberToolCall("reused", "apply_patch", second))
+
+	name, ok := state.toolCallName("reused")
+	require.True(t, ok)
+	assert.Equal(t, "exec_command", name)
+	position, ok := state.toolCallPosition("reused")
+	require.True(t, ok)
+	assert.Equal(t, first, position)
+
+	blob, err := state.MarshalBinary()
+	require.NoError(t, err)
+	var restored codexCursorState
+	require.NoError(t, restored.UnmarshalBinary(blob))
+
+	restored.forgetToolCall("reused")
+	name, ok = restored.toolCallName("reused")
+	require.True(t, ok)
+	assert.Equal(t, "apply_patch", name)
+	position, ok = restored.toolCallPosition("reused")
+	require.True(t, ok)
+	assert.Equal(t, second, position)
+}
+
+func TestCodexProviderIncrementalTargetsPendingDuplicateCallIDOccurrence(t *testing.T) {
+	const (
+		uuid   = "019eb791-cf7d-75c1-8439-9ed74c122d01"
+		callID = "reused-call"
+	)
+	prefix := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/workspace/project-a", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "run twice", tsEarlyS1),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"exec_command", callID, nil, tsEarlyS5,
+		),
+		testjsonl.CodexFunctionCallOutputJSON(
+			callID, "first result", tsLate,
+		),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"exec_command", callID, nil, tsLateS5,
+		),
+	)
+	root := t.TempDir()
+	path := writeCodexProviderSessionContent(t, root, uuid, prefix)
+	provider, ok := NewProvider(
+		AgentCodex, ProviderConfig{Roots: []string{root}},
+	)
+	require.True(t, ok)
+	source := requireCodexProviderSource(t, provider, uuid)
+	fingerprint, err := provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+	outcome, err := provider.Parse(context.Background(), ParseRequest{
+		Source: source, Fingerprint: fingerprint,
+	})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	checkpoint := outcome.Results[0].Result.Checkpoint
+	require.NotEmpty(t, checkpoint)
+
+	tail := testjsonl.JoinJSONL(testjsonl.CodexFunctionCallOutputJSON(
+		callID, "second result", "2026-08-02T09:00:06Z",
+	))
+	appendCodexProviderContent(t, path, tail)
+	fingerprint, err = provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+	incOutcome, status, err := provider.ParseIncremental(
+		context.Background(), IncrementalRequest{
+			Source:       source,
+			Fingerprint:  fingerprint,
+			SessionID:    "codex:" + uuid,
+			Offset:       int64(len(prefix)),
+			StartOrdinal: 3,
+			Seed:         checkpoint,
+		},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, IncrementalApplied, status)
+	require.Len(t, incOutcome.ToolCallUpdates, 1)
+	update := incOutcome.ToolCallUpdates[0]
+	assert.Equal(t, callID, update.ToolUseID)
+	assert.True(t, update.TargetKnown)
+	assert.Equal(t, 2, update.MessageOrdinal)
+	assert.Equal(t, 0, update.CallIndex)
+	require.Len(t, update.ResultEvents, 1)
+	assert.Equal(t, "second result", update.ResultEvents[0].Content)
 }

@@ -1234,12 +1234,22 @@ type ParsedToolCall struct {
 	ResultEvents      []ParsedToolResultEvent
 }
 
+// ParsedToolCallPosition identifies one emitted tool-call occurrence by its
+// stable normalized message ordinal and call index.
+type ParsedToolCallPosition struct {
+	MessageOrdinal int
+	CallIndex      int
+}
+
 // ParsedToolCallUpdate carries result events for a tool call that was parsed
-// before the current append-only chunk. Incremental sync uses the stable
-// tool_use_id to attach these events without rebuilding the whole transcript.
+// before the current append-only chunk. TargetKnown is required for safe
+// incremental application when a provider reuses call IDs.
 type ParsedToolCallUpdate struct {
-	ToolUseID    string
-	ResultEvents []ParsedToolResultEvent
+	ToolUseID      string
+	MessageOrdinal int
+	CallIndex      int
+	TargetKnown    bool
+	ResultEvents   []ParsedToolResultEvent
 }
 
 // ParsedMessageTokenUsageUpdate carries token metadata for an assistant

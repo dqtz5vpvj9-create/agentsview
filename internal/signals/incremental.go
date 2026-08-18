@@ -28,7 +28,7 @@ const (
 	// Bump when the struct or any detector semantics change; a mismatch
 	// makes the caller fall back to a full recompute.
 	// The codec has had a single released shape.
-	IncrementalStateCodecVersion = 1
+	IncrementalStateCodecVersion = 2
 
 	// TrailingFactCount is the size of the trailing facts window. It must
 	// cover every window any delta can affect: a modified call in the last
@@ -103,7 +103,7 @@ type IncrementalState struct {
 	EditLast map[string]EditChurnState `json:"edit_last,omitempty"`
 
 	// Runaway loop: RunawayHistorical latches hasRunawayToolWindow over
-	// every 12-window that has fully left the trailing facts window.
+	// every 12-window that has fully left the mutable late-result region.
 	RunawayHistorical bool `json:"runaway_historical"`
 
 	// Exact failing run crossing into the trailing window. ExactRunSig is
@@ -263,8 +263,12 @@ func SeedIncrementalState(
 	s.ExactRunLen = crossing.len
 	s.ExactRunFailures = crossing.failures
 
-	// Runaway window detector: latch every 12-window fully before the cut.
-	for i := 0; i+12 <= cut; i++ {
+	// Runaway window detector: latch every qualifying 12-call window that
+	// can no longer be changed by a late result. Only the final
+	// ModifiedWindowSize calls remain mutable, which can be substantially
+	// smaller than the retained facts window.
+	immutableEnd := max(0, len(calls)-ModifiedWindowSize)
+	for i := 0; i+12 <= immutableEnd; i++ {
 		if windowFactsQualify(factsFor(calls[i : i+12])) {
 			s.RunawayHistorical = true
 		}
@@ -541,17 +545,16 @@ func (s *IncrementalState) FoldToolHealth(
 	}
 	next.PendingBoundaries = kept
 
-	// Runaway loop: latch only windows that have fully exited the trailing
-	// facts window — their facts can no longer be changed by a late result.
-	// Windows still intersecting the trailing window are mutable and only
-	// contribute to the current output, so a later delta that heals them
-	// clears the signal exactly as an authoritative recompute would.
+	// Runaway loop: latch windows once every call in the 12-call window is
+	// older than the mutable late-result region. The retained facts window is
+	// intentionally wider than that region, so boundary-crossing qualifying
+	// windows must be preserved even while some of their facts remain retained.
 	runaway := s.RunawayHistorical
 	currentRunaway := false
 	windowStart := max(0, s.TotalCalls-TrailingFactCount)
 	for i := windowStart; i+12 <= next.TotalCalls; i++ {
 		if windowAt(fullTail, windowStart, i) {
-			if i+12 <= next.TotalCalls-TrailingFactCount {
+			if i+12 <= next.TotalCalls-ModifiedWindowSize {
 				runaway = true
 			} else {
 				currentRunaway = true

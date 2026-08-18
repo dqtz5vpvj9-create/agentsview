@@ -21,21 +21,25 @@ const (
 	// back to a full parse.
 	// The fork replay gate is process-only state: it is re-armed from the
 	// transcript on every parse and is not part of the persisted cursor.
-	codexCursorCheckpointVersion   = 1
+	codexCursorCheckpointVersion   = 2
 	codexCursorCheckpointMaxString = 1 << 20
 
 	// Account for the map bucket, list element, pointers, string headers, and
 	// allocator overhead that are not represented by the variable-length path
 	// and cursor strings below. The fixed pending-call array contributes two
-	// string headers per slot. The cache is intentionally an estimate rather
+	// string headers, occurrence coordinates, and flags per slot. The cache is
+	// intentionally an estimate rather
 	// than a heap profiler, but this conservative allowance keeps its retained
 	// memory bounded near the configured byte limit.
-	codexCursorEntryOverheadBytes = 256 + codexCursorMaxPendingCalls*32
+	codexCursorEntryOverheadBytes = 256 + codexCursorMaxPendingCalls*64
 )
 
 type codexPendingToolCall struct {
-	id   string
-	name string
+	id             string
+	name           string
+	messageOrdinal int
+	callIndex      int
+	positionKnown  bool
 }
 
 // codexCursorState is the compact state needed to make a tail parse behave as
@@ -117,10 +121,24 @@ func (s *codexCursorState) MarshalBinary() ([]byte, error) {
 		return nil, err
 	}
 	for i := 0; i < int(s.pendingCallCount); i++ {
-		if err := writeStr(s.pendingCalls[i].id); err != nil {
+		pending := s.pendingCalls[i]
+		if err := writeStr(pending.id); err != nil {
 			return nil, err
 		}
-		if err := writeStr(s.pendingCalls[i].name); err != nil {
+		if err := writeStr(pending.name); err != nil {
+			return nil, err
+		}
+		positionKnown := uint8(0)
+		if pending.positionKnown {
+			positionKnown = 1
+		}
+		if err := write(positionKnown); err != nil {
+			return nil, err
+		}
+		if err := write(int64(pending.messageOrdinal)); err != nil {
+			return nil, err
+		}
+		if err := write(int32(pending.callIndex)); err != nil {
 			return nil, err
 		}
 	}
@@ -202,12 +220,31 @@ func (s *codexCursorState) UnmarshalBinary(data []byte) error {
 	}
 	s.pendingCallCount = count
 	for i := 0; i < int(count); i++ {
-		if s.pendingCalls[i].id, err = readStr(); err != nil {
+		pending := &s.pendingCalls[i]
+		if pending.id, err = readStr(); err != nil {
 			return err
 		}
-		if s.pendingCalls[i].name, err = readStr(); err != nil {
+		if pending.name, err = readStr(); err != nil {
 			return err
 		}
+		var positionKnown uint8
+		if err := read(&positionKnown); err != nil {
+			return err
+		}
+		if positionKnown > 1 {
+			return fmt.Errorf("invalid codex cursor position flag %d", positionKnown)
+		}
+		var messageOrdinal int64
+		if err := read(&messageOrdinal); err != nil {
+			return err
+		}
+		var callIndex int32
+		if err := read(&callIndex); err != nil {
+			return err
+		}
+		pending.positionKnown = positionKnown == 1
+		pending.messageOrdinal = int(messageOrdinal)
+		pending.callIndex = int(callIndex)
 	}
 	if r.Len() != 0 {
 		return fmt.Errorf("codex cursor trailing bytes: %d", r.Len())
@@ -215,25 +252,25 @@ func (s *codexCursorState) UnmarshalBinary(data []byte) error {
 	return nil
 }
 
-func (s *codexCursorState) rememberToolCall(id, name string) bool {
+func (s *codexCursorState) rememberToolCall(
+	id, name string, position *ParsedToolCallPosition,
+) bool {
 	id = strings.TrimSpace(id)
 	name = strings.TrimSpace(name)
 	if id == "" || name == "" {
 		return false
 	}
-	for i := 0; i < int(s.pendingCallCount); i++ {
-		if s.pendingCalls[i].id == id {
-			s.pendingCalls[i].name = name
-			return true
-		}
-	}
 	if int(s.pendingCallCount) >= len(s.pendingCalls) {
 		s.pendingCallsOverflow = true
 		return false
 	}
-	s.pendingCalls[s.pendingCallCount] = codexPendingToolCall{
-		id: id, name: name,
+	pending := codexPendingToolCall{id: id, name: name}
+	if position != nil {
+		pending.messageOrdinal = position.MessageOrdinal
+		pending.callIndex = position.CallIndex
+		pending.positionKnown = true
 	}
+	s.pendingCalls[s.pendingCallCount] = pending
 	s.pendingCallCount++
 	return true
 }
@@ -245,6 +282,31 @@ func (s *codexCursorState) toolCallName(id string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func (s *codexCursorState) toolCallPosition(
+	id string,
+) (*ParsedToolCallPosition, bool) {
+	for i := 0; i < int(s.pendingCallCount); i++ {
+		pending := s.pendingCalls[i]
+		if pending.id != id {
+			continue
+		}
+		if !pending.positionKnown {
+			return nil, false
+		}
+		return &ParsedToolCallPosition{
+			MessageOrdinal: pending.messageOrdinal,
+			CallIndex:      pending.callIndex,
+		}, true
+	}
+	return nil, false
+}
+
+func (s *codexCursorState) clearPendingCallPositions() {
+	for i := 0; i < int(s.pendingCallCount); i++ {
+		s.pendingCalls[i].positionKnown = false
+	}
 }
 
 func (s *codexCursorState) forgetToolCall(id string) {

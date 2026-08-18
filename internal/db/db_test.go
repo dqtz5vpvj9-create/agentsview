@@ -4054,6 +4054,7 @@ func TestWriteSessionIncrementalToolCallResultUpdate(t *testing.T) {
 		NextOrdinal: 1,
 		ToolCallResultUpdates: []ToolCallResultUpdate{{
 			ToolUseID: "call_cmd",
+			Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
 			Events: []ToolResultEvent{{
 				ToolUseID:     "call_cmd",
 				Source:        "function_call_output",
@@ -4108,6 +4109,79 @@ func TestWriteSessionIncrementalToolCallResultUpdate(t *testing.T) {
 		"idempotent replay must not bump the transcript revision")
 }
 
+func TestWriteSessionIncrementalTargetsDuplicateCallIDOccurrence(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	for ordinal := 0; ordinal < 2; ordinal++ {
+		insertMessages(t, d, Message{
+			SessionID:  "s1",
+			Ordinal:    ordinal,
+			Role:       "assistant",
+			HasToolUse: true,
+			ToolCalls: []ToolCall{{
+				SessionID: "s1",
+				ToolName:  "exec_command",
+				Category:  "Bash",
+				ToolUseID: "reused-call",
+			}},
+		})
+	}
+
+	write := func(position ToolCallPosition, content string) {
+		t.Helper()
+		_, err := d.WriteSessionIncremental("s1", nil, IncrementalSessionUpdate{
+			MsgCount:    2,
+			NextOrdinal: 2,
+			ToolCallResultUpdates: []ToolCallResultUpdate{{
+				ToolUseID: "reused-call",
+				Position:  position,
+				Events: []ToolResultEvent{{
+					ToolUseID:     "reused-call",
+					Source:        "function_call_output",
+					Content:       content,
+					ContentLength: len(content),
+				}},
+			}},
+		})
+		require.NoError(t, err)
+	}
+
+	write(ToolCallPosition{MessageOrdinal: 1, CallIndex: 0}, "second")
+
+	rows, err := d.Reader().Query(`
+		SELECT m.ordinal, COALESCE(tc.result_content, '')
+		FROM tool_calls tc JOIN messages m ON m.id = tc.message_id
+		WHERE tc.session_id = ? AND tc.tool_use_id = ?
+		ORDER BY m.ordinal, tc.call_index`, "s1", "reused-call")
+	require.NoError(t, err)
+	defer rows.Close()
+	got := make(map[int]string)
+	for rows.Next() {
+		var ordinal int
+		var content string
+		require.NoError(t, rows.Scan(&ordinal, &content))
+		got[ordinal] = content
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, map[int]string{0: "", 1: "second"}, got)
+
+	var eventCount int
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT COUNT(*) FROM tool_result_events
+		WHERE session_id = ? AND tool_call_message_ordinal = ?
+		  AND call_index = ?`, "s1", 1, 0).Scan(&eventCount))
+	assert.Equal(t, 1, eventCount)
+
+	write(ToolCallPosition{MessageOrdinal: 0, CallIndex: 0}, "first")
+	var stateOccurrences int
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT COUNT(DISTINCT printf('%d/%d', message_ordinal, call_index))
+		FROM tool_call_occurrence_agent_state
+		WHERE session_id = ?`, "s1").Scan(&stateOccurrences))
+	assert.Equal(t, 2, stateOccurrences,
+		"reused provider IDs must keep independent per-occurrence state")
+}
+
 func TestWriteSessionIncrementalLateResultAndCommittedUsageAreAtomic(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "s1", "proj")
@@ -4129,6 +4203,7 @@ func TestWriteSessionIncrementalLateResultAndCommittedUsageAreAtomic(t *testing.
 		NextOrdinal: 1,
 		ToolCallResultUpdates: []ToolCallResultUpdate{{
 			ToolUseID: "call_cmd",
+			Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
 			Events: []ToolResultEvent{{
 				ToolUseID:     "call_cmd",
 				Source:        "function_call_output",
@@ -4202,6 +4277,7 @@ func TestWriteSessionIncrementalResultEventIndexesAreMonotonic(t *testing.T) {
 			NextOrdinal: 1,
 			ToolCallResultUpdates: []ToolCallResultUpdate{{
 				ToolUseID: "call_cmd",
+				Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
 				Events: []ToolResultEvent{{
 					ToolUseID:     "call_cmd",
 					Source:        "function_call_output",
@@ -4224,9 +4300,10 @@ func TestWriteSessionIncrementalResultEventIndexesAreMonotonic(t *testing.T) {
 
 	var latestIndex int
 	require.NoError(t, d.Reader().QueryRow(`
-		SELECT latest_event_index FROM tool_call_agent_state
-		WHERE session_id = ? AND tool_use_id = ? AND agent_id = ''`,
-		"s1", "call_cmd",
+		SELECT latest_event_index FROM tool_call_occurrence_agent_state
+		WHERE session_id = ? AND message_ordinal = ? AND call_index = ?
+		  AND agent_id = ''`,
+		"s1", 0, 0,
 	).Scan(&latestIndex))
 	assert.Equal(t, 1, latestIndex,
 		"the agent state must point at the newest event")
@@ -4262,6 +4339,7 @@ func TestWriteSessionIncrementalBlockedResultKeepsLength(t *testing.T) {
 		BlockedResultCategories: map[string]bool{"Bash": true},
 		ToolCallResultUpdates: []ToolCallResultUpdate{{
 			ToolUseID: "call_cmd",
+			Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
 			Events: []ToolResultEvent{
 				{
 					AgentID:       "a",
@@ -4327,16 +4405,17 @@ func TestBackfillToolCallAgentStateTracksFirstAndLatest(t *testing.T) {
 		require.NoError(t, err)
 	}
 	require.NoError(t, backfillToolCallAgentStateTx(
-		tx, "s1", "call_cmd", 0, 0,
+		tx, "s1", ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
 	))
 	require.NoError(t, tx.Commit())
 
 	var first, latest int
 	require.NoError(t, d.Reader().QueryRow(`
 		SELECT first_event_index, latest_event_index
-		FROM tool_call_agent_state
-		WHERE session_id = ? AND tool_use_id = ? AND agent_id = 'agent-a'`,
-		"s1", "call_cmd",
+		FROM tool_call_occurrence_agent_state
+		WHERE session_id = ? AND message_ordinal = ? AND call_index = ?
+		  AND agent_id = 'agent-a'`,
+		"s1", 0, 0,
 	).Scan(&first, &latest))
 	assert.Equal(t, 0, first)
 	assert.Equal(t, 2, latest,
@@ -4385,9 +4464,9 @@ func TestReplaceSessionContentDiffClearsStaleAgentState(t *testing.T) {
 
 	var before int
 	require.NoError(t, d.Reader().QueryRow(
-		`SELECT COUNT(*) FROM tool_call_agent_state
-		 WHERE session_id = ? AND tool_use_id = ?`,
-		"s1", "call_1",
+		`SELECT COUNT(*) FROM tool_call_occurrence_agent_state
+		 WHERE session_id = ? AND message_ordinal = ? AND call_index = ?`,
+		"s1", 0, 0,
 	).Scan(&before))
 	require.Equal(t, 2, before)
 
@@ -4403,9 +4482,9 @@ func TestReplaceSessionContentDiffClearsStaleAgentState(t *testing.T) {
 	))
 
 	rows, err := d.Reader().Query(
-		`SELECT agent_id FROM tool_call_agent_state
-		 WHERE session_id = ? AND tool_use_id = ?`,
-		"s1", "call_1",
+		`SELECT agent_id FROM tool_call_occurrence_agent_state
+		 WHERE session_id = ? AND message_ordinal = ? AND call_index = ?`,
+		"s1", 0, 0,
 	)
 	require.NoError(t, err)
 	agents := make(map[string]bool)

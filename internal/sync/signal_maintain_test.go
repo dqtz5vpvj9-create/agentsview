@@ -28,8 +28,9 @@ type fakeSignalQuery struct {
 	// CallResultEvents. inserted maps a tool_use_id to the events this
 	// transaction inserted, returned by InsertedResultEvents.
 	callEvents          []db.ToolResultEvent
-	inserted            map[string][]db.ToolResultEvent
+	inserted            map[db.ToolCallPosition][]db.ToolResultEvent
 	updatedUsageOrdinal map[int]bool
+	requestedPositions  []db.ToolCallPosition
 }
 
 func (f *fakeSignalQuery) Session(context.Context) (*db.Session, error) {
@@ -52,9 +53,10 @@ func (f *fakeSignalQuery) TrailingToolCalls(
 	return nil, nil
 }
 
-func (f *fakeSignalQuery) ToolCallsByUseID(
-	context.Context, []string,
+func (f *fakeSignalQuery) ToolCallsByPosition(
+	_ context.Context, positions []db.ToolCallPosition,
 ) ([]db.ToolCallSignalFact, error) {
+	f.requestedPositions = append([]db.ToolCallPosition(nil), positions...)
 	return f.callFacts, nil
 }
 
@@ -65,9 +67,9 @@ func (f *fakeSignalQuery) CallResultEvents(
 }
 
 func (f *fakeSignalQuery) InsertedResultEvents(
-	toolUseID string,
+	position db.ToolCallPosition,
 ) []db.ToolResultEvent {
-	return f.inserted[toolUseID]
+	return f.inserted[position]
 }
 
 func (f *fakeSignalQuery) MessageTokenUsageUpdated(ordinal int) bool {
@@ -195,6 +197,7 @@ func TestIncrementalMaintainerScansOnlyInsertedResultEvents(t *testing.T) {
 	m := newTestMaintainer("rev", secrets.DefiniteRulesVersion(), nil)
 	m.resultUpdates = []db.ToolCallResultUpdate{{
 		ToolUseID: "call_0",
+		Position:  db.ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
 	}}
 	state := signals.SeedIncrementalState(
 		[]signals.ToolCallRow{{
@@ -238,8 +241,8 @@ func TestIncrementalMaintainerScansOnlyInsertedResultEvents(t *testing.T) {
 			ContentLength: len(oldContent),
 			EventIndex:    0,
 		}},
-		inserted: map[string][]db.ToolResultEvent{
-			"call_0": {{
+		inserted: map[db.ToolCallPosition][]db.ToolResultEvent{
+			{MessageOrdinal: 0, CallIndex: 0}: {{
 				ToolUseID:     "call_0",
 				Source:        "function_call_output",
 				Content:       newContent,
@@ -265,6 +268,77 @@ func TestIncrementalMaintainerScansOnlyInsertedResultEvents(t *testing.T) {
 	}
 	assert.Equal(t, 1, newEventFindings,
 		"the inserted event's finding must land with its real index")
+}
+
+func TestIncrementalMaintainerTargetsDuplicateCallIDOccurrence(t *testing.T) {
+	first := db.ToolCallPosition{MessageOrdinal: 0, CallIndex: 0}
+	second := db.ToolCallPosition{MessageOrdinal: 1, CallIndex: 0}
+	state := signals.SeedIncrementalState(
+		[]signals.ToolCallRow{
+			{
+				ToolName: "exec_command", Category: "Bash", InputJSON: `{}`,
+				ResultContent: "ok", MessageOrdinal: first.MessageOrdinal,
+				CallIndex: first.CallIndex,
+			},
+			{
+				ToolName: "exec_command", Category: "Bash", InputJSON: `{}`,
+				ResultContent: "ok", MessageOrdinal: second.MessageOrdinal,
+				CallIndex: second.CallIndex,
+			},
+		},
+		nil, "", "", nil, nil, 0, 0,
+	)
+	blob, err := state.MarshalBinary()
+	require.NoError(t, err)
+
+	m := newTestMaintainer("rev", secrets.DefiniteRulesVersion(), nil)
+	m.resultUpdates = []db.ToolCallResultUpdate{{
+		ToolUseID: "reused-call",
+		Position:  second,
+	}}
+	q := &fakeSignalQuery{
+		sess: &db.Session{
+			QualitySignalVersion: db.CurrentQualitySignalVersion,
+		},
+		state: db.SessionSignalState{
+			State:              blob,
+			TranscriptRevision: "rev",
+			SignalVersion:      db.CurrentQualitySignalVersion,
+		},
+		hasState: true,
+		revision: "rev",
+		// Return both reused-ID facts in the opposite order. The maintainer
+		// must select by occurrence coordinates rather than whichever raw ID
+		// happens to win a map assignment.
+		callFacts: []db.ToolCallSignalFact{
+			{
+				MessageOrdinal: second.MessageOrdinal,
+				CallIndex:      second.CallIndex,
+				ToolName:       "exec_command",
+				Category:       "Bash",
+				InputJSON:      `{}`,
+				ResultContent:  "failed",
+				EventStatus:    "errored",
+				ToolUseID:      "reused-call",
+			},
+			{
+				MessageOrdinal: first.MessageOrdinal,
+				CallIndex:      first.CallIndex,
+				ToolName:       "exec_command",
+				Category:       "Bash",
+				InputJSON:      `{}`,
+				ResultContent:  "ok",
+				ToolUseID:      "reused-call",
+			},
+		},
+	}
+
+	delta, err := m.MaintainTx(context.Background(), q)
+	require.NoError(t, err)
+	require.NotNil(t, delta)
+	assert.Equal(t, []db.ToolCallPosition{second}, q.requestedPositions)
+	assert.Equal(t, 1, delta.Update.ToolFailureSignalCount,
+		"only the targeted reused-ID occurrence should become a failure")
 }
 
 // TestIncrementalMaintainerCompactionExplicitBoundaryParity pins parity

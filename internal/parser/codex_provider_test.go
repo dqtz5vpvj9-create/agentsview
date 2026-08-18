@@ -2125,3 +2125,86 @@ func appendCodexProviderContent(t *testing.T, path, content string) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 }
+
+func TestCodexProviderIncrementalUserBoundaryDoesNotBackfillCommittedUsage(t *testing.T) {
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229f9"
+	prefix := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/workspace/project-a", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexTurnContextJSON("gpt-5.4", tsEarlyS1),
+		testjsonl.CodexMsgJSON("user", "first request", tsEarlyS1),
+		testjsonl.CodexMsgJSON("assistant", "first response", tsEarlyS5),
+	)
+
+	t.Run("user without a new assistant blocks committed target", func(t *testing.T) {
+		root := t.TempDir()
+		path := writeCodexProviderSessionContent(t, root, uuid, prefix)
+		provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+		require.True(t, ok)
+		source := requireCodexProviderSource(t, provider, uuid)
+		prefixFingerprint, err := provider.Fingerprint(context.Background(), source)
+		require.NoError(t, err)
+
+		tail := testjsonl.JoinJSONL(
+			testjsonl.CodexMsgJSON("user", "second request", tsLate),
+			testjsonl.CodexTokenCountJSON(tsLateS5, 100_000, 250, 64_000),
+		)
+		appendCodexProviderContent(t, path, tail)
+		fingerprint, err := provider.Fingerprint(context.Background(), source)
+		require.NoError(t, err)
+		pendingUsageOrdinal := 1
+		outcome, status, err := provider.ParseIncremental(
+			context.Background(), IncrementalRequest{
+				Source:                    source,
+				Fingerprint:               fingerprint,
+				SessionID:                 "codex:" + uuid,
+				Offset:                    prefixFingerprint.Size,
+				StartOrdinal:              2,
+				StoredPendingUsageOrdinal: &pendingUsageOrdinal,
+			},
+		)
+		require.NoError(t, err)
+		assert.Equal(t, IncrementalApplied, status)
+		require.Len(t, outcome.Messages, 1)
+		assert.Equal(t, RoleUser, outcome.Messages[0].Role)
+		assert.Empty(t, outcome.MessageTokenUsageUpdates,
+			"usage after a real user boundary must not update the prior turn")
+	})
+
+	t.Run("new assistant after the user receives usage", func(t *testing.T) {
+		root := t.TempDir()
+		path := writeCodexProviderSessionContent(t, root, uuid, prefix)
+		provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+		require.True(t, ok)
+		source := requireCodexProviderSource(t, provider, uuid)
+		prefixFingerprint, err := provider.Fingerprint(context.Background(), source)
+		require.NoError(t, err)
+
+		tail := testjsonl.JoinJSONL(
+			testjsonl.CodexMsgJSON("user", "second request", tsLate),
+			testjsonl.CodexMsgJSON("assistant", "second response", tsLateS5),
+			testjsonl.CodexTokenCountJSON("2026-08-02T09:00:06Z", 100_000, 250, 64_000),
+		)
+		appendCodexProviderContent(t, path, tail)
+		fingerprint, err := provider.Fingerprint(context.Background(), source)
+		require.NoError(t, err)
+		pendingUsageOrdinal := 1
+		outcome, status, err := provider.ParseIncremental(
+			context.Background(), IncrementalRequest{
+				Source:                    source,
+				Fingerprint:               fingerprint,
+				SessionID:                 "codex:" + uuid,
+				Offset:                    prefixFingerprint.Size,
+				StartOrdinal:              2,
+				StoredPendingUsageOrdinal: &pendingUsageOrdinal,
+			},
+		)
+		require.NoError(t, err)
+		assert.Equal(t, IncrementalApplied, status)
+		require.Len(t, outcome.Messages, 2)
+		assert.Equal(t, RoleAssistant, outcome.Messages[1].Role)
+		assert.NotEmpty(t, outcome.Messages[1].TokenUsage)
+		assert.Empty(t, outcome.MessageTokenUsageUpdates)
+	})
+}

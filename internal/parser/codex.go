@@ -58,24 +58,25 @@ type codexSessionBuilder struct {
 	// sink receives every normalized operation; the collecting
 	// implementation keeps the slice-based behavior, the streaming one
 	// batches into a scratch store.
-	sink                 CodexSessionSink
-	resolveParentTurns   codexParentTurnResolver
-	parentTurnIDs        map[string]struct{}
-	firstMessage         string
-	startedAt            time.Time
-	endedAt              time.Time
-	sessionID            string
-	parentSessionID      string
-	relationshipType     RelationshipType
-	project              string
-	callNames            map[string]string
-	agentSpawnCalls      map[string]string
-	agentWaitCalls       map[string]string
-	pendingAgentEvents   map[string][]codexPendingEvent
-	unattachedTokenUsage bool
-	committedUsageTarget *int
-	messageUsageUpdates  []ParsedMessageTokenUsageUpdate
-	checkpointUnsafe     bool
+	sink                        CodexSessionSink
+	resolveParentTurns          codexParentTurnResolver
+	parentTurnIDs               map[string]struct{}
+	firstMessage                string
+	startedAt                   time.Time
+	endedAt                     time.Time
+	sessionID                   string
+	parentSessionID             string
+	relationshipType            RelationshipType
+	project                     string
+	callNames                   map[string]string
+	agentSpawnCalls             map[string]string
+	agentWaitCalls              map[string]string
+	pendingAgentEvents          map[string][]codexPendingEvent
+	unattachedTokenUsage        bool
+	committedUsageTarget        *int
+	committedUsageBlockedByUser bool
+	messageUsageUpdates         []ParsedMessageTokenUsageUpdate
+	checkpointUnsafe            bool
 }
 
 // codexForkGate drops replayed parent history at the top of a Codex
@@ -248,6 +249,46 @@ func (b *codexSessionBuilder) incrementalSeed() codexIncrementalSeed {
 	return b.codexCursorState
 }
 
+func (b *codexSessionBuilder) refreshPendingCallPositions() {
+	positionsByID := make(map[string][]ParsedToolCallPosition)
+	for _, msg := range b.sink.Messages() {
+		for callIndex, call := range msg.ToolCalls {
+			if call.ToolUseID == "" {
+				continue
+			}
+			positionsByID[call.ToolUseID] = append(
+				positionsByID[call.ToolUseID],
+				ParsedToolCallPosition{
+					MessageOrdinal: msg.Ordinal,
+					CallIndex:      callIndex,
+				},
+			)
+		}
+	}
+
+	pendingByID := make(map[string][]int)
+	for i := 0; i < int(b.pendingCallCount); i++ {
+		b.pendingCalls[i].positionKnown = false
+		pendingByID[b.pendingCalls[i].id] = append(
+			pendingByID[b.pendingCalls[i].id], i,
+		)
+	}
+	for id, pendingIndexes := range pendingByID {
+		positions := positionsByID[id]
+		if len(positions) < len(pendingIndexes) {
+			b.checkpointUnsafe = true
+			return
+		}
+		positions = positions[len(positions)-len(pendingIndexes):]
+		for i, pendingIndex := range pendingIndexes {
+			b.pendingCalls[pendingIndex].messageOrdinal =
+				positions[i].MessageOrdinal
+			b.pendingCalls[pendingIndex].callIndex = positions[i].CallIndex
+			b.pendingCalls[pendingIndex].positionKnown = true
+		}
+	}
+}
+
 // processLine handles a single non-empty, valid JSON line.
 func (b *codexSessionBuilder) processLine(
 	line string,
@@ -381,6 +422,8 @@ func (b *codexSessionBuilder) handleResponseItem(
 			// not the truncated first-message preview.
 			return
 		}
+		b.committedUsageTarget = nil
+		b.committedUsageBlockedByUser = true
 	}
 
 	b.sink.AppendMessage(ParsedMessage{
@@ -408,6 +451,8 @@ func (b *codexSessionBuilder) handleAgentMessage(
 	if replay {
 		return
 	}
+	b.committedUsageTarget = nil
+	b.committedUsageBlockedByUser = true
 	b.sink.AppendMessage(ParsedMessage{
 		Role:          RoleUser,
 		Content:       content,
@@ -449,6 +494,9 @@ func (b *codexSessionBuilder) handleTokenCountEvent(
 	if b.sink.ApplyTokenUsageToLastAssistant(raw) {
 		return
 	}
+	if b.committedUsageBlockedByUser {
+		return
+	}
 	if b.committedUsageTarget == nil {
 		b.unattachedTokenUsage = true
 		return
@@ -478,7 +526,10 @@ func (b *codexSessionBuilder) handleCollabAgentSpawnEnd(
 		return
 	}
 	b.agentSpawnCalls[agentID] = callID
-	b.sink.SetCallSubagentSessionID(callID, codexSubagentSessionID(agentID))
+	position, _ := b.toolCallPosition(callID)
+	b.sink.SetCallSubagentSessionID(
+		callID, position, codexSubagentSessionID(agentID),
+	)
 }
 
 func (b *codexSessionBuilder) handleSubagentActivity(
@@ -493,7 +544,10 @@ func (b *codexSessionBuilder) handleSubagentActivity(
 		return
 	}
 	b.agentSpawnCalls[agentID] = callID
-	b.sink.SetCallSubagentSessionID(callID, codexSubagentSessionID(agentID))
+	position, _ := b.toolCallPosition(callID)
+	b.sink.SetCallSubagentSessionID(
+		callID, position, codexSubagentSessionID(agentID),
+	)
 }
 
 // applyCodexTokenUsage normalizes Codex token usage fields
@@ -512,9 +566,6 @@ func (b *codexSessionBuilder) handleFunctionCall(
 	callID := payload.Get("call_id").Str
 	if callID != "" {
 		b.callNames[callID] = name
-		if !b.rememberToolCall(callID, name) {
-			b.checkpointUnsafe = true
-		}
 	}
 
 	content := formatCodexFunctionCall(name, payload)
@@ -526,7 +577,7 @@ func (b *codexSessionBuilder) handleFunctionCall(
 		waitAgentIDs = codexWaitAgentIDs(args)
 	}
 
-	b.sink.AppendMessage(ParsedMessage{
+	messageOrdinal := b.sink.AppendMessage(ParsedMessage{
 		Role:          RoleAssistant,
 		Content:       content,
 		Timestamp:     ts,
@@ -541,6 +592,15 @@ func (b *codexSessionBuilder) handleFunctionCall(
 			SkillName: skillName,
 		}},
 	})
+	if callID != "" {
+		position := &ParsedToolCallPosition{
+			MessageOrdinal: messageOrdinal,
+			CallIndex:      0,
+		}
+		if !b.rememberToolCall(callID, name, position) {
+			b.checkpointUnsafe = true
+		}
+	}
 
 	if isCodexWaitAgentCall(name) && callID != "" {
 		for _, agentID := range waitAgentIDs {
@@ -573,7 +633,10 @@ func (b *codexSessionBuilder) handleFunctionCallOutput(
 			return
 		}
 		b.agentSpawnCalls[agentID] = callID
-		b.sink.SetCallSubagentSessionID(callID, codexSubagentSessionID(agentID))
+		position, _ := b.toolCallPosition(callID)
+		b.sink.SetCallSubagentSessionID(
+			callID, position, codexSubagentSessionID(agentID),
+		)
 	case "wait", "wait_agent":
 		status := output.Get("status")
 		if !status.Exists() || !status.IsObject() {
@@ -585,7 +648,7 @@ func (b *codexSessionBuilder) handleFunctionCallOutput(
 			if text == "" {
 				return true
 			}
-			b.sink.AppendToolResultEvent(callID, ParsedToolResultEvent{
+			b.appendToolResultEvent(callID, ParsedToolResultEvent{
 				ToolUseID:         callID,
 				AgentID:           agentID,
 				SubagentSessionID: codexSubagentSessionID(agentID),
@@ -607,7 +670,7 @@ func (b *codexSessionBuilder) handleFunctionCallOutput(
 					status = "completed"
 				}
 			}
-			b.sink.AppendToolResultEvent(callID, ParsedToolResultEvent{
+			b.appendToolResultEvent(callID, ParsedToolResultEvent{
 				ToolUseID: callID,
 				Source:    source,
 				Status:    status,
@@ -618,12 +681,18 @@ func (b *codexSessionBuilder) handleFunctionCallOutput(
 	}
 }
 
+func (b *codexSessionBuilder) appendToolResultEvent(
+	callID string, ev ParsedToolResultEvent,
+) {
+	position, _ := b.toolCallPosition(callID)
+	b.sink.AppendToolResultEvent(callID, position, ev)
+}
+
 func (b *codexSessionBuilder) toolCallNameForOutput(callID string) string {
-	if name := b.callNames[callID]; name != "" {
+	if name, ok := b.toolCallName(callID); ok {
 		return name
 	}
-	name, _ := b.toolCallName(callID)
-	return name
+	return b.callNames[callID]
 }
 
 // handleSubagentNotification attributes a subagent notification either
@@ -638,7 +707,7 @@ func (b *codexSessionBuilder) handleSubagentNotification(
 		return false
 	}
 	if callID := b.agentWaitCalls[agentID]; callID != "" {
-		b.sink.AppendToolResultEvent(callID, ParsedToolResultEvent{
+		b.appendToolResultEvent(callID, ParsedToolResultEvent{
 			AgentID:           agentID,
 			SubagentSessionID: codexSubagentSessionID(agentID),
 			Source:            "subagent_notification",
@@ -670,7 +739,7 @@ func (b *codexSessionBuilder) claimPendingAgentEvents(
 		return
 	}
 	for _, ev := range pending {
-		b.sink.AppendToolResultEvent(callID, ParsedToolResultEvent{
+		b.appendToolResultEvent(callID, ParsedToolResultEvent{
 			AgentID:           ev.agentID,
 			SubagentSessionID: codexSubagentSessionID(ev.agentID),
 			Source:            ev.source,
@@ -1570,6 +1639,7 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 
 	b.flushPendingAgentResults()
 	b.sink.Finalize()
+	b.refreshPendingCallPositions()
 	msgs := b.sink.Messages()
 	seed := b.incrementalSeed()
 	inode, device := sourceFileIdentityForPath(path, info)
@@ -1945,7 +2015,8 @@ func seedCodexIncrementalStateFromReader(
 	r io.Reader,
 	resolveParentTurns codexParentTurnResolver,
 ) (codexIncrementalSeed, error) {
-	b := newCodexSessionBuilder(false, NewCodexCollectingSink(0))
+	sink := newCodexSeedSink()
+	b := newCodexSessionBuilder(false, sink)
 	b.resolveParentTurns = resolveParentTurns
 	lr := newLineReader(r, maxLineSize)
 	defer releaseLineReader(lr)
@@ -1957,49 +2028,21 @@ func seedCodexIncrementalStateFromReader(
 		if !gjson.Valid(line) {
 			continue
 		}
-		lineType := gjson.Get(line, "type").Str
-		payload := gjson.Get(line, "payload")
-		if lineType == codexTypeSessionMeta {
-			// Mirror processLine: the fork's own meta arms the
-			// gate and supplies cwd, and replayed parent metas are
-			// dropped while it is active.
-			if !b.forkGate.suppressesSessionMeta(payload) {
-				if cwd := payload.Get("cwd").Str; cwd != "" {
-					b.cwd = cwd
-				}
-				b.agentPath = strings.TrimSpace(
-					payload.Get("agent_path").Str,
-				)
-				if b.agentPath == "" {
-					b.agentPath = strings.TrimSpace(payload.Get(
-						"source.subagent.thread_spawn.agent_path",
-					).Str)
-				}
-				b.armForkGate(payload)
-			}
-			continue
-		}
-		if b.suppresses(lineType, payload) {
-			continue
-		}
-		switch lineType {
-		case codexTypeTurnContext:
-			b.model = payload.Get("model").Str
-		case codexTypeEventMsg:
-			eventType := payload.Get("type").Str
-			b.observeTaskEvent(eventType)
-			if eventType == "token_count" {
-				raw := payload.Get("info.last_token_usage").Raw
-				if raw != "" {
-					b.observeTokenUsage(raw)
-				}
-			}
-		case codexTypeResponseItem:
-			observeCodexIncrementalResponseItem(&b.codexCursorState, payload)
-		}
+		b.processLine(line)
 	}
 	if err := lr.Err(); err != nil {
 		return codexIncrementalSeed{}, err
+	}
+	b.flushPendingAgentResults()
+	if b.checkpointUnsafe || b.pendingCallsOverflow {
+		return codexIncrementalSeed{}, errCodexIncrementalNeedsFullParse
+	}
+	if sink.hadReservation {
+		// ReserveOrdinal may later be claimed without materializing a message,
+		// so a constant-memory prefix scan cannot prove final coordinates.
+		// Keep the cursor usable for other continuation state while forcing a
+		// full parse if a later tail needs one of these pending targets.
+		b.clearPendingCallPositions()
 	}
 	return b.codexCursorState, nil
 }
@@ -2013,6 +2056,7 @@ func observeCodexIncrementalResponseItem(
 		s.rememberToolCall(
 			payload.Get("call_id").Str,
 			payload.Get("name").Str,
+			nil,
 		)
 	case "function_call_output", "custom_tool_call_output":
 		s.forgetToolCall(payload.Get("call_id").Str)
@@ -2337,6 +2381,9 @@ func (p *codexProvider) parseSessionFromWithSources(
 	b := newCodexSessionBuilder(includeExec, NewCodexCollectingSink(startOrdinal))
 	b.resolveParentTurns = p.parentTurnResolver(path)
 	b.codexCursorState = seed
+	if seed.pendingCallsOverflow {
+		return codexIncrementalParseResult{}, errCodexIncrementalNeedsFullParse
+	}
 	if committedUsageTarget != nil {
 		ordinal := *committedUsageTarget
 		b.committedUsageTarget = &ordinal
@@ -2380,6 +2427,11 @@ func (p *codexProvider) parseSessionFromWithSources(
 	b.flushPendingAgentResults()
 	if b.checkpointUnsafe {
 		return codexIncrementalParseResult{}, errCodexIncrementalNeedsFullParse
+	}
+	for _, update := range b.sink.ToolCallUpdates() {
+		if !update.TargetKnown {
+			return codexIncrementalParseResult{}, errCodexIncrementalNeedsFullParse
+		}
 	}
 	result := codexIncrementalParseResult{
 		messages:        b.sink.Messages(),

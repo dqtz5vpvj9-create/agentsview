@@ -94,6 +94,10 @@ type ToolResultEvent struct {
 	EventIndex        int    `json:"event_index"`
 }
 
+func formatToolCallPosition(position ToolCallPosition) string {
+	return fmt.Sprintf("%d/%d", position.MessageOrdinal, position.CallIndex)
+}
+
 // SummarizeToolResultEvents derives the display result stored on a tool call
 // from its chronological result events. Anonymous events use the latest
 // content; agent-scoped events keep the latest content for each agent.
@@ -103,23 +107,24 @@ type ToolResultEvent struct {
 // the distinct agents keeps a late result update O(delta) instead of
 // rescanning the call's event history.
 func summarizeToolCallFromStateTx(
-	tx *sql.Tx, sessionID, toolUseID string,
+	tx *sql.Tx, sessionID string, position ToolCallPosition,
 ) (string, error) {
 	rows, err := tx.Query(
 		`SELECT s.agent_id, e.content
-		 FROM tool_call_agent_state s
+		 FROM tool_call_occurrence_agent_state s
 		 JOIN tool_result_events e
 		   ON e.session_id = s.session_id
-		  AND e.tool_use_id = s.tool_use_id
+		  AND e.tool_call_message_ordinal = s.message_ordinal
+		  AND e.call_index = s.call_index
 		  AND e.event_index = s.latest_event_index
-		 WHERE s.session_id = ? AND s.tool_use_id = ?
+		 WHERE s.session_id = ? AND s.message_ordinal = ? AND s.call_index = ?
 		 ORDER BY s.first_event_index`,
-		sessionID, toolUseID,
+		sessionID, position.MessageOrdinal, position.CallIndex,
 	)
 	if err != nil {
 		return "", fmt.Errorf(
 			"loading agent state for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
 	var orderedAgents []string
@@ -132,7 +137,7 @@ func summarizeToolCallFromStateTx(
 			_ = rows.Close()
 			return "", fmt.Errorf(
 				"scanning agent state for %s/%s: %w",
-				sessionID, toolUseID, err,
+				sessionID, formatToolCallPosition(position), err,
 			)
 		}
 		if agentID == "" {
@@ -149,13 +154,13 @@ func summarizeToolCallFromStateTx(
 		_ = rows.Close()
 		return "", fmt.Errorf(
 			"reading agent state for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
 	if err := rows.Close(); err != nil {
 		return "", fmt.Errorf(
 			"closing agent state for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
 	if len(latest) <= 1 {
@@ -187,23 +192,24 @@ func summarizeToolCallFromStateTx(
 // summarizeToolCallFromStateTx: a change to either assembly rule must update
 // both.
 func summarizeToolCallLengthFromStateTx(
-	tx *sql.Tx, sessionID, toolUseID string,
+	tx *sql.Tx, sessionID string, position ToolCallPosition,
 ) (int, error) {
 	rows, err := tx.Query(
 		`SELECT s.agent_id, e.content_length
-		 FROM tool_call_agent_state s
+		 FROM tool_call_occurrence_agent_state s
 		 JOIN tool_result_events e
 		   ON e.session_id = s.session_id
-		  AND e.tool_use_id = s.tool_use_id
+		  AND e.tool_call_message_ordinal = s.message_ordinal
+		  AND e.call_index = s.call_index
 		  AND e.event_index = s.latest_event_index
-		 WHERE s.session_id = ? AND s.tool_use_id = ?
+		 WHERE s.session_id = ? AND s.message_ordinal = ? AND s.call_index = ?
 		 ORDER BY s.first_event_index`,
-		sessionID, toolUseID,
+		sessionID, position.MessageOrdinal, position.CallIndex,
 	)
 	if err != nil {
 		return 0, fmt.Errorf(
 			"loading agent state lengths for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
 	var orderedAgents []string
@@ -216,7 +222,7 @@ func summarizeToolCallLengthFromStateTx(
 			_ = rows.Close()
 			return 0, fmt.Errorf(
 				"scanning agent state lengths for %s/%s: %w",
-				sessionID, toolUseID, err,
+				sessionID, formatToolCallPosition(position), err,
 			)
 		}
 		if agentID == "" {
@@ -232,13 +238,13 @@ func summarizeToolCallLengthFromStateTx(
 		_ = rows.Close()
 		return 0, fmt.Errorf(
 			"reading agent state lengths for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
 	if err := rows.Close(); err != nil {
 		return 0, fmt.Errorf(
 			"closing agent state lengths for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
 	switch {
@@ -268,9 +274,10 @@ func summarizeToolCallLengthFromStateTx(
 // before the state table existed or through the staged publish; after
 // that, every late result update reads only the state table.
 func backfillToolCallAgentStateTx(
-	tx *sql.Tx, sessionID, toolUseID string,
-	messageOrdinal, callIndex int,
+	tx *sql.Tx, sessionID string, position ToolCallPosition,
 ) error {
+	messageOrdinal := position.MessageOrdinal
+	callIndex := position.CallIndex
 	rows, err := tx.Query(
 		`SELECT COALESCE(agent_id, ''), content, content_length, event_index
 		 FROM tool_result_events
@@ -282,7 +289,7 @@ func backfillToolCallAgentStateTx(
 	if err != nil {
 		return fmt.Errorf(
 			"backfilling agent state for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
 	type stateRow struct {
@@ -299,7 +306,7 @@ func backfillToolCallAgentStateTx(
 			_ = rows.Close()
 			return fmt.Errorf(
 				"backfill scan for %s/%s: %w",
-				sessionID, toolUseID, err,
+				sessionID, formatToolCallPosition(position), err,
 			)
 		}
 		if strings.TrimSpace(content) == "" && length == 0 {
@@ -317,19 +324,19 @@ func backfillToolCallAgentStateTx(
 		_ = rows.Close()
 		return fmt.Errorf(
 			"backfill read for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
 	if err := rows.Close(); err != nil {
 		return fmt.Errorf(
 			"backfill close for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
-	args := make([]any, 0, len(latest)*5)
+	args := make([]any, 0, len(latest)*6)
 	for key, entry := range latest {
 		args = append(args,
-			sessionID, toolUseID, key,
+			sessionID, position.MessageOrdinal, position.CallIndex, key,
 			entry.firstIndex, entry.latestIndex,
 		)
 	}
@@ -337,17 +344,17 @@ func backfillToolCallAgentStateTx(
 		return nil
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO tool_call_agent_state
-			(session_id, tool_use_id, agent_id,
+		`INSERT INTO tool_call_occurrence_agent_state
+			(session_id, message_ordinal, call_index, agent_id,
 			 first_event_index, latest_event_index)
-		 VALUES `+multiRowPlaceholders(len(args)/5, 5)+`
-		 ON CONFLICT(session_id, tool_use_id, agent_id) DO UPDATE SET
-			latest_event_index = excluded.latest_event_index`,
+		 VALUES `+multiRowPlaceholders(len(args)/6, 6)+`
+		 ON CONFLICT(session_id, message_ordinal, call_index, agent_id)
+		 DO UPDATE SET latest_event_index = excluded.latest_event_index`,
 		args...,
 	); err != nil {
 		return fmt.Errorf(
 			"backfilling tool_call_agent_state (%d rows): %w",
-			len(args)/5, err,
+			len(args)/6, err,
 		)
 	}
 	return nil
@@ -1182,7 +1189,7 @@ func insertToolResultEventsChunkTx(
 func upsertToolCallAgentStateRows(
 	tx *sql.Tx, rows []toolResultEventRow,
 ) error {
-	args := make([]any, 0, len(rows)*5)
+	args := make([]any, 0, len(rows)*6)
 	for _, r := range rows {
 		if strings.TrimSpace(r.Event.Content) == "" &&
 			r.Event.ContentLength == 0 {
@@ -1190,7 +1197,8 @@ func upsertToolCallAgentStateRows(
 		}
 		args = append(args,
 			r.SessionID,
-			r.Event.ToolUseID,
+			r.MessageOrdinal,
+			r.CallIndex,
 			strings.TrimSpace(r.Event.AgentID),
 			r.Event.EventIndex,
 			r.Event.EventIndex,
@@ -1200,16 +1208,16 @@ func upsertToolCallAgentStateRows(
 		return nil
 	}
 	query := `
-		INSERT INTO tool_call_agent_state
-			(session_id, tool_use_id, agent_id,
+		INSERT INTO tool_call_occurrence_agent_state
+			(session_id, message_ordinal, call_index, agent_id,
 			 first_event_index, latest_event_index)
-		VALUES ` + multiRowPlaceholders(len(args)/5, 5) + `
-		ON CONFLICT(session_id, tool_use_id, agent_id) DO UPDATE SET
-			latest_event_index = excluded.latest_event_index`
+		VALUES ` + multiRowPlaceholders(len(args)/6, 6) + `
+		ON CONFLICT(session_id, message_ordinal, call_index, agent_id)
+		DO UPDATE SET latest_event_index = excluded.latest_event_index`
 	if _, err := tx.Exec(query, args...); err != nil {
 		return fmt.Errorf(
 			"upserting tool_call_agent_state (%d rows): %w",
-			len(args)/5, err,
+			len(args)/6, err,
 		)
 	}
 	return nil
@@ -1494,7 +1502,7 @@ func (db *DB) WriteSessionIncremental(
 		}
 		transcriptChanged = transcriptChanged || changed
 	}
-	var insertedResultEvents map[string][]ToolResultEvent
+	var insertedResultEvents map[ToolCallPosition][]ToolResultEvent
 	for _, resultUpdate := range update.ToolCallResultUpdates {
 		changed, inserted, err := applyToolCallResultUpdateTx(
 			tx, sessionID, resultUpdate,
@@ -1506,9 +1514,9 @@ func (db *DB) WriteSessionIncremental(
 		transcriptChanged = transcriptChanged || changed
 		if len(inserted) > 0 {
 			if insertedResultEvents == nil {
-				insertedResultEvents = make(map[string][]ToolResultEvent)
+				insertedResultEvents = make(map[ToolCallPosition][]ToolResultEvent)
 			}
-			key := strings.TrimSpace(resultUpdate.ToolUseID)
+			key := resultUpdate.Position
 			insertedResultEvents[key] = append(
 				insertedResultEvents[key], inserted...,
 			)
@@ -1890,7 +1898,7 @@ func deleteSessionMessagesTx(tx *sql.Tx, sessionID string) error {
 		"DELETE FROM parser_checkpoints WHERE session_id = ?",
 		"DELETE FROM parser_checkpoint_blobs WHERE session_id = ?",
 		"DELETE FROM session_signal_state WHERE session_id = ?",
-		"DELETE FROM tool_call_agent_state WHERE session_id = ?",
+		"DELETE FROM tool_call_occurrence_agent_state WHERE session_id = ?",
 	} {
 		if _, err := tx.Exec(stmt, sessionID); err != nil {
 			return fmt.Errorf("deleting session side rows: %w", err)
@@ -3044,15 +3052,19 @@ func applyToolCallResultUpdateTx(
 		return false, nil, nil
 	}
 
-	var messageOrdinal, callIndex int
+	position := update.Position
+	var toolCallID int64
 	var category string
 	if err := tx.QueryRow(
-		`SELECT m.ordinal, COALESCE(tc.call_index, 0), tc.category
+		`SELECT tc.id, tc.category
 		 FROM tool_calls tc
 		 JOIN messages m ON m.id = tc.message_id
-		 WHERE tc.session_id = ? AND tc.tool_use_id = ?`,
-		sessionID, update.ToolUseID,
-	).Scan(&messageOrdinal, &callIndex, &category); err != nil {
+		 WHERE tc.session_id = ? AND m.ordinal = ?
+		   AND COALESCE(tc.call_index, 0) = ?
+		   AND COALESCE(tc.tool_use_id, '') = ?`,
+		sessionID, position.MessageOrdinal, position.CallIndex,
+		update.ToolUseID,
+	).Scan(&toolCallID, &category); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil, nil
 		}
@@ -3070,9 +3082,10 @@ func applyToolCallResultUpdateTx(
 	// result; every later update stays O(delta).
 	var stateExists int
 	err := tx.QueryRow(
-		`SELECT 1 FROM tool_call_agent_state
-		 WHERE session_id = ? AND tool_use_id = ? LIMIT 1`,
-		sessionID, update.ToolUseID,
+		`SELECT 1 FROM tool_call_occurrence_agent_state
+		 WHERE session_id = ? AND message_ordinal = ? AND call_index = ?
+		 LIMIT 1`,
+		sessionID, position.MessageOrdinal, position.CallIndex,
 	).Scan(&stateExists)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, nil, fmt.Errorf(
@@ -3082,7 +3095,7 @@ func applyToolCallResultUpdateTx(
 	}
 	if err != nil {
 		if err := backfillToolCallAgentStateTx(
-			tx, sessionID, update.ToolUseID, messageOrdinal, callIndex,
+			tx, sessionID, position,
 		); err != nil {
 			return false, nil, err
 		}
@@ -3093,7 +3106,7 @@ func applyToolCallResultUpdateTx(
 		 FROM tool_result_events
 		 WHERE session_id = ? AND tool_call_message_ordinal = ?
 		   AND call_index = ?`,
-		sessionID, messageOrdinal, callIndex,
+		sessionID, position.MessageOrdinal, position.CallIndex,
 	).Scan(&nextEventIndex); err != nil {
 		return false, nil, fmt.Errorf(
 			"reading next event index for %s/%s: %w",
@@ -3133,7 +3146,7 @@ func applyToolCallResultUpdateTx(
 			   AND status IS ?
 			   AND (content IS ? OR (? = 1 AND content_length = ?))
 			 LIMIT 1`,
-			sessionID, messageOrdinal, callIndex,
+			sessionID, position.MessageOrdinal, position.CallIndex,
 			candidate.AgentID, candidate.Status, candidate.Content,
 			blocked, candidate.ContentLength,
 		).Scan(&exists)
@@ -3151,8 +3164,8 @@ func applyToolCallResultUpdateTx(
 		inserted = append(inserted, stored)
 		insertRows = append(insertRows, toolResultEventRow{
 			SessionID:      sessionID,
-			MessageOrdinal: messageOrdinal,
-			CallIndex:      callIndex,
+			MessageOrdinal: position.MessageOrdinal,
+			CallIndex:      position.CallIndex,
 			Event:          stored,
 		})
 	}
@@ -3164,13 +3177,13 @@ func applyToolCallResultUpdateTx(
 	}
 
 	summary, err := summarizeToolCallFromStateTx(
-		tx, sessionID, update.ToolUseID,
+		tx, sessionID, position,
 	)
 	if err != nil {
 		return false, nil, err
 	}
 	resultLength, err := summarizeToolCallLengthFromStateTx(
-		tx, sessionID, update.ToolUseID,
+		tx, sessionID, position,
 	)
 	if err != nil {
 		return false, nil, err
@@ -3182,8 +3195,8 @@ func applyToolCallResultUpdateTx(
 	if _, err := tx.Exec(
 		`UPDATE tool_calls
 		 SET result_content_length = ?, result_content = ?
-		 WHERE session_id = ? AND tool_use_id = ?`,
-		resultLength, storedSummary, sessionID, update.ToolUseID,
+		 WHERE id = ?`,
+		resultLength, storedSummary, toolCallID,
 	); err != nil {
 		return false, nil, fmt.Errorf(
 			"updating tool result summary for %s/%s: %w",

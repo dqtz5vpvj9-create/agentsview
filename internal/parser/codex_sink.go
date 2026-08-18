@@ -33,11 +33,11 @@ package parser
 //   - Finalize             — stable-sort by ordinal (ties keep emission
 //     order) and renumber 0..n-1
 type CodexSessionSink interface {
-	AppendMessage(m ParsedMessage)
+	AppendMessage(m ParsedMessage) int
 	ReserveOrdinal() int
 	InsertMessage(m ParsedMessage) int
-	AppendToolResultEvent(callID string, ev ParsedToolResultEvent)
-	SetCallSubagentSessionID(callID, sessionID string)
+	AppendToolResultEvent(callID string, target *ParsedToolCallPosition, ev ParsedToolResultEvent)
+	SetCallSubagentSessionID(callID string, target *ParsedToolCallPosition, sessionID string)
 	ApplyTokenUsageToLastAssistant(raw string) bool
 	InsertOrphanMessage(key string, m ParsedMessage) bool
 	Finalize()

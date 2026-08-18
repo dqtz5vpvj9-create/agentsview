@@ -1326,18 +1326,20 @@ CREATE TABLE IF NOT EXISTS artifact_imported_sessions (
     PRIMARY KEY (origin, gid)
 );
 
--- Machine-local per-call agent content state for incremental summary
--- recomputation: the latest raw content per agent in first-write order.
--- A late result update reads only this table (O(distinct agents)) instead
--- of rescanning the call's full event history. Never mirrored to
--- PostgreSQL or DuckDB.
-CREATE TABLE IF NOT EXISTS tool_call_agent_state (
+-- Machine-local per-call-occurrence agent content state for incremental
+-- summary recomputation: the latest raw content per agent in first-write
+-- order. Provider call IDs are not unique, so the natural stored coordinates
+-- (message ordinal, call index) are the authoritative key. A late result
+-- update reads only this table (O(distinct agents)) instead of rescanning the
+-- call's full event history. Never mirrored to PostgreSQL or DuckDB.
+CREATE TABLE IF NOT EXISTS tool_call_occurrence_agent_state (
     session_id         TEXT NOT NULL,
-    tool_use_id        TEXT NOT NULL,
+    message_ordinal    INTEGER NOT NULL,
+    call_index         INTEGER NOT NULL,
     agent_id           TEXT NOT NULL,
     first_event_index  INTEGER NOT NULL,
     latest_event_index INTEGER NOT NULL,
-    PRIMARY KEY (session_id, tool_use_id, agent_id)
+    PRIMARY KEY (session_id, message_ordinal, call_index, agent_id)
 );
 
 -- Machine-local parse checkpoints. SQLite-only, never mirrored to

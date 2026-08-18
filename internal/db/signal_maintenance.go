@@ -77,22 +77,20 @@ type SignalQuery interface {
 	// TrailingToolCalls returns the last n tool-call facts in
 	// (message ordinal, call index) order, oldest first.
 	TrailingToolCalls(ctx context.Context, n int) ([]ToolCallSignalFact, error)
-	// ToolCallsByUseID returns the facts of the named calls after the
-	// transaction's result updates, keyed by tool_use_id.
-	ToolCallsByUseID(
-		ctx context.Context, toolUseIDs []string,
+	// ToolCallsByPosition returns the facts of the exact call occurrences
+	// after the transaction's result updates.
+	ToolCallsByPosition(
+		ctx context.Context, positions []ToolCallPosition,
 	) ([]ToolCallSignalFact, error)
 	// CallResultEvents returns the stored result events of one call in
 	// event_index order, after the transaction's updates.
 	CallResultEvents(
 		ctx context.Context, messageOrdinal, callIndex int,
 	) ([]ToolResultEvent, error)
-	// InsertedResultEvents returns only the result events this
-	// transaction just inserted for the named call, with their assigned
-	// event indexes. Late-result maintenance must scan exactly these rows:
-	// previously stored events already carry findings, and rescanning the
-	// call's whole history makes repeated updates quadratic.
-	InsertedResultEvents(toolUseID string) []ToolResultEvent
+	// InsertedResultEvents returns only the result events this transaction
+	// just inserted for the exact call occurrence, with their assigned event
+	// indexes. Previously stored events already carry findings.
+	InsertedResultEvents(position ToolCallPosition) []ToolResultEvent
 	// MessageTokenUsageUpdated reports whether this transaction actually
 	// changed the token metadata of the named committed message. Identical
 	// replays must not fold the same token-drop compaction twice.
@@ -104,7 +102,7 @@ type SignalQuery interface {
 type signalTxQuery struct {
 	tx                          *sql.Tx
 	sessionID                   string
-	insertedResultEvents        map[string][]ToolResultEvent
+	insertedResultEvents        map[ToolCallPosition][]ToolResultEvent
 	updatedMessageUsageOrdinals map[int]struct{}
 }
 
@@ -269,18 +267,18 @@ func (q signalTxQuery) TrailingToolCalls(
 	return facts, rows.Err()
 }
 
-func (q signalTxQuery) ToolCallsByUseID(
-	ctx context.Context, toolUseIDs []string,
+func (q signalTxQuery) ToolCallsByPosition(
+	ctx context.Context, positions []ToolCallPosition,
 ) ([]ToolCallSignalFact, error) {
-	if len(toolUseIDs) == 0 {
+	if len(positions) == 0 {
 		return nil, nil
 	}
-	placeholders := make([]string, len(toolUseIDs))
-	args := make([]any, 0, len(toolUseIDs)+1)
+	clauses := make([]string, len(positions))
+	args := make([]any, 0, 1+2*len(positions))
 	args = append(args, q.sessionID)
-	for i, id := range toolUseIDs {
-		placeholders[i] = "?"
-		args = append(args, id)
+	for i, position := range positions {
+		clauses[i] = "(m.ordinal = ? AND COALESCE(tc.call_index, 0) = ?)"
+		args = append(args, position.MessageOrdinal, position.CallIndex)
 	}
 	rows, err := q.tx.QueryContext(ctx, `
 		SELECT m.ordinal, COALESCE(tc.call_index, 0),
@@ -297,8 +295,7 @@ func (q signalTxQuery) ToolCallsByUseID(
 		       ), '')
 		FROM tool_calls tc
 		JOIN messages m ON m.id = tc.message_id
-		WHERE tc.session_id = ? AND tc.tool_use_id IN (`+
-		strings.Join(placeholders, ",")+`)`,
+		WHERE tc.session_id = ? AND (`+strings.Join(clauses, " OR ")+")",
 		args...,
 	)
 	if err != nil {
@@ -361,11 +358,11 @@ func (q signalTxQuery) CallResultEvents(
 }
 
 // InsertedResultEvents returns the result events this transaction inserted
-// for one call, keyed by the call's tool_use_id.
+// for one exact call occurrence.
 func (q signalTxQuery) InsertedResultEvents(
-	toolUseID string,
+	position ToolCallPosition,
 ) []ToolResultEvent {
-	return q.insertedResultEvents[toolUseID]
+	return q.insertedResultEvents[position]
 }
 
 func (q signalTxQuery) MessageTokenUsageUpdated(ordinal int) bool {
