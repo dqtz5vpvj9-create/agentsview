@@ -30,6 +30,21 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
+      - name: Mark parser verification pending
+        uses: actions/github-script@v7
+        env:
+          STATUS_CONTEXT: pr1415-windows/parser-${{ matrix.os }}
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'pending',
+              context: process.env.STATUS_CONTEXT,
+              description: 'parser verification running',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            })
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.sha }}
@@ -101,11 +116,41 @@ jobs:
           set -euo pipefail
           export CGO_CFLAGS="-I$PWD/.sqlite-include"
           go vet -tags fts5 ./internal/parser
+      - name: Publish parser verification result
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          STATUS_CONTEXT: pr1415-windows/parser-${{ matrix.os }}
+          JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: process.env.JOB_STATUS === 'success' ? 'success' : 'failure',
+              context: process.env.STATUS_CONTEXT,
+              description: `parser verification ${process.env.JOB_STATUS}`,
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            })
 
   docs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - name: Mark docs verification pending
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'pending',
+              context: 'pr1415-windows/docs',
+              description: 'docs verification running',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            })
       - uses: actions/checkout@v5
         with:
           ref: ${{ env.BASE_SHA }}
@@ -121,6 +166,22 @@ jobs:
           git ls-remote --exit-code origin refs/heads/docs-assets
           git ls-remote --exit-code origin refs/heads/docs-generated-assets
           make docs-check
+      - name: Publish docs verification result
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: process.env.JOB_STATUS === 'success' ? 'success' : 'failure',
+              context: 'pr1415-windows/docs',
+              description: `docs verification ${process.env.JOB_STATUS}`,
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            })
 
   publish:
     name: Fast-forward PR branch
@@ -131,6 +192,19 @@ jobs:
       contents: write
       statuses: write
     steps:
+      - name: Mark publication pending
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'pending',
+              context: 'pr1415-windows/publish',
+              description: 'publication running',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            })
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.sha }}
@@ -164,3 +238,19 @@ jobs:
             -m "fix(codex): bind Windows checkpoints to open file handles" \
             -m "Capture file identity and NTFS change time from the exact descriptor being parsed, and make cross-platform cursor tests use the same path-versus-handle identity contract as production."
           git push origin HEAD:refs/heads/stack/5-codex-staged-imports
+      - name: Publish publication result
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: process.env.JOB_STATUS === 'success' ? 'success' : 'failure',
+              context: 'pr1415-windows/publish',
+              description: `publication ${process.env.JOB_STATUS}`,
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            })
