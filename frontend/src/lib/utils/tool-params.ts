@@ -3,6 +3,35 @@
 export interface MetaTag {
   label: string;
   value: string;
+  /** Short visual text for paths; value remains the canonical copy value. */
+  displayValue?: string;
+}
+
+export function isAbsolutePath(value: string): boolean {
+  return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\/.test(value);
+}
+
+export function pathDisplayValue(value: string): string {
+  if (!isAbsolutePath(value)) return truncate(value, 100);
+  if (value.length <= 80) return value;
+  const parts = value.split(/[\\/]+/).filter(Boolean);
+  const rootParts = value.startsWith("/")
+    ? 0
+    : /^[A-Za-z]:[\\/]/.test(value)
+      ? 1
+      : /^\\\\/.test(value)
+        ? 2
+        : 0;
+  if (parts.length <= rootParts + 2) return value;
+  return parts.slice(-2).join("/");
+}
+
+function pathMetaValue(value: unknown): Pick<MetaTag, "value" | "displayValue"> {
+  const canonical = String(value);
+  const displayValue = pathDisplayValue(canonical);
+  return displayValue === canonical
+    ? { value: canonical }
+    : { value: canonical, displayValue };
 }
 
 export function truncate(s: string, max: number): string {
@@ -32,7 +61,7 @@ export function extractToolParamMeta(
     if (filePath)
       meta.push({
         label: "file",
-        value: truncate(String(filePath), 80),
+        ...pathMetaValue(filePath),
       });
     if (params.offset != null)
       meta.push({
@@ -54,7 +83,7 @@ export function extractToolParamMeta(
     if (filePath)
       meta.push({
         label: "file",
-        value: truncate(String(filePath), 80),
+        ...pathMetaValue(filePath),
       });
     if (params.replace_all)
       meta.push({ label: "mode", value: "replace_all" });
@@ -63,7 +92,7 @@ export function extractToolParamMeta(
     if (filePath)
       meta.push({
         label: "file",
-        value: truncate(String(filePath), 80),
+        ...pathMetaValue(filePath),
       });
   } else if (cat === "Grep") {
     const pattern = params.pattern ?? params.query;
@@ -75,7 +104,7 @@ export function extractToolParamMeta(
     if (params.path)
       meta.push({
         label: "path",
-        value: truncate(String(params.path), 80),
+        ...pathMetaValue(params.path),
       });
     if (params.glob)
       meta.push({ label: "glob", value: String(params.glob) });
@@ -93,7 +122,7 @@ export function extractToolParamMeta(
     if (params.path)
       meta.push({
         label: "path",
-        value: truncate(String(params.path), 80),
+        ...pathMetaValue(params.path),
       });
   } else if (cat === "Bash") {
     if (params.description)

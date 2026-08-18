@@ -433,6 +433,49 @@ type AgentConfig struct {
 	AllowUnsafe bool   `json:"allow_unsafe,omitempty" toml:"allow_unsafe"`
 }
 
+// InsightsConfig controls an optional OpenAI-compatible chat-completions
+// endpoint for generated insights.
+type InsightsConfig struct {
+	Endpoint  string `json:"endpoint,omitempty" toml:"endpoint"`
+	Model     string `json:"model,omitempty" toml:"model"`
+	APIKeyEnv string `json:"api_key_env,omitempty" toml:"api_key_env"`
+	AllowHTTP bool   `json:"allow_http,omitempty" toml:"allow_http"`
+}
+
+// APIKey reads the configured key from the environment. The key itself is
+// intentionally never part of the serialized configuration.
+func (c InsightsConfig) APIKey() string {
+	if strings.TrimSpace(c.APIKeyEnv) == "" {
+		return ""
+	}
+	return os.Getenv(strings.TrimSpace(c.APIKeyEnv))
+}
+
+// Validate checks endpoint intent and transport safety.
+func (c InsightsConfig) Validate() error {
+	endpoint := strings.TrimSpace(c.Endpoint)
+	model := strings.TrimSpace(c.Model)
+	configured := endpoint != "" || model != "" ||
+		strings.TrimSpace(c.APIKeyEnv) != "" || c.AllowHTTP
+	if !configured {
+		return nil
+	}
+	if endpoint == "" || model == "" {
+		return fmt.Errorf("[insights] endpoint and model are required together")
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("[insights] endpoint %q must be an http(s) URL", RedactedEndpoint(endpoint))
+	}
+	if u.User != nil {
+		return fmt.Errorf("[insights] endpoint must not contain URL credentials: %q", RedactedEndpoint(endpoint))
+	}
+	if err := ValidateExtractTransport(u, c.AllowHTTP); err != nil {
+		return fmt.Errorf("[insights] %w", err)
+	}
+	return nil
+}
+
 type CustomModelRate struct {
 	InputMicrodollarsPerMTok         int64 `json:"input_microdollars_per_mtok" toml:"input_microdollars_per_mtok"`
 	OutputMicrodollarsPerMTok        int64 `json:"output_microdollars_per_mtok" toml:"output_microdollars_per_mtok"`
@@ -510,6 +553,7 @@ type Config struct {
 	PublicOrigins        []string               `json:"public_origins,omitempty" toml:"public_origins"`
 	Proxy                ProxyConfig            `json:"proxy,omitempty" toml:"proxy"`
 	WatchExcludePatterns []string               `json:"watch_exclude_patterns,omitempty" toml:"watch_exclude_patterns"`
+	DisabledAgents       []parser.AgentType     `json:"disabled_agents,omitempty" toml:"disabled_agents"`
 	CursorSecret         string                 `json:"cursor_secret" toml:"cursor_secret"`
 	CursorAdminAPIKey    string                 `json:"cursor_admin_api_key,omitempty" toml:"cursor_admin_api_key"`
 	CursorAdminEmail     string                 `json:"cursor_admin_email,omitempty" toml:"cursor_admin_email"`
@@ -528,6 +572,7 @@ type Config struct {
 	DuckDB               DuckDBConfig           `json:"duckdb,omitempty" toml:"duckdb"`
 	Vector               VectorConfig           `json:"vector,omitempty" toml:"vector"`
 	Recall               RecallConfig           `json:"recall,omitempty" toml:"recall"`
+	Insights             InsightsConfig         `json:"insights,omitempty" toml:"insights"`
 	Automated            AutomatedConfig        `json:"automated,omitempty" toml:"automated"`
 	Agent                map[string]AgentConfig `json:"agent,omitempty" toml:"agent"`
 	WriteTimeout         time.Duration          `json:"-" toml:"-"`
@@ -613,10 +658,61 @@ const (
 )
 
 // ResolveDirs returns the effective directories for an agent.
-func (c *Config) ResolveDirs(
-	agent parser.AgentType,
-) []string {
-	return c.AgentDirs[agent]
+func (c Config) AgentDisabled(agent parser.AgentType) bool {
+	return slices.Contains(c.DisabledAgents, agent)
+}
+
+func (c Config) ConfiguredDirs(agent parser.AgentType) []string {
+	return append([]string(nil), c.AgentDirs[agent]...)
+}
+
+func (c Config) ResolveDirs(agent parser.AgentType) []string {
+	return c.ConfiguredDirs(agent)
+}
+
+// LocalProviderFactories returns the provider set used for local filesystem
+// ingestion. Remote import and export deliberately use the full registry.
+func (c Config) LocalProviderFactories() []parser.ProviderFactory {
+	factories := parser.ProviderFactories()
+	return slices.DeleteFunc(factories, func(factory parser.ProviderFactory) bool {
+		return c.AgentDisabled(factory.Definition().Type)
+	})
+}
+
+func NormalizeDisabledAgents(
+	values []string,
+) ([]parser.AgentType, error) {
+	requested := make(map[parser.AgentType]struct{}, len(values))
+	for _, value := range values {
+		agent := parser.AgentType(strings.ToLower(strings.TrimSpace(value)))
+		found := false
+		for _, def := range parser.Registry {
+			if def.Type != agent {
+				continue
+			}
+			found = true
+			if !def.FileBased && def.EnvVar == "" {
+				return nil, fmt.Errorf(
+					`disabled_agents: %q is not a configurable session provider`,
+					agent,
+				)
+			}
+			requested[agent] = struct{}{}
+			break
+		}
+		if !found {
+			return nil, fmt.Errorf(
+				`disabled_agents: unknown session provider %q`, agent,
+			)
+		}
+	}
+	normalized := make([]parser.AgentType, 0, len(requested))
+	for _, def := range parser.Registry {
+		if _, ok := requested[def.Type]; ok {
+			normalized = append(normalized, def.Type)
+		}
+	}
+	return normalized, nil
 }
 
 // IsUserConfigured reports whether the agent's directories
@@ -872,22 +968,6 @@ func LoadPFlags(fs *pflag.FlagSet) (Config, error) {
 	return cfg, nil
 }
 
-// LoadPGServe builds a Config for `pg serve` by preserving
-// shared and PG settings from defaults/env/config file while
-// resetting serve-specific network/browser settings to defaults.
-// Only explicitly provided serve flags are applied on top.
-func LoadPGServe(fs *flag.FlagSet) (Config, error) {
-	cfg, err := loadPGServeBase()
-	if err != nil {
-		return cfg, err
-	}
-	applyFlags(&cfg, fs)
-	if err := finalize(&cfg); err != nil {
-		return cfg, err
-	}
-	return cfg, nil
-}
-
 // LoadPGServePFlags builds a PG serve config from a parsed Cobra/pflag FlagSet.
 func LoadPGServePFlags(fs *pflag.FlagSet) (Config, error) {
 	cfg, err := loadPGServeBase()
@@ -1109,6 +1189,7 @@ func (c *Config) applyConfigTOML(data string) error {
 		PublicOrigins                  []string                   `toml:"public_origins"`
 		Proxy                          ProxyConfig                `toml:"proxy"`
 		WatchExcludePatterns           []string                   `toml:"watch_exclude_patterns"`
+		DisabledAgents                 []string                   `toml:"disabled_agents"`
 		SyncIncludeCwdPrefixes         []string                   `toml:"sync_include_cwd_prefixes"`
 		ScanProtectedPaths             bool                       `toml:"scan_protected_paths"`
 		ResultContentBlockedCategories []string                   `toml:"result_content_blocked_categories"`
@@ -1122,6 +1203,7 @@ func (c *Config) applyConfigTOML(data string) error {
 		DuckDB                         DuckDBConfig               `toml:"duckdb"`
 		Vector                         VectorConfig               `toml:"vector"`
 		Recall                         RecallConfig               `toml:"recall"`
+		Insights                       InsightsConfig             `toml:"insights"`
 		Automated                      AutomatedConfig            `toml:"automated"`
 		Agent                          map[string]AgentConfig     `toml:"agent"`
 		EventsCoalesceInterval         time.Duration              `toml:"events_coalesce_interval"`
@@ -1189,6 +1271,13 @@ func (c *Config) applyConfigTOML(data string) error {
 	}
 	if file.WatchExcludePatterns != nil {
 		c.WatchExcludePatterns = file.WatchExcludePatterns
+	}
+	if meta.IsDefined("disabled_agents") {
+		disabled, err := NormalizeDisabledAgents(file.DisabledAgents)
+		if err != nil {
+			return err
+		}
+		c.DisabledAgents = disabled
 	}
 	if file.SyncIncludeCwdPrefixes != nil {
 		c.SyncIncludeCwdPrefixes = file.SyncIncludeCwdPrefixes
@@ -1316,6 +1405,12 @@ func (c *Config) applyConfigTOML(data string) error {
 		c.Vector.Embed.BackstopInterval = file.Vector.Embed.BackstopInterval
 	}
 	c.mergeRecallExtractTOML(file.Recall, meta)
+	if meta.IsDefined("insights") {
+		c.Insights = file.Insights
+		c.Insights.Endpoint = strings.TrimSpace(c.Insights.Endpoint)
+		c.Insights.Model = strings.TrimSpace(c.Insights.Model)
+		c.Insights.APIKeyEnv = strings.TrimSpace(c.Insights.APIKeyEnv)
+	}
 	// IsDefined distinguishes "unset" (leave default 10s) from an
 	// explicit "0s" (disable coalescing). Checking != 0 would silently
 	// ignore the latter.
@@ -1399,6 +1494,7 @@ func (c *Config) applyConfigTOML(data string) error {
 			continue
 		}
 		dirs := make([]string, 0, len(rawSlice))
+		valid := true
 		for _, v := range rawSlice {
 			s, ok := v.(string)
 			if !ok {
@@ -1406,12 +1502,12 @@ func (c *Config) applyConfigTOML(data string) error {
 					"config: %s: expected string array: element is %T",
 					def.ConfigKey, v,
 				)
-				dirs = nil
+				valid = false
 				break
 			}
 			dirs = append(dirs, s)
 		}
-		if len(dirs) > 0 {
+		if valid {
 			c.AgentDirs[def.Type] = dirs
 			c.agentDirSource[def.Type] = dirFile
 		}
@@ -1863,6 +1959,9 @@ func finalize(cfg *Config) error {
 		return err
 	}
 	if err := cfg.Recall.Extract.Validate(); err != nil {
+		return err
+	}
+	if err := cfg.Insights.Validate(); err != nil {
 		return err
 	}
 	return nil
@@ -2698,11 +2797,6 @@ func IsEnvDependentURL(s string) bool {
 // about, so each distinct variable triggers a warning at most once.
 var bareEnvWarned sync.Map
 
-// ResetBareEnvWarned clears the warning dedup state. Exported for tests.
-func ResetBareEnvWarned() {
-	bareEnvWarned.Range(func(k, _ any) bool { bareEnvWarned.Delete(k); return true })
-}
-
 // expandBracedEnv expands ${VAR} references in s. As a convenience,
 // if the entire string is a single bare $VAR (e.g. "$PGURL"), it is
 // expanded as a whole-string shortcut. Bare $VAR references embedded
@@ -2773,6 +2867,7 @@ func (c *Config) SaveTerminalConfig(tc TerminalConfig) error {
 // The patch map contains config keys mapped to their new values. Only
 // the keys present in patch are written; other config keys are preserved.
 func (c *Config) SaveSettings(patch map[string]any) error {
+	patch = maps.Clone(patch)
 	if value, ok := patch["chart_palette"]; ok {
 		palette, ok := value.(ChartPalette)
 		if !ok {
@@ -2781,6 +2876,23 @@ func (c *Config) SaveSettings(patch map[string]any) error {
 		if _, err := ParseChartPalette(string(palette)); err != nil {
 			return err
 		}
+	}
+	if value, ok := patch["disabled_agents"]; ok {
+		agents, ok := value.([]parser.AgentType)
+		if !ok {
+			return fmt.Errorf(
+				"disabled_agents must use typed session provider values",
+			)
+		}
+		raw := make([]string, len(agents))
+		for i, agent := range agents {
+			raw[i] = string(agent)
+		}
+		normalized, err := NormalizeDisabledAgents(raw)
+		if err != nil {
+			return err
+		}
+		patch["disabled_agents"] = normalized
 	}
 	return c.withConfigLock(func() error {
 		existing, err := c.readConfigMap()
@@ -2834,6 +2946,11 @@ func (c *Config) SaveSettings(patch map[string]any) error {
 		if v, ok := patch["chart_palette"]; ok {
 			if palette, ok := v.(ChartPalette); ok {
 				c.ChartPalette = palette
+			}
+		}
+		if v, ok := patch["disabled_agents"]; ok {
+			if agents, ok := v.([]parser.AgentType); ok {
+				c.DisabledAgents = append([]parser.AgentType(nil), agents...)
 			}
 		}
 		return nil

@@ -1,6 +1,9 @@
 package sync
 
-import gosync "sync"
+import (
+	gosync "sync"
+	"time"
+)
 
 // Phase describes the current sync phase.
 type Phase string
@@ -18,20 +21,27 @@ const (
 	PhaseDone             Phase = "done"
 )
 
+const defaultProgressStallAfter = 5 * time.Minute
+
 // Progress reports sync progress to listeners.
 type Progress struct {
-	Phase           Phase  `json:"phase"`
-	Detail          string `json:"detail,omitempty"`
-	Hint            string `json:"hint,omitempty"`
-	Resync          bool   `json:"resync,omitempty"`
-	CurrentProject  string `json:"current_project,omitempty"`
-	ProjectsTotal   int    `json:"projects_total"`
-	ProjectsDone    int    `json:"projects_done"`
-	SessionsTotal   int    `json:"sessions_total"`
-	SessionsDone    int    `json:"sessions_done"`
-	MessagesIndexed int    `json:"messages_indexed"`
-	BytesDone       int64  `json:"bytes_done,omitempty"`
-	BytesTotal      int64  `json:"bytes_total,omitempty"`
+	Phase             Phase     `json:"phase"`
+	Detail            string    `json:"detail,omitempty"`
+	Hint              string    `json:"hint,omitempty"`
+	Resync            bool      `json:"resync,omitempty"`
+	StartedAt         time.Time `json:"started_at,omitzero"`
+	UpdatedAt         time.Time `json:"updated_at,omitzero"`
+	Stalled           bool      `json:"stalled,omitempty"`
+	CurrentProject    string    `json:"current_project,omitempty"`
+	ProjectsTotal     int       `json:"projects_total"`
+	ProjectsDone      int       `json:"projects_done"`
+	SessionsTotal     int       `json:"sessions_total"`
+	SessionsDone      int       `json:"sessions_done"`
+	MessagesIndexed   int       `json:"messages_indexed"`
+	BytesDone         int64     `json:"bytes_done,omitempty"`
+	BytesTotal        int64     `json:"bytes_total,omitempty"`
+	FallbackProviders int       `json:"fallback_providers,omitempty"`
+	FallbackSources   int       `json:"fallback_sources,omitempty"`
 }
 
 // SyncResult describes the outcome of syncing a single session.
@@ -59,6 +69,10 @@ type SyncStats struct {
 	Warnings       []string            `json:"warnings,omitempty"`
 	Aborted        bool                `json:"aborted,omitempty"`
 	RebuildPhases  []RebuildPhaseStats `json:"rebuild_phases,omitempty"`
+	// Tombstoned counts committed session removals that are not ordinary sync
+	// writes. It remains meaningful on a partially failed or aborted pass: a
+	// later retry cannot rediscover an already-tombstoned row to notify clients.
+	Tombstoned int `json:"tombstoned,omitempty"`
 
 	// Anomalies aggregates per-run parser/sanitizer anomaly signals
 	// surfaced in the CLI sync summary. These are live per-run counters
@@ -67,12 +81,12 @@ type SyncStats struct {
 	Anomalies AnomalyStats `json:"anomalies,omitzero"`
 
 	filesOK int // unexported: file-level success counter
-	// sourceMissingTombstoned counts stored virtual members tombstoned
-	// during this run because their member source vanished from a
-	// still-existing shared container. Changed-path syncs use it to emit
-	// a sessions event even when nothing else was written.
-	sourceMissingTombstoned int
-	filesDiscovered         int // file-based total, excludes DB-backed agents
+	// sourceMissingArchiveMembers carries members discovered in the original
+	// archive while a full resync writes into its replacement. Orphan copy must
+	// materialize them before the rebuild can apply the same guarded tombstone
+	// transition used by an in-place sync.
+	sourceMissingArchiveMembers []sourceMissingMember
+	filesDiscovered             int // file-based total, excludes DB-backed agents
 	// nonContainerDiscovered counts discovered files that are not part of
 	// a self-preserving container store (OpenCode-format storage and its
 	// SQLite virtual paths). The resync empty-discovery guard uses it so a
@@ -102,7 +116,8 @@ type SyncStats struct {
 }
 
 func (s SyncStats) shouldEmitSync() bool {
-	return !s.Aborted && (s.Synced > 0 || s.ArchiveRebuilt)
+	return s.Tombstoned > 0 ||
+		(!s.Aborted && (s.Synced > 0 || s.ArchiveRebuilt))
 }
 
 // AnomalyStats aggregates parser-output anomaly signals observed during a

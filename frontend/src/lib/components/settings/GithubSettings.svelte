@@ -11,18 +11,20 @@
   let success: string | null = $state(null);
 
   async function handleSave() {
-    if (!tokenInput.trim()) return;
+    if (settings.saving || !tokenInput.trim()) return;
     saving = true;
     error = null;
     success = null;
     try {
-      configureGeneratedClient();
-      await ConfigService.postApiV1ConfigGithub({
-        requestBody: { token: tokenInput.trim() },
+      await settings.runMutation(async () => {
+        configureGeneratedClient();
+        await ConfigService.postApiV1ConfigGithub({
+          requestBody: { token: tokenInput.trim() },
+        });
+        tokenInput = "";
+        success = m.settings_github_token_saved();
+        await settings.load();
       });
-      tokenInput = "";
-      success = m.settings_github_token_saved();
-      await settings.load();
     } catch (e) {
       error = e instanceof Error ? e.message : m.settings_github_save_failed();
     } finally {
@@ -49,7 +51,7 @@
     />
     <button
       class="save-btn"
-      disabled={saving || !tokenInput.trim()}
+      disabled={saving || settings.saving || !tokenInput.trim()}
       onclick={handleSave}
     >
       {saving ? m.settings_github_saving() : m.settings_github_save_token()}

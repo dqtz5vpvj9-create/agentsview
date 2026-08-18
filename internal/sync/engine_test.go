@@ -1025,12 +1025,18 @@ func TestReconcileWatchRootsBaselinesParsedSourceOnce(t *testing.T) {
 
 type directStreamingProvider struct {
 	parser.ProviderBase
-	discoverCalls atomic.Int32
-	parseCalls    atomic.Int32
-	source        *parser.SourceRef
-	parseErr      error
-	parseOutcome  parser.ParseOutcome
-	fingerprint   parser.SourceFingerprint
+	discoverCalls    atomic.Int32
+	changedPathCalls atomic.Int32
+	parseCalls       atomic.Int32
+	discoverStarted  chan<- struct{}
+	discoverRelease  <-chan struct{}
+	parseStarted     chan<- struct{}
+	parseRelease     <-chan struct{}
+	parseForce       atomic.Bool
+	source           *parser.SourceRef
+	parseErr         error
+	parseOutcome     parser.ParseOutcome
+	fingerprint      parser.SourceFingerprint
 }
 
 func (provider *directStreamingProvider) Discover(context.Context) ([]parser.SourceRef, error) {
@@ -1043,6 +1049,19 @@ func (provider *directStreamingProvider) DiscoverEach(
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if provider.discoverStarted != nil {
+		select {
+		case provider.discoverStarted <- struct{}{}:
+		default:
+		}
+	}
+	if provider.discoverRelease != nil {
+		select {
+		case <-provider.discoverRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	if provider.source != nil {
 		return yield(*provider.source)
@@ -1057,6 +1076,7 @@ func (*directStreamingProvider) WatchPlan(context.Context) (parser.WatchPlan, er
 func (provider *directStreamingProvider) SourcesForChangedPath(
 	_ context.Context, req parser.ChangedPathRequest,
 ) ([]parser.SourceRef, error) {
+	provider.changedPathCalls.Add(1)
 	if provider.source != nil && provider.source.DisplayPath == req.Path {
 		return []parser.SourceRef{*provider.source}, nil
 	}
@@ -1070,9 +1090,23 @@ func (provider *directStreamingProvider) Fingerprint(
 }
 
 func (provider *directStreamingProvider) Parse(
-	context.Context, parser.ParseRequest,
+	ctx context.Context, req parser.ParseRequest,
 ) (parser.ParseOutcome, error) {
 	provider.parseCalls.Add(1)
+	if provider.parseStarted != nil {
+		select {
+		case provider.parseStarted <- struct{}{}:
+		default:
+		}
+	}
+	if provider.parseRelease != nil {
+		select {
+		case <-provider.parseRelease:
+		case <-ctx.Done():
+			return parser.ParseOutcome{}, ctx.Err()
+		}
+	}
+	provider.parseForce.Store(req.ForceParse)
 	return provider.parseOutcome, provider.parseErr
 }
 
@@ -1084,6 +1118,109 @@ func (factory directStreamingFactory) Definition() parser.AgentDef {
 
 func (factory directStreamingFactory) Capabilities() parser.Capabilities {
 	return factory.provider.Capabilities()
+}
+
+func TestSyncAllForceParseReparsesFreshStreamingProviderSource(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	path := filepath.Join(root, "session.db#session-1")
+	seedActiveBaselineSource(t, database, parser.AgentWarp, "session-1", path)
+	source := parser.SourceRef{
+		Provider: parser.AgentWarp, Key: path,
+		DisplayPath: path, FingerprintKey: path,
+	}
+	started := time.Unix(1704067200, 0)
+	provider := &directStreamingProvider{
+		ProviderBase: parser.ProviderBase{
+			Def: parser.AgentDef{Type: parser.AgentWarp, FileBased: false},
+			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+				StreamingDiscovery: parser.CapabilitySupported,
+			}},
+		},
+		source:      &source,
+		fingerprint: parser.SourceFingerprint{Key: path, MTimeNS: 1},
+		parseOutcome: parser.ParseOutcome{
+			Results: []parser.ParseResultOutcome{{
+				Result: parser.ParseResult{Session: parser.ParsedSession{
+					ID: "session-1", Agent: parser.AgentWarp,
+					Project: "project", Machine: "local",
+					StartedAt: started, EndedAt: started,
+					File: parser.FileInfo{Path: path, Mtime: 1},
+				}},
+				DataVersion: parser.DataVersionCurrent,
+			}},
+			ResultSetComplete: true,
+		},
+	}
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentWarp: {root}},
+		Machine:   "local",
+		ProviderFactories: []parser.ProviderFactory{
+			directStreamingFactory{provider: provider},
+		},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentWarp: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+
+	stats := engine.SyncAllForceParse(t.Context(), nil)
+
+	assert.Equal(t, int32(1), provider.parseCalls.Load())
+	assert.True(t, provider.parseForce.Load())
+	assert.Equal(t, 1, stats.Synced)
+}
+
+func TestForceFullParseBypassesPersistedProviderFreshness(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	path := filepath.Join(root, "session.db#session-1")
+	seedActiveBaselineSource(t, database, parser.AgentWarp, "session-1", path)
+	source := parser.SourceRef{
+		Provider: parser.AgentWarp, Key: path,
+		DisplayPath: path, FingerprintKey: path,
+	}
+	started := time.Unix(1704067200, 0)
+	provider := &directStreamingProvider{
+		ProviderBase: parser.ProviderBase{
+			Def: parser.AgentDef{Type: parser.AgentWarp, FileBased: false},
+		},
+		fingerprint: parser.SourceFingerprint{Key: path, MTimeNS: 1},
+		parseOutcome: parser.ParseOutcome{
+			Results: []parser.ParseResultOutcome{{
+				Result: parser.ParseResult{Session: parser.ParsedSession{
+					ID: "session-1", Agent: parser.AgentWarp,
+					Project: "project", Machine: "local",
+					StartedAt: started, EndedAt: started,
+					File: parser.FileInfo{Path: path, Mtime: 1},
+				}},
+				DataVersion: parser.DataVersionCurrent,
+			}},
+			ResultSetComplete: true,
+		},
+	}
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentWarp: {root}},
+		Machine:   "local",
+		ProviderFactories: []parser.ProviderFactory{
+			directStreamingFactory{provider: provider},
+		},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentWarp: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+	engine.forceFullParse = true
+
+	result := engine.processFile(t.Context(), parser.DiscoveredFile{
+		Path: path, Agent: parser.AgentWarp,
+		ProviderSource: &source, ProviderProcess: true,
+	})
+
+	require.NoError(t, result.err)
+	assert.Equal(t, int32(1), provider.parseCalls.Load())
+	assert.True(t, provider.parseForce.Load())
+	require.Len(t, result.results, 1)
 }
 
 func newChangedPathOutcomeEngine(
@@ -3399,6 +3536,7 @@ func TestReconciliationSourceBaselineUsesStoredPathRewrite(t *testing.T) {
 			Machine: "host",
 			Source:  db.SessionSourcePath{Agent: "claude", FilePath: storedPath},
 		}},
+		nil, nil,
 	))
 	changed, err := database.SoftDeleteSessionSourceOwnership(
 		t.Context(), "host", "claude", "session", storedPath,
@@ -9272,6 +9410,224 @@ func TestEngine_SyncAllDoesNotEmitOnEmptyRun(t *testing.T) {
 	assert.Empty(t, em.got(), "expected no emissions")
 }
 
+func TestEngine_ReconcileWatchRootsClearsCurrentProgress(t *testing.T) {
+	fx := newEngineFixture(t)
+	fx.writeClaudeSession(t, "proj", "s1.jsonl", "hello")
+
+	err := fx.engine.ReconcileWatchRoots(
+		t.Context(), []string{fx.claudeDir}, false,
+	)
+
+	require.NoError(t, err)
+	_, active := fx.engine.CurrentProgress()
+	assert.False(t, active,
+		"completed reconciliation must not leave the daemon reporting an active sync")
+}
+
+func requireStalledCurrentProgress(t *testing.T, engine *Engine) Progress {
+	t.Helper()
+	var progress Progress
+	require.Eventually(t, func() bool {
+		current, active := engine.CurrentProgress()
+		if !active || !current.Stalled {
+			return false
+		}
+		progress = current
+		return true
+	}, time.Second, time.Millisecond,
+		"active progress did not age into the stalled state")
+	return progress
+}
+
+func TestEngine_ReconcileWatchRootsReportsProgressBeforeDiscoveryReturns(t *testing.T) {
+	const agent parser.AgentType = "blocked-discovery"
+	root := t.TempDir()
+	started := make(chan struct{}, 1)
+	release := make(chan struct{}, 1)
+	defer func() {
+		select {
+		case release <- struct{}{}:
+		default:
+		}
+	}()
+	provider := &directStreamingProvider{
+		ProviderBase: parser.ProviderBase{
+			Def: parser.AgentDef{Type: agent, FileBased: true},
+			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+				DiscoverSources:    parser.CapabilitySupported,
+				StreamingDiscovery: parser.CapabilitySupported,
+				WatchSources:       parser.CapabilitySupported,
+			}},
+		},
+		discoverStarted: started,
+		discoverRelease: release,
+	}
+	engine := NewEngine(openTestDB(t), EngineConfig{
+		AgentDirs:          map[parser.AgentType][]string{agent: {root}},
+		Machine:            "local",
+		ProgressStallAfter: time.Nanosecond,
+		ProviderFactories: []parser.ProviderFactory{
+			directStreamingFactory{provider: provider},
+		},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			agent: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+	done := make(chan error, 1)
+	go func() {
+		done <- engine.ReconcileWatchRoots(t.Context(), []string{root}, false)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		require.FailNow(t, "reconciliation did not enter discovery")
+	}
+
+	progress := requireStalledCurrentProgress(t, engine)
+	assert.Equal(t, PhaseDiscovering, progress.Phase)
+
+	release <- struct{}{}
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		require.FailNow(t, "reconciliation did not finish after discovery resumed")
+	}
+}
+
+func TestEngine_SyncPathsReportsProgressBeforeChangedPathStatReturns(t *testing.T) {
+	fx := newEngineFixture(t)
+	path := fx.writeClaudeSession(t, "proj", "blocked-stat.jsonl", "hello")
+	fx.engine.progressStallAfter = time.Nanosecond
+	started := make(chan struct{}, 1)
+	release := make(chan struct{}, 1)
+	defer func() {
+		select {
+		case release <- struct{}{}:
+		default:
+		}
+	}()
+	realLstat := fx.engine.lstat
+	var calls atomic.Int32
+	fx.engine.lstat = func(got string) (os.FileInfo, error) {
+		if calls.Add(1) == 1 {
+			assert.Equal(t, path, got)
+			started <- struct{}{}
+			<-release
+		}
+		return realLstat(got)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- fx.engine.SyncPathsContext(t.Context(), []string{path})
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		require.FailNow(t, "changed-path sync did not enter source stat")
+	}
+
+	progress := requireStalledCurrentProgress(t, fx.engine)
+	assert.Equal(t, PhaseDiscovering, progress.Phase)
+
+	release <- struct{}{}
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		require.FailNow(t, "changed-path sync did not finish after stat resumed")
+	}
+	_, active := fx.engine.CurrentProgress()
+	assert.False(t, active)
+}
+
+func TestEngine_CoordinatedSyncClearsProgressBeforePostSyncWork(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*Engine, func() error) error
+	}{
+		{
+			name: "sync then run",
+			run: func(engine *Engine, work func() error) error {
+				_, err := engine.SyncThenRun(
+					t.Context(), false, nil, func(bool) error { return work() },
+				)
+				return err
+			},
+		},
+		{
+			name: "sync then run with rebuild",
+			run: func(engine *Engine, work func() error) error {
+				_, err := engine.SyncThenRunWithRebuild(
+					t.Context(), false, nil,
+					func() (RebuildOptions, RebuildCleanup, error) {
+						return RebuildOptions{}, nil, nil
+					},
+					nil,
+					func(bool, bool) error { return work() },
+				)
+				return err
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fx := newEngineFixture(t)
+			fx.writeClaudeSession(t, "proj", "post-sync.jsonl", "hello")
+			workCalled := false
+
+			err := tt.run(fx.engine, func() error {
+				workCalled = true
+				_, active := fx.engine.CurrentProgress()
+				assert.False(t, active,
+					"post-sync work must not inherit completed sync progress")
+				return nil
+			})
+
+			require.NoError(t, err)
+			assert.True(t, workCalled)
+		})
+	}
+}
+
+func TestEngine_TryRunExclusiveRejectsBusySyncWithoutRunningWork(t *testing.T) {
+	engine := NewEngine(openTestDB(t), EngineConfig{Machine: "local"})
+	t.Cleanup(engine.Close)
+	entered := make(chan struct{})
+	release := make(chan struct{}, 1)
+	defer func() {
+		select {
+		case release <- struct{}{}:
+		default:
+		}
+	}()
+	done := make(chan error, 1)
+	go func() {
+		done <- engine.RunExclusive(func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		require.FailNow(t, "first exclusive sync did not acquire the lock")
+	}
+
+	workRan := false
+	err := engine.TryRunExclusive(func() error {
+		workRan = true
+		return nil
+	})
+
+	require.ErrorIs(t, err, ErrSyncInProgress)
+	assert.False(t, workRan)
+	release <- struct{}{}
+	require.NoError(t, <-done)
+}
+
 func TestEngine_ZeroSyncedSuccessfulResyncEmits(t *testing.T) {
 	tests := []struct {
 		name string
@@ -9346,6 +9702,63 @@ func TestEngine_ZeroSyncedSuccessfulResyncEmits(t *testing.T) {
 	}
 }
 
+type recordingRebuildCommitter struct {
+	events    *[]string
+	commitErr error
+}
+
+func (c *recordingRebuildCommitter) Commit() error {
+	*c.events = append(*c.events, "commit")
+	return c.commitErr
+}
+
+func (c *recordingRebuildCommitter) Close() error {
+	*c.events = append(*c.events, "close")
+	return nil
+}
+
+func TestRebuildCommitRunsAfterSwapBeforePostRebuildWork(t *testing.T) {
+	fx := newEngineFixture(t)
+	var events []string
+	cleanup := &recordingRebuildCommitter{events: &events}
+
+	stats, err := fx.engine.SyncThenRunWithRebuild(
+		t.Context(), true, nil,
+		func() (RebuildOptions, RebuildCleanup, error) {
+			return RebuildOptions{}, cleanup, nil
+		},
+		func(SyncStats, error) { events = append(events, "done") },
+		func(bool, bool) error {
+			events = append(events, "work")
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	assert.False(t, stats.Aborted)
+	assert.Equal(t, []string{"commit", "done", "work", "close"}, events)
+}
+
+func TestRebuildCommitFailurePreventsPostRebuildWork(t *testing.T) {
+	fx := newEngineFixture(t)
+	var events []string
+	sentinel := errors.New("commit sentinel")
+	cleanup := &recordingRebuildCommitter{events: &events, commitErr: sentinel}
+
+	_, err := fx.engine.SyncThenRunWithRebuild(
+		t.Context(), true, nil,
+		func() (RebuildOptions, RebuildCleanup, error) {
+			return RebuildOptions{}, cleanup, nil
+		},
+		func(SyncStats, error) { events = append(events, "done") },
+		func(bool, bool) error {
+			events = append(events, "work")
+			return nil
+		},
+	)
+	require.ErrorIs(t, err, sentinel)
+	assert.Equal(t, []string{"commit", "done", "close"}, events)
+}
+
 func TestEngine_SyncPathsEmitsWhenSessionsChange(t *testing.T) {
 	fx := newEngineFixture(t)
 	em := &fakeEmitter{}
@@ -9388,6 +9801,49 @@ func TestEngine_SyncPathsEmitsAfterSyncMuReleased(t *testing.T) {
 
 	assert.True(t, acquired.Load(),
 		"syncMu was still held when SyncPaths emitted — defer-order regression")
+}
+
+func TestEngine_SyncAllForceParseRestoresModeBeforeQueuedSync(t *testing.T) {
+	fx := newEngineFixture(t)
+	firstEmitting := make(chan struct{})
+	releaseFirstEmitter := make(chan struct{})
+	var emitOnce gosync.Once
+	fx.engineWithEmitter(emitterFunc(func(string) {
+		emitOnce.Do(func() {
+			close(firstEmitting)
+			<-releaseFirstEmitter
+		})
+	}))
+	fx.writeClaudeSession(t, "proj", "s1.jsonl", "hello")
+
+	firstDone := make(chan SyncStats, 1)
+	go func() {
+		firstDone <- fx.engine.SyncAllForceParse(t.Context(), nil)
+	}()
+	<-firstEmitting
+
+	secondProgress := make(chan struct{})
+	releaseSecondSync := make(chan struct{})
+	var progressOnce gosync.Once
+	secondDone := make(chan SyncStats, 1)
+	go func() {
+		secondDone <- fx.engine.SyncAll(t.Context(), func(Progress) {
+			progressOnce.Do(func() {
+				close(secondProgress)
+				<-releaseSecondSync
+			})
+		})
+	}()
+	<-secondProgress
+
+	close(releaseFirstEmitter)
+	firstStats := <-firstDone
+	close(releaseSecondSync)
+	<-secondDone
+
+	require.Equal(t, 1, firstStats.Synced)
+	assert.False(t, fx.engine.forceFullParse,
+		"an overlapping ordinary sync must not restore temporary full-parse mode")
 }
 
 func TestEngine_SyncPathsDoesNotEmitOnNoMatches(t *testing.T) {

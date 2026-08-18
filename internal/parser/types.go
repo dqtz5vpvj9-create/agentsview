@@ -77,6 +77,8 @@ const (
 	AgentFreebuff       AgentType = "freebuff"
 )
 
+const AgentDeepSeekHarness AgentType = "deepseek-harness"
+
 // AgentDef describes a supported coding agent's filesystem
 // layout, configuration keys, and session ID conventions.
 type AgentDef struct {
@@ -500,6 +502,16 @@ var Registry = []AgentDef{
 		},
 		IDPrefix:  "deepseek-tui:",
 		FileBased: true,
+	},
+	{
+		Type:              AgentDeepSeekHarness,
+		DisplayName:       "DeepSeek Harness",
+		EnvVar:            "DEEPSEEK_HARNESS_SESSIONS_DIR",
+		DefaultRootEnvVar: "DSH_HOME",
+		ConfigKey:         "deepseek_harness_sessions_dirs",
+		DefaultDirs:       []string{".dsh/sessions"},
+		IDPrefix:          "deepseek-harness:",
+		FileBased:         true,
 	},
 	{
 		Type:        AgentOpenClaw,
@@ -949,17 +961,6 @@ var Registry = []AgentDef{
 			NoPerMessageTokenData: true,
 		},
 	},
-}
-
-// NonFileBackedAgents returns agent types where FileBased is false.
-func NonFileBackedAgents() []AgentType {
-	var agents []AgentType
-	for _, def := range Registry {
-		if !def.FileBased {
-			agents = append(agents, def.Type)
-		}
-	}
-	return agents
 }
 
 // AgentByType returns the AgentDef for the given type.

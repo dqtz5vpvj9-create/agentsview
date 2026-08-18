@@ -22,6 +22,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/insight"
+	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/postgres"
 	"go.kenn.io/agentsview/internal/pricingrefresh"
 	"go.kenn.io/agentsview/internal/recall/extract"
@@ -47,7 +48,10 @@ type VersionInfo struct {
 // Bump it when a client-visible contract cannot be decoded safely by an older
 // CLI or daemon.
 const (
-	APIVersion = 6
+	APIVersion = 7
+	// ScopedWatchPushAPIVersion is the first daemon API that accepts bounded
+	// watcher batches and their authoritative recovery scope on push requests.
+	ScopedWatchPushAPIVersion = 7
 	// SubagentUsageAPIVersion is the first daemon API that guarantees
 	// combined session-usage scope and targeted descendant synchronization.
 	SubagentUsageAPIVersion = 6
@@ -62,19 +66,22 @@ const (
 
 // Server is the HTTP server that serves the SPA and REST API.
 type Server struct {
-	mu              gosync.RWMutex
-	cfg             config.Config
-	db              db.Store
-	engine          *sync.Engine
-	onDemandEngine  *sync.Engine
-	sessions        service.SessionService
-	broadcaster     *Broadcaster
-	mux             *http.ServeMux
-	api             huma.API
-	httpSrv         *http.Server
-	startupProbeKey []byte
-	version         VersionInfo
-	dataDir         string
+	mu                    gosync.RWMutex
+	cfg                   config.Config
+	activeDisabledAgents  []parser.AgentType
+	db                    db.Store
+	activityReports       *activityReportCache
+	activityReportFlights *activityReportBuildGroup
+	engine                *sync.Engine
+	onDemandEngine        *sync.Engine
+	sessions              service.SessionService
+	broadcaster           *Broadcaster
+	mux                   *http.ServeMux
+	api                   huma.API
+	httpSrv               *http.Server
+	startupProbeKey       []byte
+	version               VersionInfo
+	dataDir               string
 
 	httpRemoteCleanupRegistry *remotesync.CleanupRegistry
 
@@ -160,6 +167,28 @@ type Server struct {
 	ensurePricing func(context.Context, *db.DB) error
 }
 
+type insightGenerationOptionsContextKey struct{}
+
+func (s *Server) currentInsightGenerateOptions(
+	ctx context.Context,
+) insight.GenerateOptions {
+	if options, ok := ctx.Value(insightGenerationOptionsContextKey{}).(insight.GenerateOptions); ok {
+		return options
+	}
+	s.mu.RLock()
+	cfg := s.cfg
+	s.mu.RUnlock()
+	return insightGenerateOptions(cfg)
+}
+
+func (s *Server) defaultInsightGenerateStream(
+	ctx context.Context, agent, prompt string, onLog insight.LogFunc,
+) (insight.Result, error) {
+	return insight.GenerateStreamWithOptions(
+		ctx, agent, prompt, onLog, s.currentInsightGenerateOptions(ctx),
+	)
+}
+
 // New creates a new Server.
 func New(
 	cfg config.Config, database db.Store, engine *sync.Engine,
@@ -184,7 +213,10 @@ func New(
 
 	s := &Server{
 		cfg:                       cfg,
+		activeDisabledAgents:      append([]parser.AgentType(nil), cfg.DisabledAgents...),
 		db:                        database,
+		activityReports:           newActivityReportCache(),
+		activityReportFlights:     newActivityReportBuildGroup(),
 		engine:                    engine,
 		sessions:                  sessions,
 		mux:                       http.NewServeMux(),
@@ -192,20 +224,10 @@ func New(
 		insightLogDrainTimeout:    defaultInsightLogDrainTimeout,
 		insightLogStopWaitTimeout: defaultInsightLogStopWaitTimeout,
 		ensurePricing:             pricingrefresh.EnsureCurrent,
-		generateStreamFunc: func(
-			ctx context.Context, agent, prompt string,
-			onLog insight.LogFunc,
-		) (insight.Result, error) {
-			return insight.GenerateStreamWithOptions(
-				ctx, agent, prompt, onLog,
-				insight.GenerateOptions{
-					Agents: insightAgentConfig(cfg.Agent),
-				},
-			)
-		},
-		spaFS:      dist,
-		spaHandler: http.FileServerFS(dist),
+		spaFS:                     dist,
+		spaHandler:                http.FileServerFS(dist),
 	}
+	s.generateStreamFunc = s.defaultInsightGenerateStream
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -217,6 +239,34 @@ func New(
 	}
 	s.routes()
 	return s
+}
+
+func insightGenerateOptions(cfg config.Config) insight.GenerateOptions {
+	opts := insight.GenerateOptions{Agents: insightAgentConfig(cfg.Agent)}
+	if strings.TrimSpace(cfg.Insights.Endpoint) != "" &&
+		strings.TrimSpace(cfg.Insights.Model) != "" {
+		opts.Endpoint = &insight.EndpointConfig{
+			Endpoint:  cfg.Insights.Endpoint,
+			Model:     cfg.Insights.Model,
+			APIKey:    cfg.Insights.APIKey(),
+			AllowHTTP: cfg.Insights.AllowHTTP,
+		}
+	}
+	return opts
+}
+
+// ingestionConfig returns the daemon-start configuration for local filesystem
+// provider selection. Settings updates are persisted and reflected by GET
+// immediately, but the running local engine, watchers, and polling keep one
+// provider set until restart. Remote import and export ignore DisabledAgents.
+func (s *Server) ingestionConfig() config.Config {
+	s.mu.RLock()
+	cfg := s.cfg
+	s.mu.RUnlock()
+	cfg.DisabledAgents = append(
+		[]parser.AgentType(nil), s.activeDisabledAgents...,
+	)
+	return cfg
 }
 
 // Option configures a Server.
@@ -1097,6 +1147,15 @@ func (s *Server) Serve(ln net.Listener) error {
 	s.mu.Lock()
 	s.httpSrv = srv
 	s.mu.Unlock()
+	if cache := s.activityReports; cache != nil {
+		cacheCtx := context.Background()
+		if s.baseCtx != nil {
+			cacheCtx = s.baseCtx
+		}
+		cacheCtx, stopCache := context.WithCancel(cacheCtx)
+		go cache.Run(cacheCtx)
+		defer stopCache()
+	}
 	log.Printf("Starting server at http://%s", addr)
 	return srv.Serve(ln)
 }

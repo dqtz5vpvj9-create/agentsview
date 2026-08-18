@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
+import { dismissFlash } from "@kenn-io/kit-ui";
 // @ts-ignore
 import SettingsPage from "./SettingsPage.svelte";
 import { SettingsService } from "../../api/generated/index";
@@ -26,12 +27,14 @@ vi.mock("../../api/generated/index", async (importOriginal) => {
     ...orig,
     SettingsService: {
       getApiV1Settings: vi.fn(),
+      putApiV1Settings: vi.fn(),
     },
   };
 });
 
 const settingsService = SettingsService as unknown as {
   getApiV1Settings: ReturnType<typeof vi.fn>;
+  putApiV1Settings: ReturnType<typeof vi.fn>;
 };
 
 beforeEach(() => {
@@ -42,10 +45,14 @@ beforeEach(() => {
   settings.loaded = false;
   settings.needsAuth = false;
   settings.error = null;
+  settings.saveError = null;
   settings.readOnly = false;
+  settings.saving = false;
+  dismissFlash();
 });
 
 afterEach(() => {
+  dismissFlash();
   document.body.innerHTML = "";
 });
 
@@ -81,21 +88,15 @@ describe("SettingsPage", () => {
     await tick();
 
     expect(document.body.textContent).toContain("Date ranges");
-    expect(document.body.textContent).toContain(
-      "Link date ranges across pages",
-    );
+    expect(document.body.textContent).toContain("Link date ranges across pages");
     // The mapping manager moved to Data; Settings keeps only a pointer.
     expect(document.body.textContent).toContain("Worktree mappings");
-    expect(document.body.textContent).toContain(
-      "Project classification rules have moved to Data.",
-    );
-    expect(document.body.textContent).not.toContain(
-      "available in local mode only",
-    );
+    expect(document.body.textContent).toContain("Project classification rules have moved to Data.");
+    expect(document.body.textContent).not.toContain("available in local mode only");
 
-    const pointer = Array.from(
-      document.body.querySelectorAll("button"),
-    ).find((b) => b.textContent?.includes("Open Data › Rules"));
+    const pointer = Array.from(document.body.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Open Data › Rules"),
+    );
     expect(pointer).toBeTruthy();
     pointer!.click();
     await tick();
@@ -134,9 +135,9 @@ describe("SettingsPage", () => {
     trigger!.click();
     await tick();
 
-    const option = Array.from(
-      document.body.querySelectorAll('[role="option"]'),
-    ).find((el) => el.textContent?.includes("简体中文"));
+    const option = Array.from(document.body.querySelectorAll('[role="option"]')).find((el) =>
+      el.textContent?.includes("简体中文"),
+    );
     expect(option).toBeTruthy();
 
     (option as HTMLElement).dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
@@ -173,6 +174,8 @@ describe("SettingsPage", () => {
     expect(nav!.textContent).toContain("Preferences");
     expect(nav!.textContent).toContain("Data");
     expect(nav!.textContent).toContain("Connections");
+    expect(nav!.textContent).toContain("Session Providers");
+    expect(nav!.textContent).not.toContain("Agent Directories");
 
     const visiblePanel = () =>
       document.body.querySelector<HTMLElement>(".settings-panel:not([hidden])");
@@ -237,9 +240,7 @@ describe("SettingsPage", () => {
 
     expect(document.body.textContent).toContain("No matching settings");
     expect(
-      document.body.querySelector(".settings-page")?.classList.contains(
-        "settings-no-results",
-      ),
+      document.body.querySelector(".settings-page")?.classList.contains("settings-no-results"),
     ).toBe(true);
 
     settings.loading = true;
@@ -249,9 +250,7 @@ describe("SettingsPage", () => {
     await tick();
 
     expect(
-      document.body.querySelector(".settings-page")?.classList.contains(
-        "settings-no-results",
-      ),
+      document.body.querySelector(".settings-page")?.classList.contains("settings-no-results"),
     ).toBe(true);
     expect(document.body.querySelector(".kit-settings__panel")).not.toBeNull();
 
@@ -265,13 +264,9 @@ describe("SettingsPage", () => {
 
     expect(restoredNav.querySelectorAll("button")).toHaveLength(9);
     expect(
-      document.body.querySelector(".settings-page")?.classList.contains(
-        "settings-no-results",
-      ),
+      document.body.querySelector(".settings-page")?.classList.contains("settings-no-results"),
     ).toBe(false);
-    expect(restoredNav.querySelector('[aria-current="true"]')?.textContent).toContain(
-      "Terminal",
-    );
+    expect(restoredNav.querySelector('[aria-current="true"]')?.textContent).toContain("Terminal");
 
     unmount(component);
   });
@@ -320,9 +315,7 @@ describe("SettingsPage", () => {
     await tick();
     expect(document.body.textContent).toContain("No matching settings");
     expect(
-      document.body.querySelector(".settings-page")?.classList.contains(
-        "settings-no-results",
-      ),
+      document.body.querySelector(".settings-page")?.classList.contains("settings-no-results"),
     ).toBe(true);
     expect(document.body.querySelector("#terminal-bin")).toBe(binary);
 
@@ -381,9 +374,7 @@ describe("SettingsPage", () => {
 
     expect(nav.querySelectorAll("button")).toHaveLength(1);
     expect(nav.textContent).toContain("语义嵌入");
-    expect(document.body.querySelector('[role="status"]')?.textContent).toContain(
-      "显示：语义嵌入",
-    );
+    expect(document.body.querySelector('[role="status"]')?.textContent).toContain("显示：语义嵌入");
 
     unmount(component);
   });
@@ -418,5 +409,40 @@ describe("SettingsPage", () => {
     expect(nav.textContent).toContain("Langue");
 
     unmount(component);
+  });
+
+  it("shows a danger flash when a settings save fails", async () => {
+    settingsService.getApiV1Settings.mockResolvedValue({
+      agent_dirs: {},
+      chart_palette: "agentsview",
+      github_configured: false,
+      host: "127.0.0.1",
+      port: 8080,
+      read_only: false,
+      require_auth: false,
+      terminal: { mode: "auto" },
+    });
+    settingsService.putApiV1Settings.mockRejectedValue(
+      new Error("settings endpoint unavailable"),
+    );
+    const component = mount(SettingsPage, { target: document.body });
+    await tick();
+    await tick();
+
+    const matplotlib = Array.from(
+      document.body.querySelectorAll<HTMLElement>('[role="radio"]'),
+    ).find((control) => control.textContent?.includes("Matplotlib"));
+    expect(matplotlib).toBeTruthy();
+    matplotlib!.click();
+
+    await vi.waitFor(() => {
+      const flash = document.body.querySelector<HTMLElement>(
+        '.kit-flash-banner[data-kit-tone="danger"]',
+      );
+      expect(flash).not.toBeNull();
+      expect(flash?.textContent).toContain("settings endpoint unavailable");
+    });
+
+    await unmount(component);
   });
 });

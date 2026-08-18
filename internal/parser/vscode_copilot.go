@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -675,6 +676,8 @@ type jsonlOp struct {
 	I    *int              `json:"i,omitempty"`
 }
 
+const vscodeCopilotHardRecordLimit = 128 << 20
+
 // reconstructJSONL reads a VSCode JSONL operation log and
 // replays mutations to reconstruct the full session JSON.
 //
@@ -684,25 +687,49 @@ type jsonlOp struct {
 //   - kind=2 (Push): append/splice items into array at path k
 //   - kind=3 (Delete): remove property at path k
 func reconstructJSONL(path string) ([]byte, error) {
+	return reconstructJSONLWithLimit(path, vscodeCopilotHardRecordLimit)
+}
+
+func reconstructJSONLWithLimit(path string, hardRecordLimit int) ([]byte, error) {
+	if hardRecordLimit <= 0 {
+		return nil, fmt.Errorf("VS Code Copilot hard replay limit must be positive")
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
+	reader := bufio.NewReaderSize(f, 64*1024)
 
 	var state any
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-
+	for {
+		record := newVSCodeCopilotRecordReader(reader, hardRecordLimit)
 		var op jsonlOp
-		if err := json.Unmarshal(line, &op); err != nil {
+		decoder := json.NewDecoder(record)
+		decodeErr := decoder.Decode(&op)
+		if !record.sawLine && decodeErr == io.EOF {
+			break
+		}
+		if decodeErr == nil {
+			var trailing json.RawMessage
+			if err := decoder.Decode(&trailing); err != io.EOF {
+				if err == nil {
+					decodeErr = fmt.Errorf("trailing JSON value")
+				} else {
+					decodeErr = fmt.Errorf("trailing JSON: %w", err)
+				}
+			}
+		}
+		if record.err != nil {
+			return nil, fmt.Errorf("read %s: %w", path, record.err)
+		}
+		if drainErr := record.drain(); drainErr != nil {
+			return nil, fmt.Errorf("read %s: %w", path, drainErr)
+		}
+		if decodeErr != nil {
 			continue
 		}
 
@@ -713,15 +740,29 @@ func reconstructJSONL(path string) ([]byte, error) {
 					"jsonl initial: %w", err,
 				)
 			}
+			projectVSCodeCopilotResultOutput(state)
 
 		case 1: // Set
 			if state == nil || len(op.K) == 0 {
 				continue
 			}
 			keys := decodeJSONLKeys(op.K)
+			destination := classifyVSCodeCopilotDestination(keys)
+			switch destination {
+			case vscodeCopilotDestinationExactOutput, vscodeCopilotDestinationBelowOutput:
+				if destination == vscodeCopilotDestinationExactOutput {
+					jsonlSet(state, keys, []any{})
+				}
+				continue
+			}
 			var val any
 			if err := json.Unmarshal(op.V, &val); err != nil {
 				continue
+			}
+			if destination == vscodeCopilotDestinationExactResultDetails {
+				projectVSCodeCopilotResultDetails(val)
+			} else {
+				projectVSCodeCopilotResultOutput(val)
 			}
 			jsonlSet(state, keys, val)
 
@@ -730,9 +771,19 @@ func reconstructJSONL(path string) ([]byte, error) {
 				continue
 			}
 			keys := decodeJSONLKeys(op.K)
+			if destination := classifyVSCodeCopilotDestination(keys); destination == vscodeCopilotDestinationExactOutput || destination == vscodeCopilotDestinationBelowOutput {
+				continue
+			}
 			var items []any
 			if err := json.Unmarshal(op.V, &items); err != nil {
 				continue
+			}
+			if classifyVSCodeCopilotDestination(keys) == vscodeCopilotDestinationExactResultDetails {
+				for _, item := range items {
+					projectVSCodeCopilotResultDetails(item)
+				}
+			} else {
+				projectVSCodeCopilotResultOutput(items)
 			}
 			jsonlPush(state, keys, items, op.I)
 
@@ -745,15 +796,151 @@ func reconstructJSONL(path string) ([]byte, error) {
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan %s: %w", path, err)
-	}
-
 	if state == nil {
 		return nil, nil
 	}
 
 	return json.Marshal(state)
+}
+
+type vscodeCopilotRecordReader struct {
+	source  *bufio.Reader
+	limit   int
+	chunk   []byte
+	prefix  bool
+	read    int
+	sawLine bool
+	done    bool
+	err     error
+}
+
+func newVSCodeCopilotRecordReader(
+	source *bufio.Reader,
+	limit int,
+) *vscodeCopilotRecordReader {
+	return &vscodeCopilotRecordReader{source: source, limit: limit}
+}
+
+func (r *vscodeCopilotRecordReader) Read(p []byte) (int, error) {
+	for len(r.chunk) == 0 {
+		if r.done {
+			if r.err != nil {
+				return 0, r.err
+			}
+			return 0, io.EOF
+		}
+
+		chunk, prefix, err := r.source.ReadLine()
+		if err != nil {
+			r.done = true
+			if err == io.EOF {
+				return 0, io.EOF
+			}
+			r.err = err
+			return 0, err
+		}
+		r.sawLine = true
+		if r.read+len(chunk) > r.limit {
+			r.done = true
+			r.err = fmt.Errorf(
+				"VS Code Copilot JSONL record exceeds %d-byte safety ceiling",
+				r.limit,
+			)
+			return 0, r.err
+		}
+		r.read += len(chunk)
+		r.chunk = chunk
+		r.prefix = prefix
+		if len(chunk) == 0 && !prefix {
+			r.done = true
+			return 0, io.EOF
+		}
+	}
+
+	n := copy(p, r.chunk)
+	r.chunk = r.chunk[n:]
+	if len(r.chunk) == 0 && !r.prefix {
+		r.done = true
+	}
+	return n, nil
+}
+
+func (r *vscodeCopilotRecordReader) drain() error {
+	if r.done {
+		return r.err
+	}
+	_, err := io.Copy(io.Discard, r)
+	return err
+}
+
+type vscodeCopilotDestination int
+
+const (
+	vscodeCopilotDestinationOutside vscodeCopilotDestination = iota
+	vscodeCopilotDestinationExactResultDetails
+	vscodeCopilotDestinationExactOutput
+	vscodeCopilotDestinationBelowOutput
+)
+
+func classifyVSCodeCopilotDestination(keys []string) vscodeCopilotDestination {
+	for i := range len(keys) {
+		if keys[i] != "resultDetails" {
+			continue
+		}
+		valid := true
+		for j := i + 1; j < len(keys); j++ {
+			if keys[j] == "output" {
+				if j == len(keys)-1 {
+					return vscodeCopilotDestinationExactOutput
+				}
+				return vscodeCopilotDestinationBelowOutput
+			}
+			if _, err := strconv.Atoi(keys[j]); err != nil {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			return vscodeCopilotDestinationExactResultDetails
+		}
+	}
+	return vscodeCopilotDestinationOutside
+}
+
+func projectVSCodeCopilotResultOutput(value any) {
+	switch v := value.(type) {
+	case map[string]any:
+		for key, child := range v {
+			if key == "resultDetails" {
+				projectVSCodeCopilotResultDetails(child)
+				continue
+			}
+			projectVSCodeCopilotResultOutput(child)
+		}
+	case []any:
+		for _, child := range v {
+			projectVSCodeCopilotResultOutput(child)
+		}
+	}
+}
+
+func projectVSCodeCopilotResultDetails(value any) {
+	switch details := value.(type) {
+	case map[string]any:
+		if details == nil {
+			return
+		}
+		details["output"] = []any{}
+		for key, child := range details {
+			if key != "output" {
+				projectVSCodeCopilotResultOutput(child)
+			}
+		}
+	case []any:
+		for _, child := range details {
+			projectVSCodeCopilotResultDetails(child)
+		}
+	}
 }
 
 // decodeJSONLKeys converts raw JSON key elements to strings.

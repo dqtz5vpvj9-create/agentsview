@@ -582,10 +582,16 @@ func TestSyncSemanticsUnchangedResultPolicies(t *testing.T) {
 		file, []parser.ParseResult{result},
 		parser.UnchangedResultMTimeAndHash,
 	)
+	engine.forceFullParse = true
+	forced := engine.dropUnchangedSharedSQLiteResults(
+		file, []parser.ParseResult{result}, parser.UnchangedResultMTime,
+	)
 
 	assert.Empty(t, mtimeOnly)
 	require.Len(t, mtimeAndHash, 1)
 	assert.Equal(t, "semantic:member", mtimeAndHash[0].Session.ID)
+	require.Len(t, forced, 1)
+	assert.Equal(t, "semantic:member", forced[0].Session.ID)
 }
 
 func TestOmnigentDependentSourceExpansionPreservesEngineIDPrefixing(

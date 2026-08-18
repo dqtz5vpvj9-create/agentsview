@@ -19,12 +19,26 @@ var ErrUnifiedRebuildAborted = errors.New(
 // RebuildContributor adds another configured sync source to an atomic full
 // rebuild. Contributors run sequentially against the same temporary database.
 type RebuildContributor struct {
-	Name      string
-	Config    EngineConfig
+	Name   string
+	Config EngineConfig
+
+	// ForceParse bypasses freshness gates for every contributor source. Remote
+	// explicit-full imports use this to preserve their parsing contract while
+	// participating in a unified replacement-database rebuild.
+	ForceParse bool
+	// ForceFullParseAfterCache preserves full-source parsing for work not
+	// reached by an interrupted remote attempt while allowing its durable
+	// failure-cache entries to suppress sources that were already attempted.
+	ForceFullParseAfterCache bool
+
 	Progress  func(Progress) Progress
 	Started   func()
 	Finished  func(SyncStats, error)
 	AfterSync func(*Engine, *db.DB) error
+	// AfterFailure runs before an incomplete contributor's replacement
+	// database is discarded. The database argument is the active archive, so
+	// callers can preserve retry state produced by the failed attempt.
+	AfterFailure func(*Engine, *db.DB) error
 }
 
 // RebuildOptions configures optional sources for an atomic full rebuild.
@@ -119,6 +133,7 @@ func mergeSyncStats(dst *SyncStats, src SyncStats) {
 	dst.Skipped += src.Skipped
 	dst.Failed += src.Failed
 	dst.OrphanedCopied += src.OrphanedCopied
+	dst.Tombstoned += src.Tombstoned
 	dst.Warnings = append(dst.Warnings, src.Warnings...)
 	dst.Aborted = dst.Aborted || src.Aborted
 	dst.RebuildPhases = append(dst.RebuildPhases, src.RebuildPhases...)
@@ -129,6 +144,9 @@ func mergeSyncStats(dst *SyncStats, src SyncStats) {
 	dst.messagesIndexed += src.messagesIndexed
 	dst.parserExcludedFiles += src.parserExcludedFiles
 	dst.parserExcludedIDs = append(dst.parserExcludedIDs, src.parserExcludedIDs...)
+	dst.sourceMissingArchiveMembers = append(
+		dst.sourceMissingArchiveMembers, src.sourceMissingArchiveMembers...,
+	)
 	dst.cwdFilteredSessions += src.cwdFilteredSessions
 	dst.cwdFilteredFiles += src.cwdFilteredFiles
 }

@@ -443,6 +443,100 @@ func (db *DB) UpsertSessionSignalState(st SessionSignalState) error {
 	}
 	return tx.Commit()
 }
+
+// UpsertSessionSignalStateIfRevision stores compact signal state only while
+// the session still has the transcript revision represented by st.State.
+// The boolean is false when the snapshot became stale before publication.
+func (db *DB) UpsertSessionSignalStateIfRevision(
+	st SessionSignalState,
+) (bool, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tx, err := db.getWriter().Begin()
+	if err != nil {
+		return false, fmt.Errorf("beginning conditional signal state tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	matches, err := sessionTranscriptRevisionMatchesTx(
+		tx, st.SessionID, st.TranscriptRevision,
+	)
+	if err != nil || !matches {
+		return false, err
+	}
+	if err := upsertSessionSignalStateTx(tx, st); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf(
+			"committing conditional signal state %s: %w", st.SessionID, err,
+		)
+	}
+	return true, nil
+}
+
+// ReplaceSessionSignalsIfRevision atomically publishes findings, aggregate
+// columns, and compact incremental state for one coherent transcript snapshot.
+// It returns false without modifying any rows when a concurrent writer has
+// advanced the session beyond expectedRevision.
+func (db *DB) ReplaceSessionSignalsIfRevision(
+	sessionID, expectedRevision string,
+	findings []SecretFinding,
+	update SessionSignalUpdate,
+	state SessionSignalState,
+) (bool, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tx, err := db.getWriter().Begin()
+	if err != nil {
+		return false, fmt.Errorf("beginning conditional signal recompute tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	matches, err := sessionTranscriptRevisionMatchesTx(
+		tx, sessionID, expectedRevision,
+	)
+	if err != nil || !matches {
+		return false, err
+	}
+	if err := replaceSecretFindingsTx(
+		tx, sessionID, findings, update.SecretLeakCount,
+		update.SecretsRulesVersion,
+	); err != nil {
+		return false, err
+	}
+	if err := updateSessionSignalsTx(tx, sessionID, update); err != nil {
+		return false, err
+	}
+	state.SessionID = sessionID
+	state.TranscriptRevision = expectedRevision
+	if err := upsertSessionSignalStateTx(tx, state); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf(
+			"committing conditional signal recompute %s: %w", sessionID, err,
+		)
+	}
+	return true, nil
+}
+
+func sessionTranscriptRevisionMatchesTx(
+	tx *sql.Tx, sessionID, expectedRevision string,
+) (bool, error) {
+	var current string
+	err := tx.QueryRow(
+		`SELECT transcript_revision FROM sessions WHERE id = ?`, sessionID,
+	).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf(
+			"loading transcript revision %s: %w", sessionID, err,
+		)
+	}
+	return current == expectedRevision, nil
+}
+
 func applySignalDeltaTx(
 	tx *sql.Tx, sessionID string, d SignalDelta,
 ) error {

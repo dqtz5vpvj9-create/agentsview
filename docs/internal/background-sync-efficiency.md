@@ -26,6 +26,19 @@ lives primarily in `internal/sync/watcher.go`,
 - Shutdown discards pending paths and waits only for an already-running
   callback. Normal discovery on the next startup recovers discarded changes.
 
+## HTTP mirror journal contract
+
+Persistent HTTP mirrors use the same 8,192-entry and 2 MiB path-byte limits for
+their crash-recovery journal. Crossing either limit collapses the path set to a
+full-import marker instead of retaining unbounded path data. Unlike an in-memory
+watch batch, the marker is durable and remains until database processing and
+remote skip-cache persistence complete.
+
+For a proven changed source, classification, fingerprinting, parsing, and
+database writes are independent of unrelated mirror cardinality. An unproven
+path may widen work only to its owning provider's configured roots. Full archive
+transfer caused by the half-manifest heuristic does not widen this import scope.
+
 ## Codex append cursor contract
 
 The Codex provider factory owns one in-memory cursor cache shared by its

@@ -252,12 +252,14 @@ rebuilds FTS once, and atomically swaps the completed archive into place. SSH
 hosts run through their existing active-archive path only after that swap.
 
 `--full` reparses every discovered local and remote session, but it does not
-force unchanged HTTP mirror files to be transferred again. Manifest-capable
-spokes still send only changed files; older HTTP-capable spokes fall back to
-their existing full-archive endpoint. An HTTP preparation or contributor
-failure aborts the combined rebuild without replacing the active archive or
-running SSH. Ordinary incremental and post-swap SSH failures retain per-host
-reporting, and the command exits non-zero if any host failed. See
+force unchanged manifest-capable files to transfer again. Directory-scoped and
+verbatim curated content still use delta transfer. Windsurf's sanitized curated
+export remains a separate full-archive transfer on every sync. HTTP collectors
+and spokes must use the same remote-sync protocol version; incompatible peers
+fail before exchanging targets or archive data. An HTTP preparation or
+contributor failure aborts the combined rebuild without replacing the active
+archive or running SSH. Ordinary incremental and post-swap SSH failures retain
+per-host reporting, and the command exits non-zero if any host failed. See
 [Incremental Sync](/remote-access/#incremental-sync).
 
 `agentsview sync --host X` syncs one host, not the whole configured list. When
@@ -277,12 +279,21 @@ the list, since remote sessions are namespaced by host.
 
 During HTTP remote sync, the collector prints durable phase lines for resolving
 remote roots, fetching and comparing the manifest, transferring and extracting
-changed files, processing each contributor, rebuilding FTS, and swapping the
-database. Archive downloads also show live compressed-byte progress when the
-remote daemon provides a `Content-Length` header. The new phases and bulk-ingest
-path come from the collector; a spoke upgrade is needed only for manifest-delta
-transfer. If an upgraded binary does not show those phases, restart the local
-collector daemon.
+changed files, planning pending paths, processing affected sources, rebuilding
+FTS, and swapping the database. Pending paths can outnumber processed sources:
+deletions participate in recovery and cache invalidation but usually do not
+produce an import source. Provider fallback is identified explicitly, and its
+discovered sources determine the processing denominator.
+
+The final per-host line reports changed sessions, ordinary unchanged skips, and
+error-suppressed pending entries. A retained-journal line means recovery work
+will be replayed; cancellation, processing failure, cache-persistence failure,
+retirement failure, and a rebuild awaiting its database swap remain distinct.
+Individual source paths are omitted from normal output. Archive downloads also
+show live compressed-byte progress when the remote daemon provides a
+`Content-Length` header. These phases come from the collector; a spoke upgrade
+is needed only for manifest-delta transfer. If an upgraded binary does not show
+them, restart the local collector daemon.
 
 ______________________________________________________________________
 
@@ -1244,6 +1255,8 @@ agentsview help
 | `CORTEX_DIR`                      | `~/.snowflake/cortex/conversations`                  | Cortex Code conversations directory                                                                 |
 | `CURSOR_PROJECTS_DIR`             | `~/.cursor/projects`                                 | Cursor transcripts directory                                                                        |
 | `DEEPSEEK_TUI_SESSIONS_DIR`       | `~/.codewhale/sessions` and `~/.deepseek/sessions`   | DeepSeek TUI sessions directory                                                                     |
+| `DEEPSEEK_HARNESS_SESSIONS_DIR`   | `~/.dsh/sessions`                                    | DeepSeek Harness sessions directory                                                                 |
+| `DSH_HOME`                        | unset                                                | DeepSeek Harness home that re-roots the default `sessions/` discovery path                          |
 | `FORGE_DIR`                       | `~/.forge`                                           | Forge directory (contains `.forge.db`)                                                              |
 | `GEMINI_DIR`                      | `~/.gemini`                                          | Gemini CLI directory                                                                                |
 | `GOOSE_PATH_ROOT`                 | (platform-specific)                                  | Goose path root; sessions are read from `<root>/data/sessions/sessions.db`                          |
@@ -1270,7 +1283,7 @@ agentsview help
 | `POSIT_ASSISTANT_DIR`             | `~/.posit/assistant/workspaces`                      | Posit Assistant workspaces directory                                                                |
 | `POSITRON_DIR`                    | (platform-specific)                                  | Positron Assistant user directory                                                                   |
 | `QCLAW_DIR`                       | `~/.qclaw/agents`                                    | QClaw agents directory                                                                              |
-| `QODER_PROJECTS_DIR`              | `~/.qoder/projects` and `~/.qoderwork/projects`      | Qoder projects directory                                                                            |
+| `QODER_PROJECTS_DIR`              | Legacy and platform-specific roots                   | Qoder projects directory; see [Session Discovery](/configuration/#session-discovery)                 |
 | `QWEN_PROJECTS_DIR`               | `~/.qwen/projects`                                   | Qwen Code projects directory                                                                        |
 | `QWENPAW_DIR`                     | `~/.copaw/workspaces`                                | QwenPaw workspaces directory                                                                        |
 | `REASONIX_DIR`                    | `~/.reasonix` and `~/AppData/Roaming/reasonix`       | Reasonix data directory                                                                             |

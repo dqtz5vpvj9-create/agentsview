@@ -59,9 +59,13 @@ type DiscoveredFile struct {
 	SourceMtime int64     // source object mtime for s3:// sources, UnixNano
 	// SourceFingerprint is a durable object fingerprint for s3:// sources.
 	SourceFingerprint string
-	ForceParse        bool       // caller requires a full source reparse
-	ProviderSource    *SourceRef // provider-owned source identity, when known
-	ProviderProcess   bool       // true when this caller may parse via ProviderSource
+	ForceParse        bool // caller requires freshness bypass
+	// ForceFullParse also disables append-only processing so a materialized
+	// replacement cannot be mistaken for bytes appended to the stored source.
+	// A durable skip-cache entry may suppress it after a previous attempt.
+	ForceFullParse  bool
+	ProviderSource  *SourceRef // provider-owned source identity, when known
+	ProviderProcess bool       // true when this caller may parse via ProviderSource
 }
 
 // OpenCodeSourceMode identifies the usable OpenCode storage

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"time"
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
@@ -11,17 +13,68 @@ import (
 )
 
 type SyncStats struct {
-	SessionsSynced int `json:"sessions_synced"`
-	SessionsTotal  int `json:"sessions_total"`
-	Skipped        int `json:"skipped"`
-	Failed         int `json:"failed"`
+	SessionsSynced       int              `json:"sessions_synced"`
+	SessionsTotal        int              `json:"sessions_total"`
+	Skipped              int              `json:"skipped"`
+	Failed               int              `json:"failed"`
+	PendingNew           int              `json:"pending_new,omitempty"`
+	PendingRearmed       int              `json:"pending_rearmed,omitempty"`
+	PendingReplayed      int              `json:"pending_replayed,omitempty"`
+	PendingPaths         int              `json:"pending_paths,omitempty"`
+	ArmedPaths           int              `json:"armed_paths,omitempty"`
+	ExactSources         int              `json:"exact_sources,omitempty"`
+	FallbackProviders    int              `json:"fallback_providers,omitempty"`
+	FallbackSources      int              `json:"fallback_sources,omitempty"`
+	FilesDiscovered      int              `json:"files_discovered,omitempty"`
+	FilesProcessed       int              `json:"files_processed,omitempty"`
+	PruneExactScopes     int              `json:"prune_exact_scopes,omitempty"`
+	PruneProviderScopes  int              `json:"prune_provider_scopes,omitempty"`
+	PruneHostWideScope   bool             `json:"prune_host_wide_scope,omitempty"`
+	PrunedExact          int              `json:"pruned_exact,omitempty"`
+	PrunedProvider       int              `json:"pruned_provider,omitempty"`
+	PrunedHostWide       int              `json:"pruned_host_wide,omitempty"`
+	ErrorSuppressed      int              `json:"error_suppressed,omitempty"`
+	FullReason           FullImportReason `json:"full_reason,omitempty"`
+	JournalOutcome       JournalOutcome   `json:"journal_outcome,omitempty"`
+	PlanningDuration     time.Duration    `json:"planning_duration,omitempty"`
+	PruningDuration      time.Duration    `json:"pruning_duration,omitempty"`
+	ProcessingDuration   time.Duration    `json:"processing_duration,omitempty"`
+	CachePersistDuration time.Duration    `json:"cache_persist_duration,omitempty"`
+	RetirementDuration   time.Duration    `json:"retirement_duration,omitempty"`
 }
 
 type TargetSet struct {
-	Dirs           map[parser.AgentType][]string `json:"dirs"`
-	Files          map[parser.AgentType][]string `json:"files,omitempty"`
-	ExtraFiles     []string                      `json:"extra_files,omitempty"`
-	ForbiddenRoots []string                      `json:"forbidden_roots,omitempty"`
+	Dirs               map[parser.AgentType][]string `json:"dirs"`
+	Files              map[parser.AgentType][]string `json:"files,omitempty"`
+	ExtraFiles         []string                      `json:"extra_files,omitempty"`
+	ProviderExtraFiles map[parser.AgentType][]string `json:"provider_extra_files,omitempty"`
+	ForbiddenRoots     []string                      `json:"forbidden_roots,omitempty"`
+}
+
+// AllExtraFiles returns shared and provider-owned curated files without
+// duplicates. Provider keys are sorted so archive and manifest inputs remain
+// deterministic despite map iteration order.
+func (t TargetSet) AllExtraFiles() []string {
+	files := append([]string(nil), t.ExtraFiles...)
+	seen := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		seen[file] = struct{}{}
+	}
+	agents := make([]string, 0, len(t.ProviderExtraFiles))
+	for agent := range t.ProviderExtraFiles {
+		agents = append(agents, string(agent))
+	}
+	sort.Strings(agents)
+	for _, name := range agents {
+		for _, file := range t.ProviderExtraFiles[parser.AgentType(name)] {
+			if _, exists := seen[file]; exists {
+				continue
+			}
+			seen[file] = struct{}{}
+			files = append(files, file)
+		}
+	}
+	return files
 }
 
 // HasFileScopedAgents reports whether any agent exports a curated
@@ -55,7 +108,8 @@ func (t TargetSet) HasSanitizedFileScopedAgents() bool {
 
 // IsEmpty reports whether the set names no sync targets at all.
 func (t TargetSet) IsEmpty() bool {
-	return len(t.Dirs) == 0 && len(t.Files) == 0 && len(t.ExtraFiles) == 0
+	return len(t.Dirs) == 0 && len(t.Files) == 0 && len(t.ExtraFiles) == 0 &&
+		len(t.ProviderExtraFiles) == 0
 }
 
 // SplitFileScoped partitions the set into the targets the
@@ -92,6 +146,17 @@ func (t TargetSet) SplitFileScoped() (dirScoped, fileScoped TargetSet) {
 		target.Files[agent] = files
 	}
 	dirScoped.ExtraFiles = t.ExtraFiles
+	for agent, files := range t.ProviderExtraFiles {
+		target := &dirScoped
+		if _, fileScopedAgent := t.Files[agent]; fileScopedAgent &&
+			!verbatimFileScopedAgent(agent) {
+			target = &fileScoped
+		}
+		if target.ProviderExtraFiles == nil {
+			target.ProviderExtraFiles = make(map[parser.AgentType][]string)
+		}
+		target.ProviderExtraFiles[agent] = files
+	}
 	return dirScoped, fileScoped
 }
 
@@ -105,7 +170,7 @@ func (t TargetSet) SplitFileScoped() (dirScoped, fileScoped TargetSet) {
 // retaining the TargetSet's agent ownership information.
 func (t TargetSet) DeltaAllowedRoots() []string {
 	forbidden := newForbiddenRootMatcher(t.ForbiddenRoots)
-	roots := make([]string, 0, len(t.Dirs)+len(t.Files)+len(t.ExtraFiles))
+	roots := make([]string, 0, len(t.Dirs)+len(t.Files)+len(t.AllExtraFiles()))
 	for agent, dirs := range t.Dirs {
 		if parser.RemoteSyncExcludedAgent(agent) {
 			continue
@@ -131,7 +196,7 @@ func (t TargetSet) DeltaAllowedRoots() []string {
 			}
 		}
 	}
-	for _, file := range t.ExtraFiles {
+	for _, file := range t.AllExtraFiles() {
 		if !forbidden.within(file) {
 			roots = append(roots, file)
 		}
@@ -160,6 +225,9 @@ func (r ArchiveRequest) MarshalJSON() ([]byte, error) {
 	if len(r.ExtraFiles) > 0 {
 		out["extra_files"] = r.ExtraFiles
 	}
+	if len(r.ProviderExtraFiles) > 0 {
+		out["provider_extra_files"] = r.ProviderExtraFiles
+	}
 	if len(r.ForbiddenRoots) > 0 {
 		out["forbidden_roots"] = r.ForbiddenRoots
 	}
@@ -171,19 +239,21 @@ func (r ArchiveRequest) MarshalJSON() ([]byte, error) {
 
 func (r *ArchiveRequest) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		Dirs           map[parser.AgentType][]string `json:"dirs"`
-		Files          json.RawMessage               `json:"files"`
-		ExtraFiles     []string                      `json:"extra_files"`
-		ForbiddenRoots []string                      `json:"forbidden_roots"`
-		DeltaFiles     []string                      `json:"delta_files"`
+		Dirs               map[parser.AgentType][]string `json:"dirs"`
+		Files              json.RawMessage               `json:"files"`
+		ExtraFiles         []string                      `json:"extra_files"`
+		ProviderExtraFiles map[parser.AgentType][]string `json:"provider_extra_files"`
+		ForbiddenRoots     []string                      `json:"forbidden_roots"`
+		DeltaFiles         []string                      `json:"delta_files"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
 	r.TargetSet = TargetSet{
-		Dirs:           raw.Dirs,
-		ExtraFiles:     raw.ExtraFiles,
-		ForbiddenRoots: raw.ForbiddenRoots,
+		Dirs:               raw.Dirs,
+		ExtraFiles:         raw.ExtraFiles,
+		ProviderExtraFiles: raw.ProviderExtraFiles,
+		ForbiddenRoots:     raw.ForbiddenRoots,
 	}
 	r.DeltaFiles = raw.DeltaFiles
 	if len(raw.Files) == 0 {
@@ -207,9 +277,16 @@ func (r *ArchiveRequest) UnmarshalJSON(data []byte) error {
 }
 
 type Importer struct {
-	Host                    string
-	Full                    bool
-	DB                      *db.DB
-	BlockedResultCategories []string
-	Progress                syncpkg.ProgressFunc
+	Host                      string
+	Full                      bool
+	ForceFullParseAfterCache  bool
+	RequireComplete           bool
+	DB                        *db.DB
+	BlockedResultCategories   []string
+	Progress                  syncpkg.ProgressFunc
+	Targets                   TargetSet
+	Root                      string
+	replaceRemoteSkippedFiles func(string, map[string]int64) error
+	applyRemoteSkippedChanges func(string, []string, map[string]int64) error
+	saveSkipCache             func(*db.DB, *syncpkg.Engine, remotePathMap) error
 }

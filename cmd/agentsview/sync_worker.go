@@ -202,7 +202,7 @@ func runSyncWorkerStartup(
 		engine.SetCheckpointAudit(true)
 		if auditRoots := reconcileRootPaths(cfg); len(auditRoots) > 0 {
 			stats, tombstoned, auditErr = engine.ReconcileWatchRootsWithStats(
-				ctx, auditRoots, false,
+				ctx, auditRoots, false, onProgress,
 			)
 		}
 		engine.SetCheckpointAudit(false)
@@ -285,6 +285,7 @@ func resyncBuildResultFromStats(
 		Synced:            stats.Synced,
 		Skipped:           stats.Skipped,
 		Failed:            stats.Failed,
+		Tombstoned:        stats.Tombstoned,
 		DiscoveryComplete: stats.AuthoritativeDiscoveryComplete(),
 		Stats:             &statsCopy,
 	}
@@ -332,6 +333,7 @@ func workerResultFromStats(
 		Synced:            stats.Synced,
 		Skipped:           stats.Skipped,
 		Failed:            stats.Failed,
+		Tombstoned:        stats.Tombstoned,
 		DiscoveryComplete: stats.AuthoritativeDiscoveryComplete(),
 		Stats:             &statsCopy,
 	}
@@ -367,6 +369,7 @@ func workerEngineConfig(cfg config.Config) sync.EngineConfig {
 	return sync.EngineConfig{
 		AgentDirs:               cfg.AgentDirs,
 		SourceMachines:          cfg.SourceMachines,
+		DisabledAgents:          cfg.DisabledAgents,
 		IncludeCwdPrefixes:      cfg.SyncIncludeCwdPrefixes,
 		ScanProtectedPaths:      cfg.ScanProtectedPaths,
 		Machine:                 cfg.LocalMachineName,

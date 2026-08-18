@@ -174,7 +174,7 @@ func (e *Engine) verifiedProviderSourceState(
 	source parser.SourceRef,
 	file parser.DiscoveredFile,
 ) (verifiedSourceCapture, int64, bool, bool) {
-	if e.forceParse || file.ForceParse || e.pathRewriter != nil ||
+	if e.forceParseRequested(file) || e.pathRewriter != nil ||
 		provider.Capabilities().Source.VerifiedLocalStat !=
 			parser.CapabilitySupported {
 		return verifiedSourceCapture{}, 0, false, false

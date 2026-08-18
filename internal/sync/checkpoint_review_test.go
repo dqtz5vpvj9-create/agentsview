@@ -357,7 +357,7 @@ func TestCodexCheckpointAuditRepairsSameStatRewrite(t *testing.T) {
 
 	engine.SetCheckpointAudit(true)
 	stats, tombstoned, err := engine.ReconcileWatchRootsWithStats(
-		context.Background(), []string{root}, false,
+		context.Background(), []string{root}, false, nil,
 	)
 	require.NoError(t, err)
 	require.Zero(t, tombstoned)

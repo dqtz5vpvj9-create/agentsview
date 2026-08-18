@@ -475,8 +475,9 @@ var runLocalSyncWithFallbackCLI = runLocalSyncWithFallback
 var coordinateLocalSyncRunner = coordinateLocalSync
 
 type preparedHTTPRebuildLeaseCLI struct {
-	prepared preparedHTTPRebuildCLI
-	release  func()
+	prepared  preparedHTTPRebuildCLI
+	release   func()
+	committed bool
 }
 
 func (l *preparedHTTPRebuildLeaseCLI) Close() error {
@@ -488,6 +489,21 @@ func (l *preparedHTTPRebuildLeaseCLI) Close() error {
 		l.release = nil
 	}
 	return l.prepared.Close()
+}
+
+func (l *preparedHTTPRebuildLeaseCLI) Commit() error {
+	if l == nil || l.prepared == nil || l.committed {
+		return nil
+	}
+	committer, ok := l.prepared.(sync.RebuildCommitter)
+	if !ok {
+		return nil
+	}
+	if err := committer.Commit(); err != nil {
+		return err
+	}
+	l.committed = true
+	return nil
 }
 
 var runSSHRemoteSync = func(
@@ -522,11 +538,16 @@ var runHTTPRemoteSync = func(
 			rh.Host,
 		)
 	}
+	fullReason := remotesync.FullImportReason("")
+	if full {
+		fullReason = remotesync.FullImportExplicit
+	}
 	return remotesync.HTTPSync{
 		Host:                    rh.Host,
 		URL:                     rh.URL,
 		Token:                   token,
 		Full:                    full,
+		FullReason:              fullReason,
 		DataDir:                 appCfg.DataDir,
 		DB:                      database,
 		BlockedResultCategories: appCfg.ResultContentBlockedCategories,
@@ -612,6 +633,10 @@ func runConfiguredLocalAndRemotes(
 ) (didResync bool, failures []remoteHostFailure, retErr error) {
 	httpHosts, sshHosts := partitionConfiguredRemoteHosts(hosts)
 	didResync = full || database.NeedsResync()
+	fullReason := remotesync.FullImportDataRebuild
+	if full {
+		fullReason = remotesync.FullImportExplicit
+	}
 	outerOwnsHTTP := didResync && len(httpHosts) > 0
 
 	run := func() (remotesync.SyncStats, error) {
@@ -638,7 +663,7 @@ func runConfiguredLocalAndRemotes(
 			ctx, appCfg, database, full, progress,
 			func() (sync.RebuildOptions, sync.RebuildCleanup, error) {
 				prepared, err := prepareConfiguredHTTPHosts(
-					ctx, appCfg, database, httpHosts, progress,
+					ctx, appCfg, database, httpHosts, fullReason, progress,
 				)
 				if err != nil {
 					return sync.RebuildOptions{}, prepared, err
@@ -719,6 +744,7 @@ func prepareConfiguredHTTPHosts(
 	appCfg config.Config,
 	database *db.DB,
 	hosts []config.RemoteHost,
+	fullReason remotesync.FullImportReason,
 	progress sync.ProgressFunc,
 ) (preparedHTTPRebuildCLI, error) {
 	if len(hosts) == 0 {
@@ -738,6 +764,7 @@ func prepareConfiguredHTTPHosts(
 			URL:                     host.URL,
 			Token:                   host.Token,
 			Full:                    true,
+			FullReason:              fullReason,
 			DataDir:                 appCfg.DataDir,
 			DB:                      database,
 			BlockedResultCategories: appCfg.ResultContentBlockedCategories,
@@ -934,6 +961,7 @@ func coordinateLocalSync(
 	engine := sync.NewEngine(database, sync.EngineConfig{
 		AgentDirs:               appCfg.AgentDirs,
 		SourceMachines:          appCfg.SourceMachines,
+		DisabledAgents:          appCfg.DisabledAgents,
 		IncludeCwdPrefixes:      appCfg.SyncIncludeCwdPrefixes,
 		ScanProtectedPaths:      appCfg.ScanProtectedPaths,
 		Machine:                 appCfg.LocalMachineName,

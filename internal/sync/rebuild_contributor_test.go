@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,16 +22,20 @@ import (
 func TestMergeSyncStatsIncludesAdditiveRebuildFields(t *testing.T) {
 	dst := SyncStats{
 		OrphanedCopied: 2,
+		Tombstoned:     1,
 		RebuildPhases:  []RebuildPhaseStats{{Contributor: "local", BatchedWrites: 1}},
 	}
 	src := SyncStats{
 		OrphanedCopied: 3,
+		Tombstoned:     2,
 		RebuildPhases:  []RebuildPhaseStats{{Contributor: "remote", BatchedWrites: 2}},
 	}
 
 	mergeSyncStats(&dst, src)
 
 	assert.Equal(t, 5, dst.OrphanedCopied)
+	assert.Equal(t, 3, dst.Tombstoned,
+		"contributor and watch-batch tombstones must survive aggregation")
 	assert.Equal(t, []RebuildPhaseStats{
 		{Contributor: "local", BatchedWrites: 1},
 		{Contributor: "remote", BatchedWrites: 2},
@@ -702,8 +707,9 @@ func TestResyncLocalCancellationPreventsContributors(t *testing.T) {
 
 type staticUsageRebuildProvider struct {
 	parser.ProviderBase
-	source parser.SourceRef
-	result parser.ParseResult
+	source             parser.SourceRef
+	result             parser.ParseResult
+	forceParseRequests []bool
 }
 
 func (p *staticUsageRebuildProvider) Discover(context.Context) ([]parser.SourceRef, error) {
@@ -717,12 +723,47 @@ func (p *staticUsageRebuildProvider) Fingerprint(
 }
 
 func (p *staticUsageRebuildProvider) Parse(
-	context.Context, parser.ParseRequest,
+	_ context.Context, request parser.ParseRequest,
 ) (parser.ParseOutcome, error) {
+	p.forceParseRequests = append(p.forceParseRequests, request.ForceParse)
 	return parser.ParseOutcome{
 		Results:           []parser.ParseResultOutcome{{Result: p.result}},
 		ResultSetComplete: true,
 	}, nil
+}
+
+func TestResyncContributorForceParseReachesProvider(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "archive.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	engine := NewEngine(database, EngineConfig{})
+	t.Cleanup(engine.Close)
+	provider := newStaticUsageRebuildProvider(
+		"forced-contributor", "forced-contributor.jsonl", 1, 1,
+	)
+
+	stats, err := engine.ResyncAllWithOptions(
+		context.Background(), nil, RebuildOptions{Contributors: []RebuildContributor{{
+			Name:       "forced",
+			ForceParse: true,
+			Config: EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{
+					parser.AgentCowork: {"forced-root"},
+				},
+				Machine: "forced", Ephemeral: true,
+				ProviderFactories: []parser.ProviderFactory{
+					staticUsageRebuildFactory{provider: provider},
+				},
+				ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+					parser.AgentCowork: parser.ProviderMigrationProviderAuthoritative,
+				},
+			},
+		}}},
+	)
+
+	require.NoError(t, err)
+	require.False(t, stats.Aborted, "rebuild aborted: %+v", stats)
+	assert.Equal(t, []bool{true}, provider.forceParseRequests)
 }
 
 type staticUsageRebuildFactory struct{ provider *staticUsageRebuildProvider }
@@ -912,4 +953,114 @@ func TestResyncContributorParserFailuresAbortAndCleanTempDB(t *testing.T) {
 	assert.NoFileExists(t, database.Path()+resyncTempSuffix)
 	assert.NoFileExists(t, database.Path()+resyncTempSuffix+"-wal")
 	assert.NoFileExists(t, database.Path()+resyncTempSuffix+"-shm")
+}
+
+// seedRebuildStaleForkFixture writes a replay-only Claude transcript and stores
+// a baselined stale fork row under it, so a complete rebuild would tombstone
+// the fork once the replacement archive is installed.
+func seedRebuildStaleForkFixture(
+	t *testing.T, root string, database *db.DB,
+) string {
+	t.Helper()
+	pureReplay := strings.Join([]string{
+		`{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-01-01T10:00:00Z","sessionId":"fork-abort","sessionKind":"bg","message":{"content":"first question"}}`,
+		`{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-01-01T10:00:05Z","sessionId":"fork-abort","sessionKind":"bg","message":{"id":"msg_01","content":[{"type":"text","text":"first answer"}]}}`,
+	}, "\n") + "\n"
+	path := filepath.Join(root, "project", "fork-abort.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(pureReplay), 0o644))
+	parentID := "fork-abort"
+	staleID := parentID + "-11111111-2222-4333-8444-555555555555"
+	require.NoError(t, database.UpsertSession(db.Session{
+		ID:               staleID,
+		Project:          "project",
+		Machine:          "local",
+		Agent:            "claude",
+		ParentSessionID:  &parentID,
+		RelationshipType: "fork",
+		FilePath:         &path,
+	}))
+	require.NoError(t, database.SetSessionDataVersion(staleID, 0))
+	require.NoError(t, database.BaselineActiveSessionSourceOwnerships(
+		context.Background(), []db.SessionSourceOwnership{{
+			ID: staleID, Machine: "local", Agent: "claude", FilePath: path,
+		}},
+	))
+	return staleID
+}
+
+func TestResyncBuildFailureDoesNotReportDiscardedTombstones(t *testing.T) {
+	root := t.TempDir()
+	database, err := db.Open(filepath.Join(t.TempDir(), "archive.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	emitter := &fakeEmitter{}
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
+		Machine:   "local",
+		Emitter:   emitter,
+	})
+	t.Cleanup(engine.Close)
+	staleID := seedRebuildStaleForkFixture(t, root, database)
+
+	sentinel := errors.New("fts sentinel")
+	stats, err := engine.resyncAllWithOptionsAndOperations(
+		context.Background(), nil, RebuildOptions{}, rebuildOperations{
+			rebuildFTS: func(*db.DB) error { return sentinel },
+		},
+	)
+	require.ErrorIs(t, err, sentinel)
+	require.True(t, stats.Aborted)
+	assert.Zero(t, stats.Tombstoned,
+		"tombstones in a discarded replacement must not be reported")
+	assert.Zero(t, engine.LastSyncStats().Tombstoned,
+		"recorded failure stats must not carry discarded tombstones")
+	assert.Empty(t, emitter.got(),
+		"a discarded replacement must not publish a sync event")
+	stale, err := database.GetSession(context.Background(), staleID)
+	require.NoError(t, err)
+	assert.NotNil(t, stale, "the original archive keeps the stale fork active")
+}
+
+func TestResyncPreInstallSwapFailureDoesNotReportDiscardedTombstones(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	database, err := db.Open(filepath.Join(t.TempDir(), "archive.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	emitter := &fakeEmitter{}
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
+		Machine:   "local",
+		Emitter:   emitter,
+	})
+	t.Cleanup(engine.Close)
+	staleID := seedRebuildStaleForkFixture(t, root, database)
+
+	restore := db.SetCloseDrainTimeoutForTest(100 * time.Millisecond)
+	defer restore()
+	pinned, err := database.Reader().Query("SELECT 1")
+	require.NoError(t, err)
+	pinnedOpen := true
+	defer func() {
+		if pinnedOpen {
+			require.NoError(t, pinned.Close())
+		}
+	}()
+
+	stats := engine.ResyncAll(context.Background(), nil)
+	require.True(t, stats.Aborted,
+		"a failed close before the swap must abort the resync")
+	require.NoError(t, pinned.Close())
+	pinnedOpen = false
+	assert.Zero(t, stats.Tombstoned,
+		"tombstones in a discarded replacement must not be reported")
+	assert.Zero(t, engine.LastSyncStats().Tombstoned,
+		"recorded failure stats must not carry discarded tombstones")
+	assert.Empty(t, emitter.got(),
+		"a discarded replacement must not publish a sync event")
+	stale, err := database.GetSession(context.Background(), staleID)
+	require.NoError(t, err)
+	assert.NotNil(t, stale, "the original archive keeps the stale fork active")
 }

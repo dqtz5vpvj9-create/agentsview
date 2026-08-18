@@ -45,6 +45,11 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
     label: "DeepSeek TUI",
   },
   {
+    name: "deepseek-harness",
+    color: "var(--accent-cyan)",
+    label: "DeepSeek Harness",
+  },
+  {
     name: "openclaw",
     color: "var(--accent-orange)",
     label: "OpenClaw",
@@ -120,7 +125,7 @@ export function agentColor(agent: string): string {
   return agentColorMap.get(agent) ?? defaultFillColor;
 }
 
-export function accentForeground(color: string): string {
+function accentForeground(color: string): string {
   return accentForegroundMap.get(color) ?? "var(--accent-blue-foreground)";
 }
 

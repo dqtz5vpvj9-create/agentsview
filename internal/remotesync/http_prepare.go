@@ -4,13 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"sync"
+	"time"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/parser"
 	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
@@ -19,6 +23,11 @@ var (
 	ErrPreparedInUse       = errors.New("prepared HTTP sources are in use")
 	ErrPreparedClosed      = errors.New("prepared HTTP sources are closing or closed")
 )
+
+type rebuildCachePersistError struct{ err error }
+
+func (e *rebuildCachePersistError) Error() string { return e.err.Error() }
+func (e *rebuildCachePersistError) Unwrap() error { return e.err }
 
 // HostError attributes an HTTP preparation failure to its configured host.
 // The cause remains available to errors.Is and errors.As callers.
@@ -206,19 +215,56 @@ func (p *PreparedHTTPSyncs) Close() error {
 	return cleanupErr
 }
 
+// Commit finalizes each successfully rebuilt persistent source. It is
+// idempotent; a failure leaves every uncommitted source owned for retry.
+func (p *PreparedHTTPSyncs) Commit() error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, source := range p.sources {
+		if source == nil {
+			continue
+		}
+		if err := source.Commit(); err != nil {
+			return &HostError{Host: source.sync.Host, Operation: "commit rebuild", Err: err}
+		}
+	}
+	return nil
+}
+
 // PreparedHTTP is a downloaded remote source ready for active import. A
 // persistent mirror remains locked until Close so another process cannot mutate
 // files while the importer reads them. Legacy sources own their temporary root.
 type PreparedHTTP struct {
-	sync        HTTPSync
-	targets     TargetSet
-	root        string
-	lock        *MirrorLockHandle
-	cleanupRoot bool
-	closing     bool
-	closed      bool
-	removeRoot  func(string) error
-	releaseLock func(*MirrorLockHandle) error
+	sync                      HTTPSync
+	targets                   TargetSet
+	root                      string
+	lock                      *MirrorLockHandle
+	cleanupRoot               bool
+	closing                   bool
+	closed                    bool
+	removeRoot                func(string) error
+	releaseLock               func(*MirrorLockHandle) error
+	legacy                    bool
+	mirrorImport              *preparedMirrorImport
+	replaceJournal            func(string, MirrorChangeJournal) error
+	retireJournal             func(string) error
+	replaceRemoteSkippedFiles func(string, map[string]int64) error
+	applyRemoteSkippedChanges func(string, []string, map[string]int64) error
+	commitReady               bool
+	committed                 bool
+}
+
+type preparedMirrorImport struct {
+	journalPath string
+	journal     MirrorChangeJournal
+	mergeStats  JournalMergeStats
+	fullReason  FullImportReason
+	outcome     JournalOutcome
+	reported    bool
+	pending     *PreparedDeltaImport
 }
 
 // Prepare resolves the remote targets and prepares either the persistent
@@ -245,12 +291,15 @@ func (hs HTTPSync) prepare(
 	if err := validateTargetSetPaths(targets); err != nil {
 		return nil, err
 	}
-
 	prepared := &PreparedHTTP{
-		sync:        hs,
-		targets:     targets,
-		removeRoot:  os.RemoveAll,
-		releaseLock: func(lock *MirrorLockHandle) error { return lock.Close() },
+		sync:                      hs,
+		targets:                   targets,
+		removeRoot:                os.RemoveAll,
+		releaseLock:               func(lock *MirrorLockHandle) error { return lock.Close() },
+		replaceJournal:            replaceMirrorChangeJournal,
+		retireJournal:             retireMirrorChangeJournal,
+		replaceRemoteSkippedFiles: hs.DB.ReplaceRemoteSkippedFiles,
+		applyRemoteSkippedChanges: hs.DB.ApplyRemoteSkippedFileChanges,
 	}
 	if configure != nil {
 		configure(prepared)
@@ -270,10 +319,15 @@ func (hs HTTPSync) prepare(
 			return nil, err
 		}
 		prepared.cleanupRoot = true
+		prepared.legacy = true
 		return prepared, nil
 	}
 
-	mirrorRoot := MirrorDir(hs.DataDir, hs.Host)
+	mirrorRoot, err := filepath.Abs(MirrorDir(hs.DataDir, hs.Host))
+	if err != nil {
+		return nil, fmt.Errorf("make persistent mirror root absolute: %w", err)
+	}
+	mirrorRoot = filepath.Clean(mirrorRoot)
 	prepared.lock, err = AcquireMirrorLock(ctx, mirrorRoot)
 	if err != nil {
 		return nil, err
@@ -293,14 +347,15 @@ func (hs HTTPSync) prepare(
 			return nil, err
 		}
 		prepared.cleanupRoot = true
+		prepared.legacy = true
 		return prepared, nil
 	}
 
 	prepared.root = mirrorRoot
-	err = hs.prepareMirror(ctx, client, splitTargets{
+	prepared.mirrorImport, err = hs.prepareMirror(ctx, client, splitTargets{
 		dirScoped:  dirScoped,
 		fileScoped: fileScoped,
-	}, manifest, mirrorRoot)
+	}, manifest, mirrorRoot, prepared)
 	if err != nil {
 		return nil, err
 	}
@@ -318,7 +373,67 @@ func (p *PreparedHTTP) ImportActive(ctx context.Context) (SyncStats, error) {
 	if p == nil || p.closing || p.closed {
 		return SyncStats{}, fmt.Errorf("prepared HTTP source is closed")
 	}
-	return p.sync.importRoot(ctx, p.targets, p.root)
+	if p.mirrorImport == nil {
+		if p.legacy {
+			return p.sync.importRoot(ctx, p.targets, p.root)
+		}
+		return SyncStats{}, nil
+	}
+	stats, err := p.mirrorImport.pending.Execute(ctx)
+	p.mirrorImport.outcome = stats.JournalOutcome
+	if err != nil || stats.Failed > 0 {
+		p.reportDeltaImport(stats)
+		return stats, err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		stats.JournalOutcome = JournalCancelled
+		p.mirrorImport.outcome = stats.JournalOutcome
+		p.reportDeltaImport(stats)
+		return stats, ctxErr
+	}
+	retireStart := time.Now()
+	if err := p.retireJournal(p.mirrorImport.journalPath); err != nil {
+		stats.RetirementDuration = time.Since(retireStart)
+		stats.JournalOutcome = JournalRetirementFailed
+		p.mirrorImport.outcome = stats.JournalOutcome
+		p.reportDeltaImport(stats)
+		return stats, fmt.Errorf("retire mirror change journal: %w", err)
+	}
+	stats.RetirementDuration = time.Since(retireStart)
+	stats.JournalOutcome = JournalRetired
+	p.mirrorImport.outcome = stats.JournalOutcome
+	p.reportDeltaImport(stats)
+	return stats, nil
+}
+
+func (p *PreparedHTTP) reportDeltaImport(stats SyncStats) {
+	if p.mirrorImport != nil {
+		p.mirrorImport.reported = true
+	}
+	p.sync.reportProgressDetail(fmt.Sprintf(
+		"Synced %d sessions from %s (%d unchanged, %d error-suppressed)",
+		stats.SessionsSynced, p.sync.Host, stats.Skipped, stats.ErrorSuppressed,
+	))
+	if stats.JournalOutcome != JournalRetired {
+		p.sync.reportProgressDetail(fmt.Sprintf(
+			"Pending import from %s %s", p.sync.Host, stats.JournalOutcome,
+		))
+	}
+	log.Printf(
+		"remote sync delta import: host=%s pending_paths=%d pending_new=%d pending_rearmed=%d pending_replayed=%d armed_paths=%d exact_sources=%d fallback_providers=%d fallback_sources=%d files_discovered=%d files_processed=%d prune_exact_scopes=%d prune_provider_scopes=%d prune_host_wide_scope=%t pruned_exact=%d pruned_provider=%d pruned_host_wide=%d sessions_synced=%d sessions_total=%d skipped=%d error_suppressed=%d failed=%d full_reason=%s journal_outcome=%s planning_duration=%s pruning_duration=%s processing_duration=%s cache_persist_duration=%s retirement_duration=%s",
+		p.sync.Host, stats.PendingPaths, stats.PendingNew, stats.PendingRearmed,
+		stats.PendingReplayed, stats.ArmedPaths, stats.ExactSources,
+		stats.FallbackProviders, stats.FallbackSources, stats.FilesDiscovered,
+		stats.FilesProcessed, stats.PruneExactScopes, stats.PruneProviderScopes,
+		stats.PruneHostWideScope, stats.PrunedExact, stats.PrunedProvider,
+		stats.PrunedHostWide, stats.SessionsSynced, stats.SessionsTotal,
+		stats.Skipped, stats.ErrorSuppressed, stats.Failed, stats.FullReason,
+		stats.JournalOutcome, stats.PlanningDuration.Round(time.Millisecond),
+		stats.PruningDuration.Round(time.Millisecond),
+		stats.ProcessingDuration.Round(time.Millisecond),
+		stats.CachePersistDuration.Round(time.Millisecond),
+		stats.RetirementDuration.Round(time.Millisecond),
+	)
 }
 
 // RebuildContributor converts this prepared source into an atomic rebuild
@@ -336,21 +451,126 @@ func (p *PreparedHTTP) RebuildContributor() (syncpkg.RebuildContributor, error) 
 	if err != nil {
 		return syncpkg.RebuildContributor{}, err
 	}
+	persistSkipCache := func(engine *syncpkg.Engine, database *db.DB) error {
+		var err error
+		if p.mirrorImport != nil {
+			err = p.mirrorImport.pending.persistSkipCache(database, engine)
+		} else {
+			err = saveEngineSkipCache(database, engine, layout.paths)
+		}
+		if err != nil {
+			return &rebuildCachePersistError{err: err}
+		}
+		return nil
+	}
+	persistRetrySafeSkipCache := func(
+		engine *syncpkg.Engine, database *db.DB,
+	) error {
+		var err error
+		if p.mirrorImport != nil {
+			err = p.mirrorImport.pending.persistRetrySafeSkipCache(database, engine)
+		} else {
+			remoteCache := remoteRetrySafeEngineSkipCache(engine, layout.paths)
+			err = database.ReplaceRemoteSkippedFiles(layout.paths.host, remoteCache)
+		}
+		if err != nil {
+			return &rebuildCachePersistError{err: err}
+		}
+		return nil
+	}
+	persistSuccessfulImport := func(
+		engine *syncpkg.Engine, database *db.DB,
+	) error {
+		if err := persistSkipCache(engine, database); err != nil {
+			return err
+		}
+		if p.mirrorImport == nil {
+			return nil
+		}
+		if err := p.mirrorImport.pending.persistImportDataVersion(
+			context.Background(), database,
+		); err != nil {
+			return &rebuildCachePersistError{err: err}
+		}
+		return nil
+	}
+	forceParse := p.sync.forceParseRequested()
+	forceFullParseAfterCache := p.sync.forceFullParseAfterCacheRequested()
 	contributor := syncpkg.RebuildContributor{
-		Name:   p.sync.Host,
-		Config: config,
+		Name:                     p.sync.Host,
+		Config:                   config,
+		ForceParse:               forceParse,
+		ForceFullParseAfterCache: forceFullParseAfterCache,
 		Progress: func(progress syncpkg.Progress) syncpkg.Progress {
 			return transformHostProgress(p.sync.Host, progress)
 		},
-		AfterSync: func(engine *syncpkg.Engine, database *db.DB) error {
-			return saveEngineSkipCache(database, engine, layout.paths)
-		},
+		AfterSync:    persistSuccessfulImport,
+		AfterFailure: persistRetrySafeSkipCache,
+	}
+	if p.mirrorImport != nil {
+		contributor.ForceParse = p.mirrorImport.pending.forceParse
+		contributor.ForceFullParseAfterCache =
+			p.mirrorImport.pending.forceFullParse
+		contributor.Config.InitialSkipCache = p.mirrorImport.pending.cache
 	}
 	if p.sync.Lifecycle != nil {
 		contributor.Started = p.sync.Lifecycle.RebuildStarted
-		contributor.Finished = p.sync.Lifecycle.RebuildFinished
+	}
+	contributor.Finished = func(stats syncpkg.SyncStats, err error) {
+		p.commitReady = err == nil && !stats.Aborted && stats.Failed == 0
+		if p.mirrorImport != nil {
+			pendingStats := &p.mirrorImport.pending.Stats
+			pendingStats.SessionsSynced = stats.Synced
+			pendingStats.SessionsTotal = stats.TotalSessions
+			pendingStats.Skipped = stats.Skipped
+			pendingStats.Failed = stats.Failed
+			if p.commitReady {
+				p.mirrorImport.outcome = JournalPendingSwap
+				pendingStats.JournalOutcome = JournalPendingSwap
+			} else if errors.Is(err, context.Canceled) ||
+				errors.Is(err, context.DeadlineExceeded) {
+				p.mirrorImport.outcome = JournalCancelled
+				pendingStats.JournalOutcome = JournalCancelled
+			} else {
+				var cacheErr *rebuildCachePersistError
+				if errors.As(err, &cacheErr) {
+					p.mirrorImport.outcome = JournalCachePersistFailed
+					pendingStats.JournalOutcome = JournalCachePersistFailed
+				} else if stats.Failed > 0 || stats.Aborted || err != nil {
+					p.mirrorImport.outcome = JournalProcessingFailures
+					pendingStats.JournalOutcome = JournalProcessingFailures
+				}
+			}
+		}
+		if p.sync.Lifecycle != nil && p.sync.Lifecycle.RebuildFinished != nil {
+			p.sync.Lifecycle.RebuildFinished(stats, err)
+		}
 	}
 	return contributor, nil
+}
+
+// Commit retires a processed persistent journal after an atomic rebuild swap.
+func (p *PreparedHTTP) Commit() error {
+	if p == nil || p.mirrorImport == nil || p.committed {
+		return nil
+	}
+	if !p.commitReady {
+		return fmt.Errorf("prepared HTTP journal is not ready to commit")
+	}
+	start := time.Now()
+	if err := p.retireJournal(p.mirrorImport.journalPath); err != nil {
+		p.mirrorImport.pending.Stats.RetirementDuration = time.Since(start)
+		p.mirrorImport.outcome = JournalRetirementFailed
+		p.mirrorImport.pending.Stats.JournalOutcome = JournalRetirementFailed
+		p.reportDeltaImport(p.mirrorImport.pending.Stats)
+		return fmt.Errorf("retire mirror change journal after rebuild: %w", err)
+	}
+	p.committed = true
+	p.mirrorImport.outcome = JournalRetired
+	p.mirrorImport.pending.Stats.JournalOutcome = JournalRetired
+	p.mirrorImport.pending.Stats.RetirementDuration = time.Since(start)
+	p.reportDeltaImport(p.mirrorImport.pending.Stats)
+	return nil
 }
 
 // Close releases the mirror lock and removes an owned legacy root. It is safe
@@ -358,6 +578,12 @@ func (p *PreparedHTTP) RebuildContributor() (syncpkg.RebuildContributor, error) 
 func (p *PreparedHTTP) Close() error {
 	if p == nil || p.closed {
 		return nil
+	}
+	if p.mirrorImport != nil && !p.mirrorImport.reported &&
+		p.mirrorImport.outcome.Valid() && p.mirrorImport.outcome != JournalRetired {
+		stats := p.mirrorImport.pending.Stats
+		stats.JournalOutcome = p.mirrorImport.outcome
+		p.reportDeltaImport(stats)
 	}
 	p.closing = true
 	var cleanupErr, lockErr error
@@ -397,6 +623,67 @@ type splitTargets struct {
 	fileScoped TargetSet
 }
 
+func mergeAgentPaths(
+	base map[parser.AgentType][]string,
+	extra map[parser.AgentType][]string,
+) map[parser.AgentType][]string {
+	merged := make(map[parser.AgentType][]string, len(base)+len(extra))
+	for agent, paths := range base {
+		merged[agent] = append([]string(nil), paths...)
+	}
+	for agent, paths := range extra {
+		for _, path := range paths {
+			if !slices.Contains(merged[agent], path) {
+				merged[agent] = append(merged[agent], path)
+			}
+		}
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
+}
+
+func addTargetDirs(targets TargetSet, dirs map[parser.AgentType][]string) TargetSet {
+	targets.Dirs = mergeAgentPaths(targets.Dirs, dirs)
+	return targets
+}
+
+func mirrorFileScopedPaths(
+	mirrorRoot string, targets TargetSet,
+) (map[string]struct{}, error) {
+	remotePaths := make([]string, 0)
+	for _, paths := range targets.Files {
+		remotePaths = append(remotePaths, paths...)
+	}
+	remotePaths = append(remotePaths, targets.AllExtraFiles()...)
+	result := make(map[string]struct{}, len(remotePaths))
+	for _, remotePath := range remotePaths {
+		path, err := mirrorRelativeRemoteChangePath(mirrorRoot, remotePath)
+		if err != nil {
+			return nil, err
+		}
+		result[path] = struct{}{}
+	}
+	return result, nil
+}
+
+func mirrorFileScopedRoots(
+	mirrorRoot string, dirs map[parser.AgentType][]string,
+) ([]string, error) {
+	var roots []string
+	for _, remoteDirs := range dirs {
+		for _, remoteDir := range remoteDirs {
+			root, err := safeRemappedRemotePath(mirrorRoot, remoteDir)
+			if err != nil {
+				return nil, err
+			}
+			roots = append(roots, root)
+		}
+	}
+	return roots, nil
+}
+
 // prepareMirror applies the manifest delta to the persistent mirror. The
 // caller holds the mirror lock from before the manifest fetch until the
 // prepared source is closed.
@@ -406,32 +693,220 @@ func (hs HTTPSync) prepareMirror(
 	targets splitTargets,
 	manifest Manifest,
 	mirrorRoot string,
-) error {
+	prepared *PreparedHTTP,
+) (result *preparedMirrorImport, retErr error) {
+	fullReason := hs.FullReason
+	if hs.Full && fullReason == "" {
+		fullReason = FullImportExplicit
+	}
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		hs.reportProgressDetail(fmt.Sprintf(
+			"Pending import from %s %s",
+			hs.Host, JournalAbortedBeforeProcessing,
+		))
+		log.Printf(
+			"remote sync delta import: host=%s full_reason=%s journal_outcome=%s",
+			hs.Host, fullReason, JournalAbortedBeforeProcessing,
+		)
+	}()
+	journalPath := mirrorJournalPath(mirrorRoot)
+	journal, err := loadMirrorChangeJournal(journalPath)
+	if err != nil {
+		if !errors.Is(err, ErrMalformedMirrorJournal) {
+			return nil, err
+		}
+		journal = MirrorChangeJournal{
+			Version: mirrorJournalVersion, FullImport: true,
+			FullImportReason: FullImportJournalRecovery, InvalidateAll: true,
+			ForceFullParseAll: true,
+		}
+		if replaceErr := prepared.replaceJournal(journalPath, journal); replaceErr != nil {
+			return nil, fmt.Errorf("persist mirror journal recovery marker: %w", replaceErr)
+		}
+	}
+	_, mirrorStatErr := os.Stat(mirrorRoot)
+	bootstrap := errors.Is(mirrorStatErr, os.ErrNotExist)
 	delta, err := MirrorDiff(mirrorRoot, manifest)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	hs.reportProgressDetail(fmt.Sprintf(
 		"Compared session manifest from %s: %d total, %d changed, %d deleted",
 		hs.Host, delta.Total, len(delta.Fetch), len(delta.Deletions),
 	))
+	pendingFileScopedDirs := journal.FileScopedDirs
+	fileScopedDirs := targets.fileScoped.Dirs
+	if pendingFileScopedDirs != nil {
+		fileScopedDirs = pendingFileScopedDirs
+		prepared.targets = addTargetDirs(prepared.targets, pendingFileScopedDirs)
+	}
+	fileScopedPaths, err := mirrorFileScopedPaths(mirrorRoot, targets.fileScoped)
+	if err != nil {
+		return nil, err
+	}
+	fileScopedRoots, err := mirrorFileScopedRoots(mirrorRoot, fileScopedDirs)
+	if err != nil {
+		return nil, err
+	}
+	fileScopedChange := func(relativePath string) (bool, error) {
+		if _, exact := fileScopedPaths[relativePath]; exact {
+			return true, nil
+		}
+		localPath, pathErr := safeLocalArchivePath(mirrorRoot, relativePath)
+		if pathErr != nil {
+			return false, pathErr
+		}
+		for _, root := range fileScopedRoots {
+			if within(root, localPath) {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	// A disarmed journal represents a mirror snapshot that is already ready to
+	// process. Full journals cannot retain path entries, so their host-wide flag
+	// selects replay while the saved provider roots protect and classify the
+	// sanitized snapshot if the current target response changed.
+	deferFileScopedRefresh := journal.FullImport && !journal.InvalidateAll
+	if !deferFileScopedRefresh {
+		for _, entry := range journal.Entries {
+			fileScoped, classifyErr := fileScopedChange(entry.Path)
+			if classifyErr != nil {
+				return nil, classifyErr
+			}
+			if fileScoped && !entry.InvalidateCache {
+				deferFileScopedRefresh = true
+				break
+			}
+		}
+	}
+	if deferFileScopedRefresh {
+		kept := delta.Deletions[:0]
+		for _, localPath := range delta.Deletions {
+			path, normalizeErr := mirrorRelativeLocalChangePath(
+				mirrorRoot, localPath,
+			)
+			if normalizeErr != nil {
+				return nil, normalizeErr
+			}
+			fileScoped, classifyErr := fileScopedChange(path)
+			if classifyErr != nil {
+				return nil, classifyErr
+			}
+			if fileScoped {
+				continue
+			}
+			kept = append(kept, localPath)
+		}
+		delta.Deletions = kept
+	}
+	refreshFileScoped := !targets.fileScoped.IsEmpty() && !deferFileScopedRefresh
 	mutatesMirror := len(delta.Deletions) > 0 || len(delta.Fetch) > 0 ||
-		!targets.fileScoped.IsEmpty()
-	if !mutatesMirror {
-		return nil
+		refreshFileScoped
+	observed := make([]string, 0, len(delta.Fetch)+len(delta.Deletions))
+	forceFullParseObserved := make([]string, 0, len(delta.Fetch))
+	for _, remotePath := range delta.Fetch {
+		path, normalizeErr := mirrorRelativeRemoteChangePath(mirrorRoot, remotePath)
+		if normalizeErr != nil {
+			return nil, normalizeErr
+		}
+		observed = append(observed, path)
+		forceFullParseObserved = append(forceFullParseObserved, path)
 	}
-	if err := hs.DB.ClearRemoteSkippedFiles(hs.Host); err != nil {
-		return fmt.Errorf("clear remote skip cache before mirror mutation: %w", err)
+	for _, localPath := range delta.Deletions {
+		path, normalizeErr := mirrorRelativeLocalChangePath(mirrorRoot, localPath)
+		if normalizeErr != nil {
+			return nil, normalizeErr
+		}
+		observed = append(observed, path)
 	}
-
+	if refreshFileScoped {
+		for path := range fileScopedPaths {
+			observed = append(observed, path)
+			forceFullParseObserved = append(forceFullParseObserved, path)
+		}
+	}
+	journal, mergeStats, err := mergeMirrorChangesWithForce(
+		journal, observed, forceFullParseObserved,
+	)
+	if err != nil {
+		return nil, err
+	}
+	captureCurrentFileScopedDirs := refreshFileScoped ||
+		(deferFileScopedRefresh && pendingFileScopedDirs == nil &&
+			len(targets.fileScoped.Dirs) > 0)
+	if pendingFileScopedDirs != nil || captureCurrentFileScopedDirs {
+		fileScopedSnapshot := mergeAgentPaths(nil, pendingFileScopedDirs)
+		if captureCurrentFileScopedDirs {
+			fileScopedSnapshot = mergeAgentPaths(
+				fileScopedSnapshot, targets.fileScoped.Dirs,
+			)
+		}
+		journal, err = attachFileScopedJournalDirs(journal, fileScopedSnapshot)
+		if err != nil {
+			return nil, err
+		}
+	}
+	currentDataVersion := db.CurrentDataVersion()
+	importedDataVersion, err := hs.DB.RemoteImportDataVersion(ctx, hs.Host)
+	if err != nil {
+		return nil, err
+	}
+	dataRebuildRequested := hs.forceFullParseAfterCacheRequested()
+	dataRebuildPending := importedDataVersion != currentDataVersion ||
+		dataRebuildRequested || journal.RequiredDataVersion != 0
+	if dataRebuildPending && journal.RequiredDataVersion != currentDataVersion {
+		if bootstrap && !dataRebuildRequested && !journal.FullImport {
+			journal.RequiredDataVersion = currentDataVersion
+			journal.DataRebuildCacheVersion = 0
+		} else {
+			journal = requireMirrorDataVersionImport(journal, currentDataVersion)
+		}
+	}
+	if journal.RequiredDataVersion != 0 && fullReason == "" {
+		fullReason = FullImportDataRebuild
+		if bootstrap {
+			fullReason = FullImportBootstrap
+		}
+	}
+	if fullReason == FullImportExplicit {
+		if !journal.FullImport {
+			journal = MirrorChangeJournal{
+				Version:                 mirrorJournalVersion,
+				FullImport:              true,
+				FullImportReason:        FullImportExplicit,
+				RequiredDataVersion:     journal.RequiredDataVersion,
+				DataRebuildCacheVersion: journal.DataRebuildCacheVersion,
+				FileScopedDirs:          journal.FileScopedDirs,
+			}
+		}
+		journal.InvalidateAll = true
+		journal.ForceFullParseAll = true
+	}
+	if journal.FullImportReason != "" {
+		fullReason = journal.FullImportReason
+	} else if fullReason == "" && bootstrap {
+		fullReason = FullImportBootstrap
+	}
+	hasPending := journal.FullImport || len(journal.Entries) > 0 ||
+		fullReason != "" || hs.Full
+	if !mutatesMirror && !hasPending {
+		return nil, nil
+	}
+	if err := prepared.replaceJournal(journalPath, journal); err != nil {
+		return nil, fmt.Errorf("persist pending mirror changes: %w", err)
+	}
 	// Deletions precede extraction so remote file/directory type changes cannot
 	// wedge the mirror. File-scoped content is absent from the manifest and is
 	// re-populated by its separate full archive below.
 	if err := ApplyMirrorDeletions(mirrorRoot, delta.Deletions); err != nil {
-		return err
+		return nil, err
 	}
 	if err := RemoveMirrorTypeConflicts(mirrorRoot, delta.Fetch); err != nil {
-		return err
+		return nil, err
 	}
 	if len(delta.Fetch) > 0 {
 		full := len(delta.Fetch)*2 >= delta.Total
@@ -445,15 +920,74 @@ func (hs HTTPSync) prepareMirror(
 			)
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
-	if !targets.fileScoped.IsEmpty() {
+	if refreshFileScoped {
 		if err := hs.downloadIntoMirror(
 			ctx, client, targets.fileScoped, nil, true, mirrorRoot,
 		); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	hs.reportProgressDetail(fmt.Sprintf(
+		"Planning import from %s: %d pending paths", hs.Host, len(journal.Entries),
+	))
+	dataRebuild := journal.RequiredDataVersion != 0
+	attemptCacheDataVersion := 0
+	if dataRebuild {
+		attemptCacheDataVersion = currentDataVersion
+	}
+	pending, err := (Importer{
+		Host: hs.Host, Full: hs.Full, DB: hs.DB,
+		BlockedResultCategories: hs.BlockedResultCategories,
+		Progress:                hs.Progress, Targets: prepared.targets, Root: mirrorRoot,
+		replaceRemoteSkippedFiles: prepared.replaceRemoteSkippedFiles,
+		applyRemoteSkippedChanges: prepared.applyRemoteSkippedChanges,
+	}).PreparePending(ctx, DeltaImportRequest{
+		Journal: journal, FullReason: fullReason,
+		ForceParse:               hs.forceParseRequested(),
+		ForceFullParseAfterCache: dataRebuild,
+		ResetAttemptCache: dataRebuild &&
+			journal.DataRebuildCacheVersion != currentDataVersion,
+		AttemptCacheDataVersion: attemptCacheDataVersion,
+	})
+	if err != nil {
+		return nil, err
+	}
+	pending.Stats.PendingNew = mergeStats.New
+	pending.Stats.PendingRearmed = mergeStats.Rearmed
+	pending.Stats.PendingReplayed = mergeStats.Replayed
+	if pending.Stats.FullReason != "" {
+		hs.reportProgressDetail(fmt.Sprintf(
+			"Planned full import from %s (%s)", hs.Host, pending.Stats.FullReason,
+		))
+	} else {
+		hs.reportProgressDetail(fmt.Sprintf(
+			"Planned import from %s: %d exact sources, %d provider fallback",
+			hs.Host, pending.Stats.ExactSources, pending.Stats.FallbackProviders,
+		))
+	}
+	if err := prepared.replaceJournal(journalPath, pending.DisarmedJournal); err != nil {
+		return nil, fmt.Errorf("persist disarmed mirror changes: %w", err)
+	}
+	return &preparedMirrorImport{
+		journalPath: journalPath, journal: pending.DisarmedJournal,
+		mergeStats: mergeStats, fullReason: fullReason,
+		outcome: JournalAbortedBeforeProcessing, pending: pending,
+	}, nil
+}
+
+func requireMirrorDataVersionImport(
+	journal MirrorChangeJournal, version int,
+) MirrorChangeJournal {
+	return MirrorChangeJournal{
+		Version:             mirrorJournalVersion,
+		FullImport:          true,
+		FullImportReason:    journal.FullImportReason,
+		InvalidateAll:       true,
+		ForceFullParseAll:   true,
+		RequiredDataVersion: version,
+		FileScopedDirs:      journal.FileScopedDirs,
+	}
 }

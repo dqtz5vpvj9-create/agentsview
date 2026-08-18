@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -33,6 +32,7 @@ type HTTPSync struct {
 	URL                     string
 	Token                   string
 	Full                    bool
+	FullReason              FullImportReason
 	DataDir                 string
 	DB                      *db.DB
 	BlockedResultCategories []string
@@ -41,6 +41,17 @@ type HTTPSync struct {
 	Lifecycle               *HTTPSyncLifecycle
 	runPrepare              func(context.Context) (*PreparedHTTP, error)
 	removeArchiveSpool      func(string) error
+}
+
+// forceParseRequested distinguishes an operator-requested full sync from a
+// complete source scan required by an automatic data rebuild. A blank reason
+// retains the historical meaning of Full for direct callers.
+func (hs HTTPSync) forceParseRequested() bool {
+	return hs.Full && (hs.FullReason == "" || hs.FullReason == FullImportExplicit)
+}
+
+func (hs HTTPSync) forceFullParseAfterCacheRequested() bool {
+	return hs.Full && !hs.forceParseRequested()
 }
 
 // PreparedCleanupError reports an operation failure while retaining a prepared
@@ -108,12 +119,17 @@ func (hs HTTPSync) importRoot(
 	stats, err := Importer{
 		Host:                    hs.Host,
 		Full:                    hs.Full,
+		RequireComplete:         true,
 		DB:                      hs.DB,
 		BlockedResultCategories: hs.BlockedResultCategories,
 		Progress:                hs.Progress,
 	}.ImportExtracted(ctx, targets, root)
+	stats.FullReason = hs.FullReason
+	if stats.FullReason == "" {
+		stats.FullReason = FullImportLegacy
+	}
 	if err != nil {
-		return SyncStats{}, err
+		return stats, err
 	}
 	hs.report(syncpkg.Progress{
 		Detail: fmt.Sprintf(
@@ -139,6 +155,7 @@ func (hs HTTPSync) fetchManifest(
 		return Manifest{}, false, err
 	}
 	hs.authorize(req)
+	SetProtocolHeader(req.Header)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept-Encoding", "gzip")
 	resp, err := client.Do(req)
@@ -146,27 +163,17 @@ func (hs HTTPSync) fetchManifest(
 		return Manifest{}, false, err
 	}
 	defer resp.Body.Close()
-	switch resp.StatusCode {
-	case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented:
-		// Old daemon without the manifest endpoint; also gates delta
-		// archive usage (an old server would ignore the files field
-		// and return the full corpus).
+	if resp.StatusCode == http.StatusNotImplemented {
+		if err := ValidateProtocolHeader(resp.Header); err != nil {
+			return Manifest{}, false, err
+		}
 		return Manifest{}, false, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return Manifest{}, false, httpStatusError(resp)
 	}
-	// A real old daemon has no manifest route at all: the POST falls
-	// through to the SPA catch-all, which serves index.html with a 200
-	// and Content-Type text/html rather than a 404. Treat any 2xx
-	// response that isn't JSON as manifest-unsupported instead of
-	// failing the decode below. A malformed Content-Type is treated the
-	// same way; only a genuine JSON response goes through the decoder,
-	// so truncated/corrupt JSON (e.g. bad gzip) still surfaces as a hard
-	// error rather than silently degrading to full syncs forever.
-	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/json" {
-		return Manifest{}, false, nil
+	if err := ValidateProtocolHeader(resp.Header); err != nil {
+		return Manifest{}, false, err
 	}
 	reader := io.Reader(resp.Body)
 	if resp.Header.Get("Content-Encoding") == "gzip" {
@@ -217,11 +224,18 @@ func (hs HTTPSync) downloadIntoMirror(
 		return err
 	}
 	hs.authorize(req)
+	SetProtocolHeader(req.Header)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept-Encoding", "gzip")
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if err := ValidateProtocolHeader(resp.Header); err != nil {
+			_ = resp.Body.Close()
+			return err
+		}
 	}
 	archive, err := hs.downloadArchive(
 		ctx, resp, downloadLabel, filepath.Dir(mirrorRoot),
@@ -239,8 +253,24 @@ func (hs HTTPSync) downloadIntoMirror(
 	if err := RemoveMirrorFetchFiles(mirrorRoot, fetch); err != nil {
 		return err
 	}
-	if err := archive.extract(ctx, mirrorRoot, hs.Progress, extractLabel); err != nil {
-		return fmt.Errorf("extract archive into mirror: %w", err)
+	var extractErr error
+	if full && fetch != nil {
+		selected := make(map[string]struct{}, len(fetch))
+		for _, remotePath := range fetch {
+			name, nameErr := safeRemotePathArchiveName(remotePath)
+			if nameErr != nil {
+				return nameErr
+			}
+			selected[filepath.ToSlash(filepath.Clean(name))] = struct{}{}
+		}
+		extractErr = archive.extractSelected(
+			ctx, mirrorRoot, selected, hs.Progress, extractLabel,
+		)
+	} else {
+		extractErr = archive.extract(ctx, mirrorRoot, hs.Progress, extractLabel)
+	}
+	if extractErr != nil {
+		return fmt.Errorf("extract archive into mirror: %w", extractErr)
 	}
 	return nil
 }
@@ -256,6 +286,7 @@ func (hs HTTPSync) fetchTargets(
 		return TargetSet{}, err
 	}
 	hs.authorize(req)
+	SetProtocolHeader(req.Header)
 	resp, err := client.Do(req)
 	if err != nil {
 		return TargetSet{}, err
@@ -263,6 +294,9 @@ func (hs HTTPSync) fetchTargets(
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return TargetSet{}, httpStatusError(resp)
+	}
+	if err := ValidateProtocolHeader(resp.Header); err != nil {
+		return TargetSet{}, err
 	}
 	var targets TargetSet
 	if err := json.NewDecoder(resp.Body).Decode(&targets); err != nil {
@@ -287,11 +321,18 @@ func (hs HTTPSync) downloadAndExtract(
 		return "", err
 	}
 	hs.authorize(req)
+	SetProtocolHeader(req.Header)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept-Encoding", "gzip")
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if err := ValidateProtocolHeader(resp.Header); err != nil {
+			_ = resp.Body.Close()
+			return "", err
+		}
 	}
 	downloadLabel := fmt.Sprintf("Downloading session archive from %s", hs.Host)
 	archive, err := hs.downloadArchive(ctx, resp, downloadLabel, os.TempDir())

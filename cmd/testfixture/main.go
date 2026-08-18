@@ -416,6 +416,19 @@ func generateMixedContentMessages(
 				),
 			)
 		}
+		if i == 3 {
+			const resultContent = "# Fixture output\n\n**safe** <script>alert(\"xss\")</script>"
+			msg.ToolCalls = []db.ToolCall{
+				{
+					ToolName:            "Read",
+					Category:            "Read",
+					ToolUseID:           "tu_mixed_read",
+					InputJSON:           `{"file_path":"/workspace/packages/agentsview/frontend/src/lib/components/content/ToolBlock.svelte"}`,
+					ResultContentLength: len(resultContent),
+					ResultContent:       resultContent,
+				},
+			}
+		}
 		msgs = append(msgs, msg)
 	}
 	return msgs

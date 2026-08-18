@@ -19,6 +19,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/money"
+	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/postgres"
 	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
@@ -26,6 +27,26 @@ import (
 // stubVectorPushSource is a no-op postgres.VectorPushSource: the gating test
 // only needs identity, never a method call.
 type stubVectorPushSource struct{}
+
+func TestDaemonPushRequestWatchTransportJSON(t *testing.T) {
+	payload := []byte(`{
+		"full":false,
+		"watch_batch":{"paths":["/sessions/changed.jsonl"],"lost_events":true},
+		"watch_recovery":{"available_roots":["/sessions"],"deferred_roots":["/offline"]}
+	}`)
+	var request daemonPushRequest
+	require.NoError(t, json.Unmarshal(payload, &request))
+	require.NotNil(t, request.WatchBatch)
+	assert.Equal(t, []string{"/sessions/changed.jsonl"}, request.WatchBatch.Paths)
+	assert.True(t, request.WatchBatch.LostEvents)
+	require.NotNil(t, request.WatchRecovery)
+	assert.Equal(t, []string{"/sessions"}, request.WatchRecovery.AvailableRoots)
+	assert.Equal(t, []string{"/offline"}, request.WatchRecovery.DeferredRoots)
+
+	encoded, err := json.Marshal(request)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(payload), string(encoded))
+}
 
 func (stubVectorPushSource) BeginExport(
 	context.Context, []string,
@@ -502,7 +523,7 @@ func TestSyncThenRunForPushWorkerRunnerRouting(t *testing.T) {
 			t.Cleanup(engine.Close)
 
 			err := f.srv.syncThenRunForPush(
-				context.Background(), engine, f.db, tt.full,
+				context.Background(), engine, f.db, tt.full, nil, nil,
 				func(forceFull bool) error {
 					workCalls++
 					assert.Equal(t, tt.wantForceFull, forceFull)
@@ -531,7 +552,7 @@ func TestSyncThenRunForPushRunnerErrorSkipsPush(t *testing.T) {
 	t.Cleanup(engine.Close)
 
 	err := f.srv.syncThenRunForPush(
-		context.Background(), engine, f.db, true,
+		context.Background(), engine, f.db, true, nil, nil,
 		func(bool) error {
 			require.FailNow(t, "push work must not run after a failed worker pass")
 			return nil
@@ -540,6 +561,207 @@ func TestSyncThenRunForPushRunnerErrorSkipsPush(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "resync build reported failed")
+}
+
+func TestSyncThenRunForPushAppliesCurrentWatchBatchBeforeWork(t *testing.T) {
+	f := newSyncRouteFixture(t)
+	changed := f.writeClaudeSession(t, "proj/changed.jsonl", "scoped daemon push")
+	untouched := f.writeClaudeSession(t, "proj/untouched.jsonl", "must stay cold")
+	engine := f.srv.syncEngineForLocal(f.db)
+	t.Cleanup(engine.Close)
+	batch := syncpkg.WatchBatch{Paths: []string{changed}}
+
+	err := f.srv.syncThenRunForPush(
+		t.Context(), engine, f.db, false, &batch, nil,
+		func(forceFull bool) error {
+			assert.False(t, forceFull)
+			changedSession, getErr := f.db.GetSession(t.Context(), "changed")
+			require.NoError(t, getErr)
+			require.NotNil(t, changedSession)
+			untouchedSession, getErr := f.db.GetSession(t.Context(), "untouched")
+			require.NoError(t, getErr)
+			assert.Nil(t, untouchedSession)
+			return nil
+		},
+	)
+
+	require.NoError(t, err)
+	assert.FileExists(t, untouched)
+}
+
+func TestSyncThenRunForPushStaleArchiveIgnoresBatchAndUsesWorker(t *testing.T) {
+	runnerCalls := 0
+	f := newSyncRouteFixture(t,
+		withStaleDB(),
+		withLocalResyncRunner(func(
+			context.Context, func(syncpkg.Progress),
+		) (syncpkg.SyncStats, error) {
+			runnerCalls++
+			return syncpkg.SyncStats{}, nil
+		}),
+	)
+	path := f.writeClaudeSession(t, "proj/changed.jsonl", "stale scoped push")
+	engine := f.srv.syncEngineForLocal(f.db)
+	t.Cleanup(engine.Close)
+	batch := syncpkg.WatchBatch{Paths: []string{path}}
+	workCalls := 0
+
+	err := f.srv.syncThenRunForPush(
+		t.Context(), engine, f.db, false, &batch, nil,
+		func(forceFull bool) error {
+			workCalls++
+			assert.True(t, forceFull)
+			return nil
+		},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, runnerCalls)
+	assert.Equal(t, 1, workCalls)
+	assertSessionCount(t, f.db, 0)
+}
+
+func TestPGPushRejectsMalformedWatchScopeBeforeSSE(t *testing.T) {
+	f := newSyncRouteFixture(t)
+	tests := []struct {
+		name  string
+		body  map[string]any
+		match string
+	}{
+		{
+			name: "full batch retains path",
+			body: map[string]any{
+				"watch_batch": map[string]any{
+					"full_sync": true,
+					"paths":     []string{"/sessions/changed.jsonl"},
+				},
+				"watch_recovery": map[string]any{},
+			},
+			match: "full watch batch",
+		},
+		{
+			name:  "recovery without batch",
+			body:  map[string]any{"watch_recovery": map[string]any{}},
+			match: "watch recovery requires",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.body["full"] = false
+			tt.body["pg"] = map[string]any{
+				"url":            "postgres://nobody:nobody@127.0.0.1:1/test?sslmode=disable",
+				"schema":         "agentsview",
+				"machine_name":   "test",
+				"allow_insecure": false,
+			}
+			w := serveJSON(
+				t, f.handler, http.MethodPost, "/api/v1/push/pg", tt.body,
+				withAccept("text/event-stream"),
+			)
+			require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+			assert.Contains(t, w.Body.String(), tt.match)
+			assert.NotContains(t, w.Header().Get("Content-Type"), "text/event-stream")
+		})
+	}
+}
+
+func TestPGPushRejectsWatchPathsOutsideStartupProviderRoots(t *testing.T) {
+	f := newSyncRouteFixture(t)
+	outside := filepath.Join(t.TempDir(), "session.jsonl")
+	for _, tt := range []struct {
+		name  string
+		body  map[string]any
+		match string
+	}{
+		{
+			name: "changed path", match: "watch path",
+			body: map[string]any{"watch_batch": map[string]any{
+				"paths": []string{outside},
+			}},
+		},
+		{
+			name: "UNC changed path", match: "watch path",
+			body: map[string]any{"watch_batch": map[string]any{
+				"paths": []string{`\\server\share\session.jsonl`},
+			}},
+		},
+		{
+			name: "reconciliation root", match: "watch reconciliation root",
+			body: map[string]any{"watch_batch": map[string]any{
+				"reconcile_roots": []string{outside},
+			}},
+		},
+		{
+			name: "rename path", match: "watch rename path",
+			body: map[string]any{
+				"watch_batch": map[string]any{"renames": []map[string]any{{
+					"path": outside, "root": f.claudeDir, "item_type": 1,
+				}}},
+				"watch_recovery": map[string]any{},
+			},
+		},
+		{
+			name: "rename root", match: "watch rename root",
+			body: map[string]any{
+				"watch_batch": map[string]any{"renames": []map[string]any{{
+					"path": filepath.Join(f.claudeDir, "session.jsonl"),
+					"root": outside, "item_type": 1,
+				}}},
+				"watch_recovery": map[string]any{},
+			},
+		},
+		{
+			name: "available recovery root", match: "watch recovery root",
+			body: map[string]any{
+				"watch_batch": map[string]any{"full_sync": true},
+				"watch_recovery": map[string]any{
+					"available_roots": []string{outside},
+				},
+			},
+		},
+		{
+			name: "deferred recovery root", match: "watch recovery root",
+			body: map[string]any{
+				"watch_batch": map[string]any{"full_sync": true},
+				"watch_recovery": map[string]any{
+					"deferred_roots": []string{outside},
+				},
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.body["full"] = false
+			tt.body["pg"] = map[string]any{
+				"url":            "postgres://nobody:nobody@127.0.0.1:1/test?sslmode=disable",
+				"schema":         "agentsview",
+				"machine_name":   "test",
+				"allow_insecure": false,
+			}
+			w := serveJSON(
+				t, f.handler, http.MethodPost, "/api/v1/push/pg",
+				tt.body,
+				withAccept("text/event-stream"),
+			)
+
+			require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+			assert.Contains(t, w.Body.String(), tt.match)
+			assert.NotContains(t, w.Header().Get("Content-Type"), "text/event-stream")
+		})
+	}
+}
+
+func TestValidatePushWatchScopeAcceptsConfiguredAndProviderWatchRoots(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	index := filepath.Join(filepath.Dir(root), parser.CodexSessionIndexFilename)
+	cfg := config.Config{AgentDirs: map[parser.AgentType][]string{
+		parser.AgentCodex: {root},
+	}}
+
+	require.NoError(t, validatePushWatchScope(t.Context(), daemonPushRequest{
+		WatchBatch: &syncpkg.WatchBatch{Paths: []string{
+			filepath.Join(root, "2026", "session.jsonl"), index,
+		}},
+	}, cfg))
 }
 
 // TestPGPushFullRoutesResyncThroughWorkerRunner is the handler-level twin of

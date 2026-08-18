@@ -32,22 +32,22 @@ func ZedSQLiteSessionExists(dbPath, sessionID string) bool {
 		return false
 	}
 	defer db.Close()
-
+	shape, err := inspectZedSchema(context.Background(), db)
+	if err != nil {
+		return false
+	}
 	var found int
-	err = db.QueryRow(
-		`SELECT 1
-		   FROM threads
-		  WHERE id = ?
-		    AND COALESCE(parent_id, '') = ''
-		  LIMIT 1`,
-		sessionID,
-	).Scan(&found)
+	err = db.QueryRow(fmt.Sprintf(`SELECT 1 FROM threads WHERE id = ? %s LIMIT 1`, shape.parentFilter()), sessionID).Scan(&found)
 	return err == nil
 }
 
 // ZedSQLiteSourceMtime resolves the per-thread updated_at timestamp
 // for a virtual Zed SQLite source path.
 func ZedSQLiteSourceMtime(path string) (int64, error) {
+	return ZedSQLiteSourceMtimeContext(context.Background(), path)
+}
+
+func ZedSQLiteSourceMtimeContext(ctx context.Context, path string) (int64, error) {
 	dbPath, sessionID, ok := parseZedVirtualPath(path)
 	if !ok {
 		return 0, fmt.Errorf("not a zed sqlite virtual path: %s", path)
@@ -57,16 +57,12 @@ func ZedSQLiteSourceMtime(path string) (int64, error) {
 		return 0, err
 	}
 	defer db.Close()
-
+	shape, err := inspectZedSchema(ctx, db)
+	if err != nil {
+		return 0, err
+	}
 	var updatedAt string
-	err = db.QueryRow(
-		`SELECT COALESCE(updated_at, '')
-		   FROM threads
-		  WHERE id = ?
-		    AND COALESCE(parent_id, '') = ''
-		  LIMIT 1`,
-		sessionID,
-	).Scan(&updatedAt)
+	err = db.QueryRowContext(ctx, fmt.Sprintf(`SELECT COALESCE(updated_at, '') FROM threads WHERE id = ? %s LIMIT 1`, shape.parentFilter()), sessionID).Scan(&updatedAt)
 	if err != nil {
 		return 0, fmt.Errorf("loading zed thread mtime %s: %w", sessionID, err)
 	}
@@ -98,14 +94,105 @@ func ForEachZedThreadMeta(
 	ctx context.Context, conn *sql.DB, dbPath string,
 	yield func(ZedThreadMeta) error,
 ) error {
-	rows, err := conn.QueryContext(ctx,
-		`SELECT id, COALESCE(updated_at, '')
-		   FROM threads
-		  WHERE COALESCE(parent_id, '') = ''
-		  ORDER BY updated_at, id`,
-	)
+	shape, err := inspectZedSchema(ctx, conn)
 	if err != nil {
-		return fmt.Errorf("listing zed thread metas: %w", err)
+		return wrapZedListingError(err)
+	}
+	return forEachZedThreadMeta(ctx, conn, dbPath, shape, yield)
+}
+
+type zedSchema struct {
+	hasParent, hasFolderPaths, hasCreatedAt bool
+}
+
+const (
+	zedListingError = "listing zed thread metas"
+	zedLoadingError = "loading zed thread"
+)
+
+func wrapZedListingError(err error) error {
+	return fmt.Errorf("%s: %w", zedListingError, err)
+}
+
+func wrapZedLoadingError(rawID string, err error) error {
+	return fmt.Errorf("%s %s: %w", zedLoadingError, rawID, err)
+}
+
+func inspectZedSchema(ctx context.Context, conn *sql.DB) (zedSchema, error) {
+	var shape zedSchema
+	var table int
+	if err := conn.QueryRowContext(ctx, `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads'`).Scan(&table); err != nil {
+		if err == sql.ErrNoRows {
+			return shape, fmt.Errorf("missing Zed threads table")
+		}
+		return shape, fmt.Errorf("inspecting Zed threads table: %w", err)
+	}
+	required := map[string]bool{"id": false, "summary": false, "updated_at": false, "data_type": false, "data": false}
+	rows, err := conn.QueryContext(ctx, `PRAGMA table_info(threads)`)
+	if err != nil {
+		return shape, fmt.Errorf("inspecting Zed threads schema: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return shape, fmt.Errorf("scanning Zed threads schema: %w", err)
+		}
+		switch name {
+		case "parent_id":
+			shape.hasParent = true
+		case "folder_paths":
+			shape.hasFolderPaths = true
+		case "created_at":
+			shape.hasCreatedAt = true
+		}
+		if _, ok := required[name]; ok {
+			required[name] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return shape, fmt.Errorf("reading Zed threads schema: %w", err)
+	}
+	for name, present := range required {
+		if !present {
+			return shape, fmt.Errorf("missing required Zed threads column %s", name)
+		}
+	}
+	return shape, nil
+}
+
+func (s zedSchema) parentFilter() string {
+	if s.hasParent {
+		return ` AND COALESCE(parent_id, '') = ''`
+	}
+	return ""
+}
+func (s zedSchema) parentExpr() string {
+	if s.hasParent {
+		return `COALESCE(parent_id, '')`
+	}
+	return `''`
+}
+func (s zedSchema) folderExpr() string {
+	if s.hasFolderPaths {
+		return `COALESCE(folder_paths, '')`
+	}
+	return `''`
+}
+func (s zedSchema) createdExpr() string {
+	if s.hasCreatedAt {
+		return `COALESCE(created_at, '')`
+	}
+	return `''`
+}
+
+func forEachZedThreadMeta(ctx context.Context, conn *sql.DB, dbPath string, shape zedSchema, yield func(ZedThreadMeta) error) error {
+	rows, err := conn.QueryContext(ctx, fmt.Sprintf(`SELECT id, COALESCE(updated_at, '') FROM threads WHERE 1=1%s ORDER BY updated_at, id`, shape.parentFilter()))
+	if err != nil {
+		return wrapZedListingError(err)
 	}
 	defer rows.Close()
 
@@ -135,15 +222,21 @@ func ForEachZedThreadMeta(
 func parseZedThreadFromDB(
 	conn *sql.DB, dbPath, rawID, machine string, dbInfo os.FileInfo,
 ) (*ParseResult, error) {
+	shape, err := inspectZedSchema(context.Background(), conn)
+	if err != nil {
+		return nil, wrapZedLoadingError(rawID, err)
+	}
+	return parseZedThreadFromDBWithSchema(context.Background(), conn, dbPath, rawID, machine, dbInfo, shape)
+}
+
+func parseZedThreadFromDBWithSchema(
+	ctx context.Context, conn *sql.DB, dbPath, rawID, machine string, dbInfo os.FileInfo, shape zedSchema,
+) (*ParseResult, error) {
 	var row zedThreadRow
 	row.id = rawID
-	err := conn.QueryRow(
-		`SELECT COALESCE(summary, ''), COALESCE(updated_at, ''),
-		        COALESCE(data_type, ''), data, COALESCE(parent_id, ''),
-		        COALESCE(folder_paths, ''), COALESCE(created_at, '')
-		   FROM threads
-		  WHERE id = ?
-		    AND COALESCE(parent_id, '') = ''`,
+	err := conn.QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT COALESCE(summary, ''), COALESCE(updated_at, ''), COALESCE(data_type, ''), data, %s, %s, %s FROM threads WHERE id = ?%s`,
+		shape.parentExpr(), shape.folderExpr(), shape.createdExpr(), shape.parentFilter()),
 		rawID,
 	).Scan(
 		&row.summary, &row.updatedAt, &row.dataType, &row.data,
@@ -153,7 +246,7 @@ func parseZedThreadFromDB(
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("loading zed thread %s: %w", rawID, err)
+		return nil, wrapZedLoadingError(rawID, err)
 	}
 	result, ok := buildZedParseResult(row, dbPath, dbInfo, machine)
 	if !ok {

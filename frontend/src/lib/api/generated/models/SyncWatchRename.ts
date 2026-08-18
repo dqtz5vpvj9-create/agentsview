@@ -2,9 +2,9 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-export type ActivityReportInterval = {
-  end: string;
-  session_id: string;
-  start: string;
+export type SyncWatchRename = {
+  agent?: string;
+  item_type?: number;
+  path: string;
+  root?: string;
 };
-

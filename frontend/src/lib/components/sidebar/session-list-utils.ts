@@ -4,8 +4,8 @@ import type {
 } from "../../stores/sessions.svelte.js";
 
 export const ITEM_HEIGHT = 42;
-export const CHILD_ITEM_HEIGHT = 34;
-export const TEAM_HEADER_HEIGHT = 28;
+const CHILD_ITEM_HEIGHT = 34;
+const TEAM_HEADER_HEIGHT = 28;
 export const HEADER_HEIGHT = 28;
 export const OVERSCAN = 10;
 export const STORAGE_KEY = "agentsview-group-by-agent";
@@ -114,14 +114,6 @@ export function buildGroupSections(
   return Array.from(map.entries())
     .sort((a, b) => b[1].length - a[1].length)
     .map(([label, groups]) => ({ label, groups }));
-}
-
-/** @deprecated Use buildGroupSections */
-export function buildAgentSections(
-  groups: SessionGroup[],
-  groupByAgent: boolean,
-): GroupSection[] {
-  return buildGroupSections(groups, groupByAgent ? "agent" : "none");
 }
 
 /** Check if a session is a teammate (received a <teammate-message>). */

@@ -39,6 +39,7 @@ type fakeCLIPreparedHTTPRebuild struct {
 	closed        int
 	released      bool
 	closeReleased bool
+	committed     int
 }
 
 type cliLifecycleError struct{ err error }
@@ -56,6 +57,20 @@ func (p *fakeCLIPreparedHTTPRebuild) Close() error {
 	p.closed++
 	p.closeReleased = p.released
 	return nil
+}
+
+func (p *fakeCLIPreparedHTTPRebuild) Commit() error {
+	p.committed++
+	return nil
+}
+
+func TestPreparedHTTPRebuildLeaseCLIForwardsCommitOnce(t *testing.T) {
+	prepared := &fakeCLIPreparedHTTPRebuild{}
+	lease := &preparedHTTPRebuildLeaseCLI{prepared: prepared, release: func() {}}
+	require.NoError(t, lease.Commit())
+	require.NoError(t, lease.Commit())
+	assert.Equal(t, 1, prepared.committed)
+	assert.Zero(t, prepared.closed, "commit must not infer cleanup")
 }
 
 func newDirectSyncFixture(t *testing.T) (config.Config, *db.DB) {
@@ -142,8 +157,10 @@ func TestDoSyncConfiguredFullUsesUnifiedHTTPContributorBeforeSSH(t *testing.T) {
 	}}}
 	originalPrepare := prepareHTTPRebuildCLI
 	prepareHTTPRebuildCLI = func(
-		context.Context, []remotesync.HTTPSync,
+		_ context.Context, syncs []remotesync.HTTPSync,
 	) (preparedHTTPRebuildCLI, error) {
+		require.Len(t, syncs, 1)
+		assert.Equal(t, remotesync.FullImportExplicit, syncs[0].FullReason)
 		order = append(order, "prepare")
 		return prepared, nil
 	}
@@ -293,8 +310,10 @@ func TestDoSyncAutomaticResyncUsesUnifiedHTTPContributor(t *testing.T) {
 	prepareCalls := 0
 	originalPrepare := prepareHTTPRebuildCLI
 	prepareHTTPRebuildCLI = func(
-		context.Context, []remotesync.HTTPSync,
+		_ context.Context, syncs []remotesync.HTTPSync,
 	) (preparedHTTPRebuildCLI, error) {
+		require.Len(t, syncs, 1)
+		assert.Equal(t, remotesync.FullImportDataRebuild, syncs[0].FullReason)
 		prepareCalls++
 		return prepared, nil
 	}
@@ -623,6 +642,7 @@ func TestDoSyncConfiguredFullUnifiedHTTPUsesManifestDeltaAndOrderedProgress(
 	}}
 	var archiveRequests atomic.Int32
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remotesync.SetProtocolHeader(w.Header())
 		switch r.URL.Path {
 		case "/api/v1/remote-sync/targets":
 			w.Header().Set("Content-Type", "application/json")
@@ -2232,6 +2252,7 @@ func TestRemoteFailureDisplaySanitizesHTTPErrors(t *testing.T) {
 func TestRunHTTPRemoteSyncReachesMirrorPath(t *testing.T) {
 	manifestRequests := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remotesync.SetProtocolHeader(w.Header())
 		switch r.URL.Path {
 		case "/api/v1/remote-sync/targets":
 			w.Header().Set("Content-Type", "application/json")

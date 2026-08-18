@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -49,7 +50,16 @@ func newRemoteSyncServer(t *testing.T) (*Server, http.Handler, string) {
 			parser.AgentClaude: {claudeDir},
 		},
 	}, database, nil)
-	return srv, srv.Handler(), sessionPath
+	return srv, currentRemoteSyncHandler(srv.Handler()), sessionPath
+}
+
+func currentRemoteSyncHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/remote-sync/") {
+			remotesync.SetProtocolHeader(r.Header)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func TestRemoteSyncTargetsRequiresBearerAndBypassesHostCheck(t *testing.T) {
@@ -61,7 +71,41 @@ func TestRemoteSyncTargetsRequiresBearerAndBypassesHostCheck(t *testing.T) {
 	handler.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	assert.Equal(t, strconv.Itoa(remotesync.ProtocolVersion),
+		w.Header().Get(remotesync.ProtocolHeader))
 	assert.Contains(t, w.Body.String(), "claude")
+}
+
+func TestRemoteSyncRoutesRejectMissingProtocolHandshake(t *testing.T) {
+	srv, _, _ := newRemoteSyncServer(t)
+	for _, test := range []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodGet, path: "/api/v1/remote-sync/targets"},
+		{method: http.MethodPost, path: "/api/v1/remote-sync/manifest"},
+		{method: http.MethodPost, path: "/api/v1/remote-sync/archive"},
+	} {
+		t.Run(test.path, func(t *testing.T) {
+			req := httptest.NewRequest(test.method, test.path, strings.NewReader(`{}`))
+			req.Header.Set("Authorization", "Bearer remote-token")
+			w := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(w, req)
+
+			assert.Equal(t, http.StatusUpgradeRequired, w.Code)
+		})
+	}
+}
+
+func TestRemoteSyncTargetsRejectsMismatchedProtocol(t *testing.T) {
+	srv, _, _ := newRemoteSyncServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/remote-sync/targets", nil)
+	req.Header.Set("Authorization", "Bearer remote-token")
+	req.Header.Set(remotesync.ProtocolHeader, "2")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUpgradeRequired, w.Code)
 }
 
 func TestRemoteSyncArchiveRejectsUnresolvedPath(t *testing.T) {
@@ -74,6 +118,53 @@ func TestRemoteSyncArchiveRejectsUnresolvedPath(t *testing.T) {
 	handler.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestRemoteSyncRoutesExportLocallyDisabledProvider(t *testing.T) {
+	dir := t.TempDir()
+	database := dbtest.OpenTestDBAt(t, filepath.Join(dir, "test.db"))
+	claudeDir := filepath.Join(dir, "claude")
+	geminiDir := filepath.Join(dir, "gemini")
+	require.NoError(t, os.MkdirAll(claudeDir, 0o755))
+	require.NoError(t, os.MkdirAll(geminiDir, 0o755))
+	srv := New(config.Config{
+		Host:           "127.0.0.1",
+		Port:           8080,
+		DataDir:        dir,
+		DBPath:         filepath.Join(dir, "test.db"),
+		AuthToken:      "remote-token",
+		DisabledAgents: []parser.AgentType{parser.AgentGemini},
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {claudeDir},
+			parser.AgentGemini: {geminiDir},
+		},
+	}, database, nil)
+	handler := currentRemoteSyncHandler(srv.Handler())
+
+	targetReq := httptest.NewRequest(http.MethodGet, "/api/v1/remote-sync/targets", nil)
+	targetReq.Header.Set("Authorization", "Bearer remote-token")
+	targetW := httptest.NewRecorder()
+	handler.ServeHTTP(targetW, targetReq)
+	require.Equal(t, http.StatusOK, targetW.Code, "body: %s", targetW.Body.String())
+	var targets remotesync.TargetSet
+	require.NoError(t, json.Unmarshal(targetW.Body.Bytes(), &targets))
+	assert.Equal(t, []string{geminiDir}, targets.Dirs[parser.AgentGemini])
+
+	payload, err := json.Marshal(remotesync.TargetSet{
+		Dirs: map[parser.AgentType][]string{parser.AgentGemini: {geminiDir}},
+	})
+	require.NoError(t, err)
+	for _, path := range []string{
+		"/api/v1/remote-sync/manifest",
+		"/api/v1/remote-sync/archive",
+	} {
+		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer remote-token")
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code, "path: %s; body: %s", path, w.Body.String())
+	}
 }
 
 func TestRemoteSyncArchiveStreamsTar(t *testing.T) {
@@ -129,7 +220,7 @@ func TestRemoteSyncHermesSessionlessProfileCannotExposeCredentials(t *testing.T)
 			parser.AgentHermes: {profileRoot},
 		},
 	}, database, nil)
-	handler := srv.Handler()
+	handler := currentRemoteSyncHandler(srv.Handler())
 
 	targetReq := httptest.NewRequest(http.MethodGet, "/api/v1/remote-sync/targets", nil)
 	targetReq.Header.Set("Authorization", "Bearer remote-token")
@@ -176,7 +267,7 @@ func TestRemoteSyncHermesFlatCustomRootStreamsTranscripts(t *testing.T) {
 			parser.AgentHermes: {root},
 		},
 	}, database, nil)
-	handler := srv.Handler()
+	handler := currentRemoteSyncHandler(srv.Handler())
 
 	targetReq := httptest.NewRequest(http.MethodGet, "/api/v1/remote-sync/targets", nil)
 	targetReq.Header.Set("Authorization", "Bearer remote-token")
@@ -270,7 +361,7 @@ func TestRemoteSyncHermesSidecarRemovalRaces(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			handler, targets, wal, removeWAL := newHermesRemoteSyncServer(t)
-			assert.Contains(t, targets.ExtraFiles, wal)
+			assert.Contains(t, targets.AllExtraFiles(), wal)
 			tt.run(t, handler, targets, wal, removeWAL)
 		})
 	}
@@ -329,7 +420,7 @@ func newHermesRemoteSyncServer(
 			parser.AgentHermes: {profileRoot},
 		},
 	}, database, nil)
-	handler := srv.Handler()
+	handler := currentRemoteSyncHandler(srv.Handler())
 	targetReq := httptest.NewRequest(http.MethodGet, "/api/v1/remote-sync/targets", nil)
 	targetReq.Header.Set("Authorization", "Bearer remote-token")
 	targetW := httptest.NewRecorder()
@@ -371,7 +462,7 @@ func newWindsurfRemoteSyncServer(t *testing.T) (http.Handler, remotesync.TargetS
 			parser.AgentWindsurf: {windsurfRoot},
 		},
 	}, database, nil)
-	handler := srv.Handler()
+	handler := currentRemoteSyncHandler(srv.Handler())
 
 	targetReq := httptest.NewRequest(http.MethodGet, "/api/v1/remote-sync/targets", nil)
 	targetReq.Header.Set("Authorization", "Bearer remote-token")

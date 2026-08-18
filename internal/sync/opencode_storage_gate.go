@@ -103,7 +103,7 @@ func (e *Engine) storageTrustSnapshotFor(path string) storageTrustSnapshot {
 func (e *Engine) openCodeStorageSessionGateState(
 	file parser.DiscoveredFile,
 ) (string, storageTrustSnapshot, bool) {
-	if e.forceParse || file.ForceParse {
+	if e.forceParseRequested(file) {
 		return "", storageTrustSnapshot{}, false
 	}
 	sessionPath := e.openCodeStorageSessionPath(file)

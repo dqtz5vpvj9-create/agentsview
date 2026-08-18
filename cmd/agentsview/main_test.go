@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
@@ -32,6 +33,27 @@ import (
 	agentsync "go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
+
+type cursorSecretRecorder struct {
+	secret []byte
+}
+
+func (recorder *cursorSecretRecorder) SetCursorSecret(secret []byte) {
+	recorder.secret = append([]byte(nil), secret...)
+}
+
+func TestApplyRequiredCursorSecret(t *testing.T) {
+	recorder := &cursorSecretRecorder{}
+	err := applyRequiredCursorSecret(recorder, config.Config{})
+	assert.ErrorContains(t, err, "cursor secret is not configured")
+
+	want := []byte("configured cursor secret")
+	err = applyRequiredCursorSecret(recorder, config.Config{
+		CursorSecret: base64.StdEncoding.EncodeToString(want),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, want, recorder.secret)
+}
 
 func TestRuntimeWarningHelper(t *testing.T) {
 	logOutput := captureLogOutput(t)
@@ -601,6 +623,23 @@ func TestCollectWatchRootsPreservesDirsSharingWatchRoot(t *testing.T) {
 	assert.Equal(t, []watchScope{{agent: parser.AgentCodex, syncDir: archivedDir}}, archived.scopes)
 	assert.Equal(t, []string{archivedDir}, archived.pendingPollingDirs)
 	assert.Empty(t, archived.persistentPollingDirs)
+}
+
+func TestCollectWatchRootsOmitsLocallyDisabledProvider(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Config{
+		DisabledAgents: []parser.AgentType{parser.AgentGemini},
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentGemini: {root},
+		},
+	}
+
+	roots, unwatched, symlinkGated, persistent := collectWatchRoots(cfg)
+
+	assert.Empty(t, roots)
+	assert.Empty(t, unwatched)
+	assert.Empty(t, symlinkGated)
+	assert.Empty(t, persistent)
 }
 
 func TestCollectWatchRootsPollsRecursiveSymlinkProviderRoot(t *testing.T) {

@@ -99,6 +99,7 @@ describe("ToolBlock output section", () => {
 
     // Output content pre block should not be present when output is collapsed.
     expect(document.querySelector(".output-content")).toBeNull();
+    expect(document.querySelector(".output-mode")).toBeNull();
   });
 
   it("expands output content on clicking output-header", async () => {
@@ -123,6 +124,71 @@ describe("ToolBlock output section", () => {
     const outputContent = document.querySelector(".output-content");
     expect(outputContent).not.toBeNull();
     expect(outputContent!.textContent).toBe(resultText);
+  });
+
+  it("switches the expanded current output between raw and formatted modes", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "Read",
+      category: "Read",
+      result_content: "# Result\n\n**bold** <script>alert(1)</script>",
+    };
+    component = mount(ToolBlock, { target: document.body, props: { content: "", toolCall } });
+    await tick();
+    document.querySelector<HTMLButtonElement>(".tool-header")!.click();
+    await tick();
+    document.querySelector<HTMLButtonElement>(".output-header")!.click();
+    await tick();
+    expect(document.querySelector(".output-mode")).not.toBeNull();
+    expect(document.querySelector(".formatted-output")).toBeNull();
+    const formatted = Array.from(document.querySelectorAll<HTMLButtonElement>(".output-mode button"))
+      .find((button) => button.textContent?.trim() === "Formatted");
+    expect(formatted).not.toBeNull();
+    formatted!.click();
+    await tick();
+    expect(document.querySelector(".formatted-output h1")?.textContent).toBe("Result");
+    expect(document.querySelector(".formatted-output script")).toBeNull();
+  });
+
+  it("keeps canonical path metadata accessible without labelling ordinary metadata", async () => {
+    const longPath = "/workspace/packages/agentsview/frontend/src/lib/components/content/ToolBlock.svelte";
+    const toolCall: ToolCall = {
+      tool_name: "Read",
+      category: "Read",
+      input_json: JSON.stringify({ file_path: longPath }),
+    };
+    component = mount(ToolBlock, { target: document.body, props: { content: "", toolCall } });
+    await tick();
+    document.querySelector<HTMLButtonElement>(".tool-header")!.click();
+    await tick();
+
+    const file = document.querySelector(".meta-tag");
+    expect(file?.textContent).toContain("content/ToolBlock.svelte");
+    expect(file?.querySelector(".kit-sr-only")?.textContent).toBe(longPath);
+    expect(file?.querySelector("[aria-label]")).toBeNull();
+    expect(document.querySelector(".meta-tag:nth-child(2) [aria-label]")).toBeNull();
+  });
+
+  it("highlights search matches and fenced code in formatted output", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "Read",
+      category: "Read",
+      result_content: "```ts\nconst target = true;\n```",
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", toolCall, highlightQuery: "target" },
+    });
+    await tick();
+    document.querySelector<HTMLButtonElement>(".tool-header")!.click();
+    await tick();
+    document.querySelector<HTMLButtonElement>(".output-header")!.click();
+    await tick();
+    document.querySelector<HTMLButtonElement>(".output-mode button:nth-child(2)")!.click();
+    await tick();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const formatted = document.querySelector(".formatted-output");
+    expect(formatted?.querySelector("code[class*='language-']")).not.toBeNull();
+    expect(formatted?.querySelector("mark.search-highlight")?.textContent).toBe("target");
   });
 
   it("shows first line as preview when output is collapsed", async () => {

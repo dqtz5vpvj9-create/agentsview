@@ -99,6 +99,28 @@ func TestSyncWorkerStartupModeSyncsAndEmitsTerminalResult(t *testing.T) {
 		"public SyncStats fields must survive the NDJSON protocol")
 }
 
+func TestSyncWorkerAuditModeForwardsReconciliationProgress(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	var out bytes.Buffer
+	require.NoError(t, runSyncWorker(cfg, "audit", &out))
+
+	sawActiveProgress := false
+	sc := bufio.NewScanner(&out)
+	for sc.Scan() {
+		var line workerLine
+		require.NoError(t, json.Unmarshal(sc.Bytes(), &line),
+			"every stdout line must be a workerLine JSON object")
+		if line.Progress != nil &&
+			line.Progress.Phase == sync.PhaseSyncing &&
+			line.Progress.SessionsDone > 0 {
+			sawActiveProgress = true
+		}
+	}
+	require.NoError(t, sc.Err())
+	assert.True(t, sawActiveProgress,
+		"audit worker must forward active reconciliation progress")
+}
+
 func TestSyncWorkerStartupUsesConfiguredSourceMachine(t *testing.T) {
 	cfg := testConfigWithClaudeFixture(t)
 	claudeRoot := cfg.AgentDirs[parser.AgentClaude][0]
@@ -131,6 +153,22 @@ func TestSyncWorkerReportsAbortAsFailure(t *testing.T) {
 	result := decodeSingleResult(t, &out)
 	assert.Equal(t, "aborted", result.Status)
 	assert.False(t, result.DiscoveryComplete)
+}
+
+func TestWorkerResultPreservesTombstonesAcrossProtocol(t *testing.T) {
+	result := workerResultFromStats(context.Background(), sync.SyncStats{
+		Tombstoned: 2,
+		Aborted:    true,
+	})
+	var wire bytes.Buffer
+	require.NoError(t, json.NewEncoder(&wire).Encode(workerLine{Result: &result}))
+
+	decoded, err := readWorkerResult(&wire, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 2, decoded.Tombstoned,
+		"the terminal summary must carry committed tombstones")
+	assert.Equal(t, 2, statsFromWorkerResult(decoded).Tombstoned,
+		"the daemon-side stats must retain tombstones after JSON decoding")
 }
 
 func TestSyncWorkerFailsWhenWriteLockHeld(t *testing.T) {

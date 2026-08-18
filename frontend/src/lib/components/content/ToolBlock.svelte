@@ -8,12 +8,15 @@
     extractToolParamMeta,
     generateFallbackContent,
   } from "../../utils/tool-params.js";
+  import type { MetaTag } from "../../utils/tool-params.js";
   import { m } from "../../i18n/index.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
   import { applyHighlight, escapeHTML } from "../../utils/highlight.js";
+  import { highlightCodeFences } from "../../utils/highlight-fences.js";
   import { ChevronRightIcon } from "../../icons.js";
-  import { summarizeToolCall } from "../../utils/tool-summary.js";
-  import { CopyButton } from "@kenn-io/kit-ui";
+  import { summarizeToolCall, summarizeToolCallPath } from "../../utils/tool-summary.js";
+  import { CopyButton, SegmentedControl, type SegmentedControlOption } from "@kenn-io/kit-ui";
+  import { renderMarkdown } from "../../utils/markdown.js";
 
   interface Props {
     content: string;
@@ -137,6 +140,7 @@
   let prevQuery: string = "";
   let inputCopied: boolean = $state(false);
   let outputCopied: boolean = $state(false);
+  let outputMode: "raw" | "formatted" = $state("raw");
   let inputCopyTimer: ReturnType<typeof setTimeout> | undefined;
   let outputCopyTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -219,6 +223,13 @@
   let structuredSummary = $derived(
     toolCall ? summarizeToolCall(toolCall) : null,
   );
+  let structuredSummaryTitle = $derived(
+    toolCall ? summarizeToolCallPath(toolCall) : null,
+  );
+  const outputModeOptions = $derived<SegmentedControlOption[]>([
+    { value: "raw", label: m.tool_block_raw() },
+    { value: "formatted", label: m.tool_block_formatted() },
+  ]);
 
   /** Legacy fallback: first line of display content, shown collapsed-only
    *  when no structured summary is available. */
@@ -282,7 +293,7 @@
   });
 
   /** Combined metadata for any tool type */
-  let metaTags = $derived(
+  let metaTags = $derived<MetaTag[] | null>(
     taskMeta ??
       taskCreateMeta ??
       taskUpdateMeta ??
@@ -409,7 +420,11 @@
         <span class="tool-label">{label}</span>
       {/if}
       {#if structuredSummary}
-        <span class="tool-preview">{structuredSummary}</span>
+        <span class="tool-preview" title={structuredSummaryTitle ?? undefined}>
+          {structuredSummary}{#if structuredSummaryTitle}
+            <span class="kit-sr-only">{structuredSummaryTitle}</span>
+          {/if}
+        </span>
       {:else if collapsed && legacyPreview}
         <span class="tool-preview">{legacyPreview}</span>
       {/if}
@@ -439,10 +454,16 @@
   {#if !collapsed}
     {#if metaTags}
       <div class="tool-meta">
-        {#each metaTags as { label: metaLabel, value }}
+        {#each metaTags as { label: metaLabel, value, displayValue }}
           <span class="meta-tag">
             <span class="meta-label">{metaLabel}:</span>
-            {value}
+            {#if displayValue}
+              <span class="meta-value" title={value}>
+                {displayValue}<span class="kit-sr-only">{value}</span>
+              </span>
+            {:else}
+              <span>{value}</span>
+            {/if}
           </span>
         {/each}
       </div>
@@ -491,6 +512,15 @@
             <span class="tool-preview">{outputPreviewLine}</span>
           {/if}
         </button>
+        {#if !outputCollapsed}
+          <SegmentedControl
+            class="output-mode"
+            options={outputModeOptions}
+            value={outputMode}
+            ariaLabel={m.tool_block_output_mode()}
+            onchange={(next) => (outputMode = next as "raw" | "formatted")}
+          />
+        {/if}
         {#if toolCall.result_content}
           <CopyButton
             class="tool-copy output-copy"
@@ -505,7 +535,17 @@
         {/if}
       </div>
       {#if !outputCollapsed}
-        <pre class="tool-content output-content" use:applyHighlight={{ q: highlightQuery, current: isCurrentHighlight, content: toolCall.result_content }}>{@html escapeHTML(toolCall.result_content)}</pre>
+        {#if outputMode === "formatted"}
+          <div
+            class="tool-content output-content formatted-output"
+            use:applyHighlight={{ q: highlightQuery, current: isCurrentHighlight, content: toolCall.result_content }}
+            use:highlightCodeFences={{ q: highlightQuery, current: isCurrentHighlight, content: toolCall.result_content }}
+          >
+            {@html renderMarkdown(toolCall.result_content)}
+          </div>
+        {:else}
+          <pre class="tool-content output-content" use:applyHighlight={{ q: highlightQuery, current: isCurrentHighlight, content: toolCall.result_content }}>{@html escapeHTML(toolCall.result_content)}</pre>
+        {/if}
       {/if}
     {/if}
     {#if resultEvents.length > 0}
@@ -724,6 +764,30 @@
     user-select: text;
     flex: 1 1 auto;
     min-width: 0;
+  }
+
+  :global(.tool-block .output-mode) {
+    flex: 0 0 auto;
+    margin-left: auto;
+  }
+
+  .formatted-output :global(pre) {
+    white-space: pre-wrap;
+  }
+
+  .tool-preview,
+  .meta-value {
+    position: relative;
+  }
+
+  :global(.tool-preview .kit-sr-only),
+  :global(.meta-tag .kit-sr-only) {
+    left: 0;
+    top: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .output-header:hover {

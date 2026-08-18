@@ -848,3 +848,74 @@ func TestIncrementalSignalMaintainerDeclinesForUserMessage(t *testing.T) {
 		"the fallback recompute must keep the signal version current")
 	require.Equal(t, 2, sess.MessageCount)
 }
+
+func TestFullSignalRecomputeRetriesWhenTranscriptRevisionChanges(t *testing.T) {
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122d77"
+	root := t.TempDir()
+	day := filepath.Join(root, "2024", "01", "01")
+	require.NoError(t, os.MkdirAll(day, 0o755))
+	path := filepath.Join(
+		day, "rollout-2024-01-01T10-00-00-"+uuid+".jsonl",
+	)
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/workspace/project", "codex_cli_rs",
+			"2024-01-01T10:00:00Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"user", "start", "2024-01-01T10:00:01Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"assistant", "old answer", "2024-01-01T10:00:02Z",
+		),
+	)
+	require.NoError(t, os.WriteFile(path, []byte(initial), 0o644))
+
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+
+	sessionID := "codex:" + uuid
+	hookCalls := 0
+	_, err := engine.recomputeSignalsFromDBWithHook(
+		t.Context(), sessionID,
+		func(attempt int) {
+			hookCalls++
+			if attempt != 0 {
+				return
+			}
+			appended := testjsonl.JoinJSONL(testjsonl.CodexMsgJSON(
+				"assistant", "new answer", "2024-01-01T10:00:03Z",
+			))
+			f, openErr := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+			require.NoError(t, openErr)
+			_, writeErr := f.WriteString(appended)
+			require.NoError(t, writeErr)
+			require.NoError(t, f.Close())
+			require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+		},
+	)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, hookCalls, 2,
+		"a changed revision must force a fresh snapshot attempt")
+
+	sess, err := database.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TranscriptRevision)
+	stored, ok, err := database.GetSessionSignalState(sessionID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, *sess.TranscriptRevision, stored.TranscriptRevision)
+
+	var state signals.IncrementalState
+	require.NoError(t, state.UnmarshalBinary(stored.State))
+	require.Equal(t, "new answer", state.LastContent,
+		"the current revision must never be stamped onto the stale snapshot")
+}

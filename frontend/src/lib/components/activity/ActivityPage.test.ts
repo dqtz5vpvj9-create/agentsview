@@ -79,7 +79,7 @@ function projectReport(): Report {
     by_model: [],
     by_agent: [],
     by_session: [],
-    intervals: [],
+    sessions_total: 0,
     projects: {},
   } as Report;
 }
@@ -92,8 +92,44 @@ describe("ActivityPage refresh control layout", () => {
   it("keeps the shared refresh control inline with the toolbar filters", () => {
     expect(source).toContain("<RefreshControl");
     expect(source).toContain("activity.lastUpdatedAt");
+    expect(source).toContain("flex: 0 0 220px");
     expect(source).not.toContain("refresh-slot");
     expect(source).not.toContain("margin-left: auto");
+  });
+
+  it("shows report progress in the refresh status instead of the report body", async () => {
+    stubActivityPageCollaborators();
+    activity.report = projectReport();
+    activity.lastUpdatedAt = Date.now() - 3 * 60_000;
+    activity.loading = true;
+    activity.progress = { phase: "scanning_activity", rows_processed: 120 };
+
+    const component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+
+    const refresh = document.body.querySelector(".activity-refresh");
+    expect(refresh?.textContent).toContain("Processing activity… 120 rows");
+    expect(refresh?.textContent).not.toContain("Updated 3m ago");
+    expect(
+      document.body.querySelector(".activity-content")?.textContent,
+    ).not.toContain("Processing activity");
+
+    activity.progress = { phase: "loading_usage" };
+    await flushEffects();
+    expect(refresh?.textContent).toContain("Loading usage…");
+
+    activity.progress = { phase: "finalizing", sessions_processed: 2 };
+    await flushEffects();
+    expect(refresh?.textContent).toContain("Finalizing report…");
+
+    unmount(component);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    activity.report = null;
+    activity.loading = false;
+    activity.progress = null;
+    activity.lastUpdatedAt = null;
   });
 });
 
@@ -125,6 +161,156 @@ describe("ActivityPage breakdown links", () => {
       "/data?project_key=pl1%3Asha256%3Awrong",
     );
     expect(link.getAttribute("title")).toBe("View wrong-project in Data");
+  });
+});
+
+describe("ActivityPage bucket drill-down", () => {
+  let component: ReturnType<typeof mount> | undefined;
+
+  afterEach(() => {
+    if (component) unmount(component);
+    component = undefined;
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    activity.report = null;
+    activity.reportGeneration = 0;
+  });
+
+  it("clears a selected bucket after a same-ID report refresh", async () => {
+    stubActivityPageCollaborators();
+    vi.spyOn(activity, "loadSessionPage").mockResolvedValue(true);
+    activity.reportGeneration = 1;
+    activity.report = {
+      ...projectReport(),
+      report_id: "stable-report",
+      bucket_count: 1,
+      elapsed_bucket_count: 1,
+      buckets: [
+        {
+          start: "2026-07-01T00:00:00Z",
+          end: "2026-07-01T01:00:00Z",
+          max_agents: 1,
+          interactive_at_peak: 1,
+          automated_at_peak: 0,
+          agent_minutes: 20,
+          output_tokens: 0,
+          cost: testMoney(0),
+        },
+      ],
+    } as Report;
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Filter sessions active in this time slot",
+      }),
+    );
+    await flushEffects();
+    expect(screen.getByTitle("Clear time filter")).toBeTruthy();
+
+    activity.reportGeneration = 2;
+    await flushEffects();
+    expect(screen.queryByTitle("Clear time filter")).toBeNull();
+  });
+
+  it("does not show a bucket selection when its page request fails", async () => {
+    stubActivityPageCollaborators();
+    vi.spyOn(activity, "loadSessionPage").mockResolvedValue(false);
+    activity.report = {
+      ...projectReport(),
+      report_id: "stable-report",
+      bucket_count: 1,
+      elapsed_bucket_count: 1,
+      buckets: [{
+        start: "2026-07-01T00:00:00Z",
+        end: "2026-07-01T01:00:00Z",
+        max_agents: 1,
+        interactive_at_peak: 1,
+        automated_at_peak: 0,
+        agent_minutes: 20,
+        output_tokens: 0,
+        cost: testMoney(0),
+      }],
+    } as Report;
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    await fireEvent.click(screen.getByRole("button", {
+      name: "Filter sessions active in this time slot",
+    }));
+    await flushEffects();
+
+    expect(screen.queryByTitle("Clear time filter")).toBeNull();
+  });
+
+  it("does not restore a bucket selection after a report-generation refresh", async () => {
+    stubActivityPageCollaborators();
+    vi.spyOn(activity, "loadSessionPage").mockImplementation(async () => {
+      activity.reportGeneration++;
+      return true;
+    });
+    activity.reportGeneration = 1;
+    activity.report = {
+      ...projectReport(),
+      report_id: "stable-report",
+      bucket_count: 1,
+      elapsed_bucket_count: 1,
+      buckets: [{
+        start: "2026-07-01T00:00:00Z",
+        end: "2026-07-01T01:00:00Z",
+        max_agents: 1,
+        interactive_at_peak: 1,
+        automated_at_peak: 0,
+        agent_minutes: 20,
+        output_tokens: 0,
+        cost: testMoney(0),
+      }],
+    } as Report;
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    await fireEvent.click(screen.getByRole("button", {
+      name: "Filter sessions active in this time slot",
+    }));
+    await flushEffects();
+
+    expect(screen.queryByTitle("Clear time filter")).toBeNull();
+  });
+
+  it("keeps the active badge when clearing its page request fails", async () => {
+    stubActivityPageCollaborators();
+    vi.spyOn(activity, "loadSessionPage")
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false);
+    activity.report = {
+      ...projectReport(),
+      report_id: "stable-report",
+      bucket_count: 1,
+      elapsed_bucket_count: 1,
+      buckets: [{
+        start: "2026-07-01T00:00:00Z",
+        end: "2026-07-01T01:00:00Z",
+        max_agents: 1,
+        interactive_at_peak: 1,
+        automated_at_peak: 0,
+        agent_minutes: 20,
+        output_tokens: 0,
+        cost: testMoney(0),
+      }],
+    } as Report;
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    await fireEvent.click(screen.getByRole("button", {
+      name: "Filter sessions active in this time slot",
+    }));
+    await flushEffects();
+    await fireEvent.click(screen.getByTitle("Clear time filter"));
+    await flushEffects();
+
+    expect(screen.getByTitle("Clear time filter")).toBeTruthy();
   });
 });
 

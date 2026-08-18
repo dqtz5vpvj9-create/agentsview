@@ -447,10 +447,10 @@ func extractModelCounts(
 }
 
 // seedSignalStateFromFull builds and persists the compact incremental state
-// after a full signal recompute so later incremental deltas can fold. The
-// persisted token (transcript revision + signal version) is read after the
-// recompute's rows committed; a state that falls behind is rejected by the
-// maintainer and reseeded by the next full recompute.
+// after a synchronous full-content write so later incremental deltas can fold.
+// Callers run under the engine's sync serialization; the conditional database
+// write still refuses publication if another writer advances the transcript
+// after the revision is captured.
 func (e *Engine) seedSignalStateFromFull(
 	sessionID string, msgs []db.Message,
 ) error {
@@ -474,6 +474,29 @@ func (e *Engine) seedSignalStateFromFullWithContentFailures(
 func (e *Engine) seedSignalStateFromRows(
 	sessionID string, msgs []db.Message, toolRows []signals.ToolCallRow,
 ) error {
+	rev, err := e.db.TranscriptRevision(sessionID)
+	if err != nil {
+		return err
+	}
+	state, err := buildSignalStateFromRows(sessionID, msgs, toolRows, rev)
+	if err != nil {
+		return err
+	}
+	_, err = e.db.UpsertSessionSignalStateIfRevision(state)
+	return err
+}
+
+// buildSignalStateFromRows is the pure full-snapshot counterpart of the
+// incremental fold. revision must be captured before the rows represented by
+// msgs are loaded; callers that read from the database then publish through
+// ReplaceSessionSignalsIfRevision so a concurrent transcript change cannot
+// make stale aggregates appear current.
+func buildSignalStateFromRows(
+	sessionID string,
+	msgs []db.Message,
+	toolRows []signals.ToolCallRow,
+	revision string,
+) (db.SessionSignalState, error) {
 	lastRole, lastContent := extractLastMessageRole(msgs)
 	counts, firstSeen, msgIndex := extractModelCounts(msgs)
 	lastTokens := 0
@@ -491,18 +514,14 @@ func (e *Engine) seedSignalStateFromRows(
 	)
 	blob, err := state.MarshalBinary()
 	if err != nil {
-		return fmt.Errorf(
+		return db.SessionSignalState{}, fmt.Errorf(
 			"encoding signal state %s: %w", sessionID, err,
 		)
 	}
-	rev, err := e.db.TranscriptRevision(sessionID)
-	if err != nil {
-		return err
-	}
-	return e.db.UpsertSessionSignalState(db.SessionSignalState{
+	return db.SessionSignalState{
 		SessionID:          sessionID,
 		State:              blob,
-		TranscriptRevision: rev,
+		TranscriptRevision: revision,
 		SignalVersion:      db.CurrentQualitySignalVersion,
-	})
+	}, nil
 }

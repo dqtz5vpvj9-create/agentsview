@@ -2,14 +2,18 @@ package parser
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+const testVSCodeCopilotHardRecordLimit = 16 * 1024
 
 func TestParseVSCodeCopilotSession(t *testing.T) {
 	tests := []struct {
@@ -721,6 +725,414 @@ func TestReconstructJSONL(t *testing.T) {
 			tt.check(t, data)
 		})
 	}
+}
+
+func TestReconstructJSONLOversizedCopilotIssueShape(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "oversized.jsonl")
+	response := oversizedVSCodeCopilotResponse(
+		testVSCodeCopilotHardRecordLimit/2 + 512,
+	)
+	indexedResponse := strings.Repeat("preserved-", 150)
+	line := `{"kind":0,"v":{"version":3,"sessionId":"large","creationDate":1770650022790,"requests":[{"requestId":"req1","timestamp":1770650031889,"message":{"text":"Run subagents"},"response":[` + response + `,{"value":` + strconv.Quote(indexedResponse) + `}]}]}}` + "\n"
+	var raw struct {
+		V json.RawMessage `json:"v"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(line), &raw))
+	require.Greater(t, len(raw.V), testVSCodeCopilotHardRecordLimit/2)
+	require.Less(t, len([]byte(line)), 20*1024)
+	require.NoError(t, os.WriteFile(path, []byte(line), 0644))
+
+	sess, msgs, err := parseVSCodeCopilotTestSession(t,
+		path, "proj", "local",
+	)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	assert.Equal(t, "vscode-copilot:large", sess.ID)
+	assert.Len(t, msgs, 2)
+	require.True(t, msgs[1].HasToolUse)
+	require.Len(t, msgs[1].ToolCalls, 1)
+	assert.Contains(t, msgs[1].Content, indexedResponse)
+
+	data, err := reconstructJSONLWithLimit(path, testVSCodeCopilotHardRecordLimit)
+	require.NoError(t, err)
+	var state map[string]any
+	require.NoError(t, json.Unmarshal(data, &state))
+	request := state["requests"].([]any)[0].(map[string]any)
+	responseState := request["response"].([]any)[0].(map[string]any)
+	resultDetails := responseState["resultDetails"].(map[string]any)
+	assert.Empty(t, resultDetails["output"])
+	assert.Equal(t, "retained input", resultDetails["input"])
+	toolData := responseState["toolSpecificData"].(map[string]any)
+	terminal := toolData["terminalCommandOutput"].(map[string]any)
+	assert.Len(t, terminal["text"], 1024)
+	assert.Equal(t, float64(200), terminal["lineCount"])
+	assert.Equal(t, float64(0), toolData["terminalCommandState"].(map[string]any)["exitCode"])
+}
+
+func TestReconstructJSONLOversizedKindOneAndTwo(t *testing.T) {
+	dir := t.TempDir()
+	response := oversizedVSCodeCopilotResponse(
+		testVSCodeCopilotHardRecordLimit/2 + 512,
+	)
+	lines := []string{
+		`{"kind":0,"v":{"version":3,"sessionId":"mutations","requests":[{"message":{"text":"initial"},"response":[{}]}]}}`,
+		`{"kind":1,"k":["requests",0,"response",0],"v":` + response + `}`,
+		`{"kind":2,"k":["requests"],"v":[{"message":{"text":"pushed"},"response":[` + response + `]}]}`,
+	}
+	path := filepath.Join(dir, "mutations.jsonl")
+	for _, line := range lines {
+		require.Less(t, len(line), 12*1024)
+	}
+	require.NoError(t, os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0644))
+	data, err := reconstructJSONLWithLimit(path, testVSCodeCopilotHardRecordLimit)
+	require.NoError(t, err)
+	var state struct {
+		Requests []struct {
+			Response []map[string]any `json:"response"`
+		} `json:"requests"`
+	}
+	require.NoError(t, json.Unmarshal(data, &state))
+	require.Len(t, state.Requests, 2)
+	require.Len(t, state.Requests[0].Response, 1)
+	require.Len(t, state.Requests[1].Response, 1)
+	for _, item := range []map[string]any{
+		state.Requests[0].Response[0], state.Requests[1].Response[0],
+	} {
+		assert.Empty(t, item["resultDetails"].(map[string]any)["output"])
+	}
+}
+
+func TestReconstructJSONLResultOutputDestinationMatrix(t *testing.T) {
+	resultDetails := `{"input":"keep input","output":[{"value":"drop"}],"outputLabel":"keep sibling"}`
+	initial := `{"kind":0,"v":{"sessionId":"matrix","requests":[{"response":[{"resultDetails":` + resultDetails + `,"output":"unrelated"}]}]}}`
+	tests := []struct {
+		name  string
+		line  string
+		check func(t *testing.T, item map[string]any)
+	}{
+		{
+			name: "kind zero",
+			line: initial,
+		},
+		{
+			name: "kind one exact result details",
+			line: `{"kind":1,"k":["requests",0,"response",0,"resultDetails"],"v":` + resultDetails + `}`,
+		},
+		{
+			name: "kind one exact output",
+			line: `{"kind":1,"k":["requests",0,"response",0,"resultDetails","output"],"v":[{"value":"drop"}]}`,
+		},
+		{
+			name: "kind two exact result details",
+			line: `{"kind":2,"k":["requests",0,"response",0,"resultDetails"],"v":[` + resultDetails + `]}`,
+		},
+		{
+			name: "kind one below output",
+			line: `{"kind":1,"k":["requests",0,"response",0,"resultDetails","output",0],"v":{"value":"drop"}}`,
+		},
+		{
+			name: "kind two exact output",
+			line: `{"kind":2,"k":["requests",0,"response",0,"resultDetails","output"],"v":[{"value":"drop"}]}`,
+		},
+		{
+			name: "kind two outside with nested output",
+			line: `{"kind":2,"k":["requests"],"v":[{"response":[{"resultDetails":` + resultDetails + `,"output":"unrelated"}]}]}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lines := []string{initial}
+			if tt.name != "kind zero" {
+				lines = append(lines, tt.line)
+			}
+			path := filepath.Join(t.TempDir(), "matrix.jsonl")
+			require.NoError(t, os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0644))
+
+			data, err := reconstructJSONLWithLimit(path, testVSCodeCopilotHardRecordLimit)
+			require.NoError(t, err)
+			var state map[string]any
+			require.NoError(t, json.Unmarshal(data, &state))
+			requests := state["requests"].([]any)
+			item := requests[0].(map[string]any)["response"].([]any)[0].(map[string]any)
+			if tt.name == "kind two outside with nested output" {
+				item = requests[1].(map[string]any)["response"].([]any)[0].(map[string]any)
+			}
+			result := item["resultDetails"].(map[string]any)
+			assert.Empty(t, result["output"])
+			assert.Equal(t, "keep input", result["input"])
+			assert.Equal(t, "keep sibling", result["outputLabel"])
+			assert.Equal(t, "unrelated", item["output"])
+		})
+	}
+}
+
+func TestReconstructJSONLResultDetailsArrayProjection(t *testing.T) {
+	detail := func(input string) string {
+		return `{"input":` + strconv.Quote(input) + `,"output":[{"value":"drop"}],"label":"keep"}`
+	}
+	tests := []struct {
+		name  string
+		lines []string
+		want  []string
+	}{
+		{
+			name: "initial snapshot",
+			lines: []string{
+				`{"kind":0,"v":{"requests":[{"response":[{"resultDetails":[` + detail("initial") + `]}]}]}}`,
+			},
+			want: []string{"initial"},
+		},
+		{
+			name: "set mutation",
+			lines: []string{
+				`{"kind":0,"v":{"requests":[{"response":[{"resultDetails":[]}]}]}}`,
+				`{"kind":1,"k":["requests",0,"response",0,"resultDetails"],"v":[` + detail("set") + `]}`,
+			},
+			want: []string{"set"},
+		},
+		{
+			name: "push mutation",
+			lines: []string{
+				`{"kind":0,"v":{"requests":[{"response":[{"resultDetails":[]}]}]}}`,
+				`{"kind":2,"k":["requests",0,"response",0,"resultDetails"],"v":[` + detail("push") + `]}`,
+			},
+			want: []string{"push"},
+		},
+		{
+			name: "nested push mutation",
+			lines: []string{
+				`{"kind":0,"v":{"requests":[]}}`,
+				`{"kind":2,"k":["requests"],"v":[{"response":[{"resultDetails":[` + detail("nested") + `]}]}]}`,
+			},
+			want: []string{"nested"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "result-details-array.jsonl")
+			require.NoError(t, os.WriteFile(path, []byte(strings.Join(tt.lines, "\n")+"\n"), 0644))
+			data, err := reconstructJSONLWithLimit(path, testVSCodeCopilotHardRecordLimit)
+			require.NoError(t, err)
+			var state map[string]any
+			require.NoError(t, json.Unmarshal(data, &state))
+			for i, want := range tt.want {
+				details := state["requests"].([]any)[i].(map[string]any)["response"].([]any)[0].(map[string]any)["resultDetails"].([]any)
+				require.Len(t, details, 1)
+				item := details[0].(map[string]any)
+				assert.Equal(t, want, item["input"])
+				assert.Empty(t, item["output"])
+				assert.Equal(t, "keep", item["label"])
+			}
+		})
+	}
+}
+
+func TestReconstructJSONLIndexedResultDetailsMutations(t *testing.T) {
+	initial := `{"kind":0,"v":{"requests":[{"response":[{"resultDetails":[{"input":"initial","output":[{"value":"drop"}],"label":"keep"}]}]}]}}`
+	tests := []struct {
+		name string
+		line string
+		want string
+	}{
+		{
+			name: "set indexed detail",
+			line: `{"kind":1,"k":["requests",0,"response",0,"resultDetails",0],"v":{"input":"replacement","output":[{"value":"drop"}],"label":"keep"}}`,
+			want: "replacement",
+		},
+		{
+			name: "set indexed output",
+			line: `{"kind":1,"k":["requests",0,"response",0,"resultDetails",0,"output"],"v":[{"value":"drop"}]}`,
+			want: "initial",
+		},
+		{
+			name: "push indexed output",
+			line: `{"kind":2,"k":["requests",0,"response",0,"resultDetails",0,"output"],"v":[{"value":"drop"}]}`,
+			want: "initial",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "indexed-result-details.jsonl")
+			content := strings.Join([]string{initial, tt.line}, "\n") + "\n"
+			require.NoError(t, os.WriteFile(path, []byte(content), 0644))
+			data, err := reconstructJSONLWithLimit(path, testVSCodeCopilotHardRecordLimit)
+			require.NoError(t, err)
+			var state map[string]any
+			require.NoError(t, json.Unmarshal(data, &state))
+			item := state["requests"].([]any)[0].(map[string]any)["response"].([]any)[0].(map[string]any)["resultDetails"].([]any)[0].(map[string]any)
+			assert.Equal(t, tt.want, item["input"])
+			assert.Empty(t, item["output"])
+			assert.Equal(t, "keep", item["label"])
+		})
+	}
+}
+
+func TestReconstructJSONLNestedResultDetailsMutations(t *testing.T) {
+	initial := `{"kind":0,"v":{"requests":[{"response":[{"resultDetails":{"nested":{"resultDetails":{"input":"nested","output":[{"value":"drop"}],"label":"keep"}}}}]}]}}`
+	tests := []struct {
+		name string
+		line string
+	}{
+		{
+			name: "set nested output",
+			line: `{"kind":1,"k":["requests",0,"response",0,"resultDetails","nested","resultDetails","output"],"v":[{"value":"drop"}]}`,
+		},
+		{
+			name: "push nested output",
+			line: `{"kind":2,"k":["requests",0,"response",0,"resultDetails","nested","resultDetails","output"],"v":[{"value":"drop"}]}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "nested-result-details.jsonl")
+			content := strings.Join([]string{initial, tt.line}, "\n") + "\n"
+			require.NoError(t, os.WriteFile(path, []byte(content), 0644))
+			data, err := reconstructJSONLWithLimit(path, testVSCodeCopilotHardRecordLimit)
+			require.NoError(t, err)
+			var state map[string]any
+			require.NoError(t, json.Unmarshal(data, &state))
+			details := state["requests"].([]any)[0].(map[string]any)["response"].([]any)[0].(map[string]any)["resultDetails"].(map[string]any)["nested"].(map[string]any)["resultDetails"].(map[string]any)
+			assert.Equal(t, "nested", details["input"])
+			assert.Empty(t, details["output"])
+			assert.Equal(t, "keep", details["label"])
+		})
+	}
+}
+
+func TestReconstructJSONLCumulativeResultOutputPushes(t *testing.T) {
+	lines := []string{
+		`{"kind":0,"v":{"sessionId":"cumulative","requests":[{"response":[{"resultDetails":{"input":"keep","output":[]}}]}]}}`,
+	}
+	for range 20 {
+		lines = append(lines, `{"kind":2,"k":["requests",0,"response",0,"resultDetails","output"],"v":[{"value":"drop"}]}`)
+	}
+	path := filepath.Join(t.TempDir(), "cumulative.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0644))
+	data, err := reconstructJSONLWithLimit(path, testVSCodeCopilotHardRecordLimit)
+	require.NoError(t, err)
+	var state map[string]any
+	require.NoError(t, json.Unmarshal(data, &state))
+	result := state["requests"].([]any)[0].(map[string]any)["response"].([]any)[0].(map[string]any)["resultDetails"].(map[string]any)
+	assert.Empty(t, result["output"])
+	assert.Equal(t, "keep", result["input"])
+}
+
+func TestReconstructJSONLKindTwoExactResultDetailsProjectsItems(t *testing.T) {
+	lines := []string{
+		`{"kind":0,"v":{"sessionId":"exact-details","requests":[{"response":[{"resultDetails":[]}]}]}}`,
+		`{"kind":2,"k":["requests",0,"response",0,"resultDetails"],"v":[{"input":"keep","output":[{"value":"drop"}]}]}`,
+	}
+	path := filepath.Join(t.TempDir(), "exact-result-details.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0644))
+	data, err := reconstructJSONLWithLimit(path, testVSCodeCopilotHardRecordLimit)
+	require.NoError(t, err)
+	var state map[string]any
+	require.NoError(t, json.Unmarshal(data, &state))
+	details := state["requests"].([]any)[0].(map[string]any)["response"].([]any)[0].(map[string]any)["resultDetails"].([]any)
+	require.Len(t, details, 1)
+	item := details[0].(map[string]any)
+	assert.Equal(t, "keep", item["input"])
+	assert.Empty(t, item["output"])
+}
+
+func TestReconstructJSONLHardCeiling(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hard-ceiling.jsonl")
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	_, err = f.Write([]byte(strings.Repeat(
+		"x", testVSCodeCopilotHardRecordLimit+1,
+	)))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	_, err = reconstructJSONLWithLimit(path, testVSCodeCopilotHardRecordLimit)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "safety ceiling")
+}
+
+func TestReconstructJSONLRejectsTrailingJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "trailing.jsonl")
+	lines := []string{
+		`{"kind":0,"v":{"version":3,"sessionId":"trailing","requests":[]}}`,
+		`{"kind":2,"k":["requests"],"v":[]}{"kind":2}`,
+		`{"kind":2,"k":["requests"],"v":[{"message":{"text":"after malformed"},"response":[{"value":"kept"}]}]}`,
+	}
+	require.NoError(t, os.WriteFile(path,
+		[]byte(strings.Join(lines, "\n")+"\n"), 0644,
+	))
+
+	data, err := reconstructJSONL(path)
+	require.NoError(t, err)
+	var state struct {
+		SessionID string `json:"sessionId"`
+		Requests  []any  `json:"requests"`
+	}
+	require.NoError(t, json.Unmarshal(data, &state))
+	assert.Equal(t, "trailing", state.SessionID)
+	assert.Len(t, state.Requests, 1)
+}
+
+func TestReconstructJSONLAtHardCeiling(t *testing.T) {
+	prefix := `{"kind":0,"v":{"version":3,"sessionId":"normal-boundary","requests":[{"message":{"text":"boundary"},"response":[{"value":"`
+	suffix := `"}]}]}}`
+	value := strings.Repeat("x", testVSCodeCopilotHardRecordLimit)
+	line := prefix + value + suffix
+	value = value[:len(value)-(len([]byte(line))-testVSCodeCopilotHardRecordLimit)]
+	line = prefix + value + suffix
+	require.Len(t, []byte(line), testVSCodeCopilotHardRecordLimit)
+	require.Less(t, len([]byte(line)), 20*1024)
+
+	path := filepath.Join(t.TempDir(), "normal-boundary.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(line), 0644))
+	data, err := reconstructJSONLWithLimit(path, testVSCodeCopilotHardRecordLimit)
+	require.NoError(t, err)
+	var state map[string]any
+	require.NoError(t, json.Unmarshal(data, &state))
+	assert.Equal(t, "normal-boundary", state["sessionId"])
+	assert.Len(t, state["requests"].([]any)[0].(map[string]any)["response"].([]any)[0].(map[string]any)["value"], len(value))
+}
+
+func oversizedVSCodeCopilotResponse(outputSize int) string {
+	output := strings.Repeat("x", outputSize)
+	var b strings.Builder
+	b.WriteString(`{"kind":"toolInvocationSerialized","toolId":"runSubagent","toolCallId":"tc1","subAgentInvocationId":"toolu_1","isComplete":true,"invocationMessage":{"value":"Run subagent","isTrusted":false},"resultDetails":{"input":"retained input","output":[`)
+	fmt.Fprintf(&b, `{"type":"embed","isText":true,"value":%q}`, output)
+	b.WriteString(`]},"toolSpecificData":{"kind":"terminal","commandLine":{"original":"go test","toolEdited":"go test ./..."},"cwd":{"path":"/Users/user/project","scheme":"file"},"terminalCommandOutput":{"text":`)
+	b.WriteString(strconv.Quote(strings.Repeat("y", 1024)))
+	b.WriteString(`,"lineCount":200},"terminalCommandState":{"exitCode":0,"timestamp":1786390616101}}}`)
+	return b.String()
+}
+
+func TestVSCodeCopilotReplayLimitRejectsInvalid(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "unused.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(`{"kind":0,"v":{}}`), 0644))
+	for name, test := range map[string]struct {
+		limit int
+		want  string
+	}{
+		"zero": {
+			limit: 0,
+			want:  "hard replay limit must be positive",
+		},
+		"negative": {
+			limit: -1,
+			want:  "hard replay limit must be positive",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := reconstructJSONLWithLimit(path, test.limit)
+			require.ErrorContains(t, err, test.want)
+		})
+	}
+}
+
+func TestVSCodeCopilotReplayDefaults(t *testing.T) {
+	assert.Equal(t, 128<<20, vscodeCopilotHardRecordLimit)
 }
 
 func TestDiscoverVSCodeCopilot_JSONLDedup(t *testing.T) {

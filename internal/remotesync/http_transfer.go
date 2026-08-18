@@ -160,6 +160,26 @@ func (a *downloadedArchive) extract(
 	report syncpkg.ProgressFunc,
 	label string,
 ) (err error) {
+	return a.extractWithSelection(ctx, dst, nil, report, label)
+}
+
+func (a *downloadedArchive) extractSelected(
+	ctx context.Context,
+	dst string,
+	selected map[string]struct{},
+	report syncpkg.ProgressFunc,
+	label string,
+) error {
+	return a.extractWithSelection(ctx, dst, selected, report, label)
+}
+
+func (a *downloadedArchive) extractWithSelection(
+	ctx context.Context,
+	dst string,
+	selected map[string]struct{},
+	report syncpkg.ProgressFunc,
+	label string,
+) (err error) {
 	if report != nil {
 		report(syncpkg.Progress{Detail: label})
 	}
@@ -186,7 +206,7 @@ func (a *downloadedArchive) extract(
 		stream = gz
 	}
 	stream = &contextReader{ctx: ctx, r: stream}
-	if _, err := ExtractTarStream(ctx, stream, dst); err != nil {
+	if _, err := extractTarStream(ctx, stream, dst, selected); err != nil {
 		return fmt.Errorf("extract archive: %w", err)
 	}
 	return nil

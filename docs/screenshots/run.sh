@@ -90,6 +90,58 @@ else
   echo "Warning: no session with thinking blocks found; thinking-blocks screenshot may be skipped"
 fi
 
+# Resolve the exact message whose tool activity includes result content so the
+# raw/formatted output screenshot can navigate through the virtualized transcript
+# without depending on whichever messages are initially mounted. Prefer output
+# with Markdown syntax because it makes the formatted state visually distinct.
+TOOL_OUTPUT_TARGET=$(sqlite3 -separator $'\t' "$CONTEXT/test-sessions.db" \
+  "SELECT tc.session_id, m.ordinal
+   FROM tool_calls tc
+   JOIN messages m ON m.id = tc.message_id
+   WHERE COALESCE(tc.result_content, '') != ''
+     AND trim(tc.result_content) NOT LIKE '[%'
+     AND trim(tc.result_content) NOT LIKE '{%'
+   ORDER BY CASE WHEN tc.result_content LIKE '%\`\`\`%'
+                       OR tc.result_content LIKE '%**%'
+                       OR tc.result_content LIKE '%# %'
+                     THEN 1 ELSE 0 END DESC,
+   m.ordinal,
+   tc.session_id
+   LIMIT 1" 2>/dev/null || true)
+TOOL_OUTPUT_SESSION_ID=""
+TOOL_OUTPUT_MESSAGE_ORDINAL=""
+if [ -n "$TOOL_OUTPUT_TARGET" ]; then
+  IFS=$'\t' read -r TOOL_OUTPUT_SESSION_ID TOOL_OUTPUT_MESSAGE_ORDINAL \
+    <<< "$TOOL_OUTPUT_TARGET"
+fi
+if [ -n "$TOOL_OUTPUT_SESSION_ID" ] &&
+  [[ "$TOOL_OUTPUT_MESSAGE_ORDINAL" =~ ^[0-9]+$ ]]; then
+  echo "Tool-output target: $TOOL_OUTPUT_SESSION_ID message $TOOL_OUTPUT_MESSAGE_ORDINAL"
+else
+  TOOL_OUTPUT_SESSION_ID=""
+  TOOL_OUTPUT_MESSAGE_ORDINAL=""
+  echo "Warning: no message with tool output found; formatted tool-output screenshot may fail"
+fi
+
+# Resolve a session with a fenced Markdown code block. Recent sidebar rows do
+# not reliably contain one, so the code-block copy screenshot navigates to a
+# known match in the privacy-filtered fixture.
+CODE_BLOCK_SESSION_ID=$(sqlite3 "$CONTEXT/test-sessions.db" \
+  "SELECT m.session_id
+   FROM messages m
+   JOIN sessions s ON s.id = m.session_id
+   WHERE instr(m.content, char(10) || char(96) || char(96) || char(96)) > 0
+     AND COALESCE(m.is_system, 0) = 0
+     AND m.content NOT LIKE '[%'
+     AND s.message_count <= 12
+   ORDER BY length(m.content), m.session_id
+   LIMIT 1" 2>/dev/null || true)
+if [ -n "$CODE_BLOCK_SESSION_ID" ]; then
+  echo "Code-block session: $CODE_BLOCK_SESSION_ID"
+else
+  echo "Warning: no session with a fenced code block found; code-block screenshot may be skipped"
+fi
+
 # Copy screenshot pipeline files
 cp -r "$ROOT/screenshots/" "$CONTEXT/screenshots/"
 cp "$ROOT/screenshots/Dockerfile" "$CONTEXT/Dockerfile"
@@ -114,6 +166,9 @@ echo "Running screenshot capture..."
 docker run --rm \
   -v "$OUTPUT_DIR:/output" \
   -e SCREENSHOT_THINKING_SESSION_ID="$THINKING_SESSION_ID" \
+  -e SCREENSHOT_TOOL_OUTPUT_SESSION_ID="$TOOL_OUTPUT_SESSION_ID" \
+  -e SCREENSHOT_TOOL_OUTPUT_MESSAGE_ORDINAL="$TOOL_OUTPUT_MESSAGE_ORDINAL" \
+  -e SCREENSHOT_CODE_BLOCK_SESSION_ID="$CODE_BLOCK_SESSION_ID" \
   "$IMAGE_NAME" "$@"
 
 echo ""

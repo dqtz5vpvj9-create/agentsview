@@ -6,6 +6,7 @@
     localDateStr,
     type Automation,
   } from "../../stores/activity.svelte.js";
+  import type { ActivityReportProgress } from "../../api/activity-report.js";
   import { sync } from "../../stores/sync.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import {
@@ -59,15 +60,57 @@
   let slotFilter = $state<{
     idx: number;
     label: string;
-    sessionIds: string[];
   } | null>(null);
+  let slotReportGeneration = -1;
 
-  // A reloaded report (range/filter change) gets fresh buckets and sessions, so
-  // a slot index/membership captured against the old report is stale; clear it.
+  // Every successful full-report load gets fresh buckets and sessions, even
+  // when its deterministic report_id is unchanged. Clear any slot membership
+  // captured against the previous generation.
   $effect(() => {
-    void activity.report;
-    slotFilter = null;
+    const generation = activity.reportGeneration;
+    if (generation !== slotReportGeneration) {
+      slotReportGeneration = generation;
+      slotFilter = null;
+    }
   });
+
+  async function selectBucket(sel: { idx: number; label: string } | null) {
+    const generation = activity.reportGeneration;
+    if (
+      await activity.loadSessionPage({ bucket: sel?.idx ?? null })
+      && activity.reportGeneration === generation
+    ) {
+      slotFilter = sel;
+    }
+  }
+
+  async function sortSessions(
+    sort: import("../../api/activity-report.js").ActivitySessionSort,
+    direction: "asc" | "desc",
+  ) {
+    await activity.loadSessionPage({ sort, direction });
+  }
+
+  function reportProgressLabel(progress: ActivityReportProgress | null): string {
+    if (!progress) return m.activity_loading_report();
+    switch (progress.phase) {
+      case "loading_sessions":
+        return m.activity_loading_sessions();
+      case "loading_usage":
+        return m.activity_loading_usage();
+      case "scanning_activity":
+        return m.activity_report_progress({
+          count: progress.rows_processed ?? 0,
+        });
+      case "finalizing":
+      case "done":
+        return m.activity_finalizing_report();
+    }
+  }
+
+  const refreshStatus = $derived(
+    activity.loading ? reportProgressLabel(activity.progress) : undefined,
+  );
 
   const earliestSession = $derived(sync.stats?.earliest_session ?? null);
   let today = $state(localDateStr(new Date()));
@@ -361,12 +404,15 @@
       />
     </div>
 
-    <RefreshControl
-      lastUpdatedAt={activity.lastUpdatedAt}
-      busy={activity.loading}
-      onRefresh={() => activity.load({ background: true })}
-      label={m.activity_refresh()}
-    />
+    <div class="activity-refresh" aria-live="polite">
+      <RefreshControl
+        lastUpdatedAt={activity.lastUpdatedAt}
+        busy={activity.loading}
+        status={refreshStatus}
+        onRefresh={() => activity.load({ background: true })}
+        label={m.activity_refresh()}
+      />
+    </div>
   </div>
 
   <div class="activity-content">
@@ -381,15 +427,21 @@
         <ConcurrencyTimeline
           report={activity.report}
           selectedBucket={slotFilter?.idx ?? null}
-          onSelectBucket={(sel) => (slotFilter = sel)}
+          onSelectBucket={selectBucket}
         />
       </Card>
       <Card level="default" padding="none" class="chart-panel">
         <SessionsTable
           report={activity.report}
-          filterIds={slotFilter?.sessionIds ?? null}
+          filterActive={slotFilter !== null}
           filterLabel={slotFilter?.label ?? ""}
-          onClearFilter={() => (slotFilter = null)}
+          loading={activity.sessionsLoading}
+          error={activity.sessionsError}
+          sortKey={activity.sessionsSort}
+          sortDir={activity.sessionsDirection}
+          onClearFilter={() => selectBucket(null)}
+          onSort={sortSessions}
+          onNext={(cursor) => activity.loadSessionPage({ cursor })}
         />
       </Card>
       <Card level="default" padding="none" class="chart-panel">
@@ -454,6 +506,32 @@
   .toolbar-typeahead.compact {
     --typeahead-min-width: 118px;
     --typeahead-max-width: 150px;
+  }
+
+  /* The refresh control always owns the same toolbar footprint. Progress
+     replaces its age label inside this box, so phase and row-count updates
+     cannot reflow the filters or report body. */
+  .activity-refresh {
+    flex: 0 0 220px;
+    width: 220px;
+    max-width: 100%;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .activity-refresh :global(.kit-refresh-control) {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .activity-refresh :global(.kit-refresh-control__status) {
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .activity-refresh :global(.kit-refresh-control__status span) {
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .activity-content {

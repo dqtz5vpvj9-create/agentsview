@@ -465,7 +465,7 @@ func (e *Engine) finishStreamingSQLiteContainerDiscovery() {
 // removed storage JSON stops shadowing its same-ID row) without the
 // container state changing; such a row was never verified and must parse.
 func (e *Engine) sqliteContainerSourceFresh(file parser.DiscoveredFile) bool {
-	if e.forceParse || file.ForceParse {
+	if e.forceParseRequested(file) {
 		return false
 	}
 	dbPath, sessionID, ok := sqliteContainerSourceForFile(file)
@@ -509,7 +509,7 @@ func (e *Engine) watermarkOnlySQLiteSourceFresh(
 	source parser.SourceRef,
 	file parser.DiscoveredFile,
 ) (int64, bool) {
-	if e.forceParse || file.ForceParse {
+	if e.forceParseRequested(file) {
 		return 0, false
 	}
 	watermark, ok := parser.SourceWatermarkOnlyMTimeNS(source)

@@ -1834,6 +1834,19 @@ func TestGetSession_Found(t *testing.T) {
 	}
 }
 
+func TestGetSession_RoundTripsReservedIDCharacters(t *testing.T) {
+	te := setup(t)
+	const sessionID = "deepseek-harness:child%7E/%25?#"
+	te.seedSession(t, sessionID, "my-app", 2)
+
+	w := te.get(t, "/api/v1/sessions/"+
+		"deepseek-harness%3Achild%257E%2F%2525%3F%23")
+	assertStatus(t, w, http.StatusOK)
+
+	resp := decode[db.Session](t, w)
+	assert.Equal(t, sessionID, resp.ID)
+}
+
 func TestGetSession_NotFound(t *testing.T) {
 	te := setup(t)
 
@@ -3209,6 +3222,83 @@ func TestAuthRequiredProtectsPing(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 }
 
+func TestPingReportsStalledSyncWithoutLosingDaemonIdentity(t *testing.T) {
+	dir := tempDirWithRetryCleanup(t)
+	cfg := config.Config{
+		Host: "127.0.0.1", Port: 0, DataDir: dir,
+		DBPath: filepath.Join(dir, "test.db"), WriteTimeout: 30 * time.Second,
+	}
+	database := dbtest.OpenTestDBAt(t, cfg.DBPath)
+	engine := sync.NewEngine(database, sync.EngineConfig{
+		Machine: "test", ProgressStallAfter: time.Nanosecond,
+	})
+	t.Cleanup(engine.Close)
+	te := &testEnv{
+		srv: server.New(cfg, database, engine), db: database, engine: engine,
+		dataDir: dir,
+	}
+	te.handler = wrapTestHandler(cfg, te.srv.Handler())
+	type pingResponse struct {
+		OK      bool `json:"ok"`
+		Healthy bool `json:"healthy"`
+		Sync    *struct {
+			Phase     sync.Phase `json:"phase"`
+			Stalled   bool       `json:"stalled"`
+			StartedAt string     `json:"started_at"`
+			UpdatedAt string     `json:"updated_at"`
+		} `json:"sync,omitempty"`
+	}
+
+	healthy := decode[pingResponse](t, te.get(t, "/api/ping"))
+	assert.True(t, healthy.OK)
+	assert.True(t, healthy.Healthy)
+	assert.Nil(t, healthy.Sync)
+
+	progressSeen := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce stdlibsync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	done := make(chan struct{})
+	var once stdlibsync.Once
+	go func() {
+		engine.SyncAll(t.Context(), func(sync.Progress) {
+			once.Do(func() { close(progressSeen) })
+			<-release
+		})
+		close(done)
+	}()
+	select {
+	case <-progressSeen:
+	case <-time.After(time.Second):
+		require.FailNow(t, "sync did not publish progress")
+	}
+	require.Eventually(t, func() bool {
+		progress, active := engine.CurrentProgress()
+		return active && progress.Stalled
+	}, time.Second, time.Millisecond,
+		"sync progress did not age into the stalled state")
+
+	stalled := decode[pingResponse](t, te.get(t, "/api/ping"))
+	assert.True(t, stalled.OK,
+		"ping must keep proving the running daemon's identity")
+	assert.False(t, stalled.Healthy)
+	require.NotNil(t, stalled.Sync)
+	assert.Equal(t, sync.PhaseDiscovering, stalled.Sync.Phase)
+	assert.True(t, stalled.Sync.Stalled)
+	assert.NotEmpty(t, stalled.Sync.StartedAt)
+	assert.NotEmpty(t, stalled.Sync.UpdatedAt)
+
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		require.FailNow(t, "sync did not finish after progress callback returned")
+	}
+	finished := decode[pingResponse](t, te.get(t, "/api/ping"))
+	assert.True(t, finished.Healthy)
+	assert.Nil(t, finished.Sync)
+}
+
 func TestGetGithubConfig(t *testing.T) {
 	t.Setenv("AGENTSVIEW_GITHUB_TOKEN", "")
 	t.Setenv("PATH", t.TempDir())
@@ -3500,6 +3590,109 @@ func TestSettingsRejectInvalidChartPaletteWithoutChangingSelection(t *testing.T)
 	}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
 	assert.Equal(t, config.ChartPaletteMatplotlib, got.ChartPalette)
+}
+
+func TestSettingsDisabledProvidersRoundTrip(t *testing.T) {
+	geminiDir := filepath.Join(t.TempDir(), "gemini")
+	te := setup(t, func(cfg *config.Config) {
+		cfg.AgentDirs = map[parser.AgentType][]string{
+			parser.AgentClaude: {"/sessions/claude"},
+			parser.AgentGemini: {geminiDir},
+		}
+	})
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	w := put(`{"disabled_agents":["gemini","claude","gemini"]}`)
+	assertStatus(t, w, http.StatusOK)
+	type sessionProvider struct {
+		ID          parser.AgentType `json:"id"`
+		DisplayName string           `json:"display_name"`
+		Dirs        []string         `json:"dirs"`
+	}
+	var got struct {
+		SessionProviders []sessionProvider  `json:"session_providers"`
+		DisabledAgents   []parser.AgentType `json:"disabled_agents"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.Equal(t,
+		[]parser.AgentType{parser.AgentClaude, parser.AgentGemini},
+		got.DisabledAgents,
+	)
+	require.NotEmpty(t, got.SessionProviders)
+	assert.Equal(t, parser.AgentClaude, got.SessionProviders[0].ID)
+	assert.Equal(t, "Claude Code", got.SessionProviders[0].DisplayName)
+	assert.Equal(t, []string{"/sessions/claude"}, got.SessionProviders[0].Dirs)
+	geminiIndex := slices.IndexFunc(got.SessionProviders,
+		func(provider sessionProvider) bool {
+			return provider.ID == parser.AgentGemini
+		})
+	require.NotEqual(t, -1, geminiIndex)
+	gemini := got.SessionProviders[geminiIndex]
+	assert.Equal(t, "Gemini", gemini.DisplayName)
+	assert.Equal(t, []string{geminiDir}, gemini.Dirs)
+
+	var persisted struct {
+		DisabledAgents []parser.AgentType `toml:"disabled_agents"`
+	}
+	_, err := toml.DecodeFile(filepath.Join(te.dataDir, "config.toml"), &persisted)
+	require.NoError(t, err)
+	assert.Equal(t, got.DisabledAgents, persisted.DisabledAgents)
+}
+
+func TestSettingsDisabledProvidersDefaultToEmptyArray(t *testing.T) {
+	te := setup(t)
+
+	w := te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	var got struct {
+		DisabledAgents json.RawMessage `json:"disabled_agents"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.JSONEq(t, `[]`, string(got.DisabledAgents))
+}
+
+func TestSettingsRejectInvalidDisabledProviderWithoutMutation(t *testing.T) {
+	te := setup(t)
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	assertStatus(t, put(`{"disabled_agents":["gemini"]}`), http.StatusOK)
+	w := put(`{"disabled_agents":["nope"]}`)
+	assertStatus(t, w, http.StatusBadRequest)
+	assertBodyContains(t, w, "unknown session provider")
+
+	w = te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	var got struct {
+		DisabledAgents []parser.AgentType `json:"disabled_agents"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.Equal(t, []parser.AgentType{parser.AgentGemini}, got.DisabledAgents)
+}
+
+func TestSettingsDisabledProvidersRemainLockedInPGMode(t *testing.T) {
+	te := setupPGMode(t)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+		strings.NewReader(`{"disabled_agents":["gemini"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	te.handler.ServeHTTP(w, req)
+
+	assertStatus(t, w, http.StatusNotImplemented)
+	assertBodyContains(t, w, "settings cannot be modified")
 }
 
 func TestSettingsRemainLockedInPGMode(t *testing.T) {

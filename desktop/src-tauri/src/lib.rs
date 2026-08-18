@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tauri::async_runtime::Receiver;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::plugin::Builder as PluginBuilder;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use tauri::tray::TrayIconBuilder;
 use tauri::{App, AppHandle, Emitter, Manager, RunEvent, Url, WebviewWindow};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
@@ -157,13 +157,11 @@ pub fn run() {
             if let Err(err) = setup_menu(app) {
                 eprintln!("[agentsview] failed to set up desktop menu: {err}");
             }
-            #[cfg(target_os = "macos")]
-            if let Err(err) = setup_macos_status_item(app) {
-                eprintln!("[agentsview] failed to set up macOS status item: {err}");
-            }
-            #[cfg(target_os = "macos")]
-            if let Err(err) = setup_macos_window_lifecycle(app) {
-                eprintln!("[agentsview] failed to set up macOS window lifecycle: {err}");
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            if let Err(err) =
+                setup_close_to_tray_with(app, setup_status_item, setup_window_lifecycle)
+            {
+                eprintln!("[agentsview] failed to set up close-to-tray behavior: {err}");
             }
             match tauri::async_runtime::block_on(run_data_version_preflight(app.handle())) {
                 Ok(()) => {
@@ -254,6 +252,7 @@ fn show_main_window(handle: &AppHandle) {
 }
 
 trait MainWindowVisibility {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn hide_main_window(&self);
     fn show_main_window(&self);
     fn unminimize_main_window(&self);
@@ -261,6 +260,7 @@ trait MainWindowVisibility {
 }
 
 impl MainWindowVisibility for WebviewWindow {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn hide_main_window(&self) {
         let _ = self.hide();
     }
@@ -278,6 +278,7 @@ impl MainWindowVisibility for WebviewWindow {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn hide_main_window_on_close(window: &impl MainWindowVisibility, prevent_close: impl FnOnce()) {
     prevent_close();
     window.hide_main_window();
@@ -1999,8 +2000,8 @@ fn setup_menu(app: &mut App) -> Result<(), DynError> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn setup_macos_status_item(app: &mut App) -> Result<(), DynError> {
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn setup_status_item(app: &mut App) -> Result<(), DynError> {
     let show = MenuItemBuilder::with_id(SHOW_MAIN_WINDOW_MENU_ID, "Show AgentsView").build(app)?;
     let open_logs =
         MenuItemBuilder::with_id(OPEN_LOGS_FOLDER_MENU_ID, "Open Logs Folder").build(app)?;
@@ -2017,18 +2018,38 @@ fn setup_macos_status_item(app: &mut App) -> Result<(), DynError> {
         .item(&quit)
         .build()?;
 
-    let icon = macos_status_item_icon()?;
-    TrayIconBuilder::with_id("agentsview")
-        .icon(icon)
-        .icon_as_template(true)
+    let builder = TrayIconBuilder::with_id("agentsview")
         .tooltip("AgentsView")
-        .menu(&menu)
-        .build(app)?;
+        .menu(&menu);
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .icon(macos_status_item_icon()?)
+        .icon_as_template(true);
+
+    #[cfg(target_os = "windows")]
+    let builder = builder.icon(
+        app.default_window_icon()
+            .cloned()
+            .ok_or_else(|| io::Error::other("default window icon is unavailable"))?,
+    );
+
+    builder.build(app)?;
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn setup_macos_window_lifecycle(app: &App) -> Result<(), DynError> {
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn setup_close_to_tray_with<T>(
+    target: &mut T,
+    setup_status_item: impl FnOnce(&mut T) -> Result<(), DynError>,
+    setup_window_lifecycle: impl FnOnce(&T) -> Result<(), DynError>,
+) -> Result<(), DynError> {
+    setup_status_item(target)?;
+    setup_window_lifecycle(target)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn setup_window_lifecycle(app: &App) -> Result<(), DynError> {
     let window = main_window(app)?;
     let close_window = window.clone();
     window.on_window_event(move |event| {
@@ -3916,9 +3937,9 @@ agentsview running at http://127.0.0.1:18082
         assert!(!is_allowed_external_open_url(&custom));
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
-    fn macos_status_item_actions_share_desktop_menu_routing() {
+    fn status_item_actions_share_desktop_menu_routing() {
         assert_eq!(
             desktop_menu_action(ABOUT_MENU_ID),
             Some(DesktopMenuAction::About)
@@ -3942,13 +3963,13 @@ agentsview running at http://127.0.0.1:18082
         assert_eq!(desktop_menu_action("unknown"), None);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[derive(Clone, Default)]
     struct FakeMainWindow {
         calls: std::sync::Arc<Mutex<Vec<&'static str>>>,
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     impl MainWindowVisibility for FakeMainWindow {
         fn hide_main_window(&self) {
             self.calls.lock().expect("lock calls").push("hide");
@@ -3967,9 +3988,9 @@ agentsview running at http://127.0.0.1:18082
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
-    fn macos_close_hides_the_existing_window_and_show_restores_it() {
+    fn close_hides_the_existing_window_and_show_restores_it() {
         let window = FakeMainWindow::default();
         let close_calls = window.calls.clone();
 
@@ -3985,6 +4006,27 @@ agentsview running at http://127.0.0.1:18082
             *window.calls.lock().expect("lock calls for assertion"),
             vec!["prevent_close", "hide", "show", "unminimize", "focus"]
         );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn tray_setup_failure_does_not_register_window_lifecycle() {
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let result = setup_close_to_tray_with(
+            &mut (),
+            |_| {
+                calls.borrow_mut().push("tray");
+                Err(io::Error::other("tray setup failed").into())
+            },
+            |_| {
+                calls.borrow_mut().push("lifecycle");
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(*calls.borrow(), vec!["tray"]);
     }
 
     #[cfg(target_os = "macos")]

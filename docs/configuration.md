@@ -72,6 +72,7 @@ chart_palette = "agentsview"
 | `public_origins`                    | Array of additional trusted CORS origins                                                                                                                                                                                                             |
 | `daemon_idle_timeout`               | Idle timeout for detached writable daemons; set to `"0s"` to keep them alive                                                                                                                                                                         |
 | `chart_palette`                     | Server-wide categorical chart colors: `"agentsview"` (default) or `"matplotlib"`; also configurable under **Settings > Appearance**                                                                                                                  |
+| `disabled_agents`                   | Session providers to exclude from local filesystem scanning; changes require a daemon restart — see [Disabling Session Providers](#disabling-session-providers)                                                                                     |
 | `[proxy]`                           | Managed proxy configuration table — see [Remote Access](/remote-access/)                                                                                                                                                                             |
 | `disable_update_check`              | Disable the automatic update check (see [Privacy](#privacy-and-telemetry))                                                                                                                                                                           |
 | `scan_protected_paths`              | Allow Git discovery inside macOS privacy-protected folders, accepting one consent prompt per folder — see [macOS Protected Folders](#macos-protected-folders)                                                                                        |
@@ -79,6 +80,7 @@ chart_palette = "agentsview"
 | `[duckdb]`                          | DuckDB mirror configuration — see [DuckDB Mirror](/duckdb/)                                                                                                                                                                                          |
 | `[vector]`                          | Opt-in semantic-search index; model settings live in `[vector.embeddings]`, named endpoints in `[vector.embeddings.servers.<name>]`, embedding schedule in `[vector.embed]` — see [Semantic Search](/semantic-search/#enabling-vector) for every key |
 | `[recall.extract]`                  | Opt-in model-backed recall extraction; named endpoints in `[recall.extract.servers.<name>]`, prompt selection in `[recall.extract.prompts]`, request overrides in `[recall.extract.request]` — see [Recall](/recall/#automatic-extraction)           |
+| `[insights]`                        | Optional generated-insights endpoint and model; local loopback HTTP is allowed, remote plaintext requires `allow_http = true`, and endpoint failures do not retry through a CLI — see [Recall](/recall/#current-surface) |
 | `[[remote_hosts]]`                  | Remote machines synced by a bare `agentsview sync` — see [CLI Reference](/commands/#agentsview-sync)                                                                                                                                                 |
 | `[[session_sources]]`               | Additional filesystem session roots with per-root machine labels — see [Filesystem Session Sync](/filesystem-sync/)                                                                                                                                  |
 | `[automated]`                       | Custom automated-session patterns — see [Automated Session Detection](#automated-session-detection)                                                                                                                                                  |
@@ -146,9 +148,10 @@ deltas when fewer than half of the manifest files need fetching; see
 When a full or automatic data-version rebuild includes local sources, configured
 HTTP hosts join the same temporary-database bulk ingest and atomic swap. `--full`
 reparses the complete local and remote corpus without retransferring unchanged
-files from manifest-capable spokes. Older HTTP-capable spokes remain compatible
-through the full-archive fallback; upgrading them is required only to gain delta
-transfer.
+files from manifest-capable spokes. HTTP remote sync requires the collector and
+remote daemon to use the same remote-sync protocol version. After upgrading
+either host, upgrade the other before syncing again; incompatible peers fail
+before targets or archive data are exchanged.
 
 Each `remote_hosts.host` value must be unique and stable. It namespaces imported
 session IDs, the database skip cache, and the persistent mirror; changing it for
@@ -234,6 +237,14 @@ support is deprecated because current Amp releases may keep full threads
 server-side and leave only local stubs; historical local Amp thread JSON files
 can still be parsed.
 
+The matching environment variable and `*_dirs` configuration key override an
+agent's default directories. Environment variables take precedence when both
+are set. An explicit empty `*_dirs` array, such as `grok_dirs = []`, clears that
+agent's default local directories, so local discovery finds nothing there.
+Matching `session_sources` entries for that agent still apply. Provider-wide
+exclusion is documented under [Disabling Session Providers](#disabling-session-providers).
+Omitting the key keeps its default directories.
+
 | Agent                 | Default Directory                                                                | File Format                                                                                                                     |
 | --------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | Aider                 | No default; opt in with `AIDER_DIR` or `aider_dirs`                              | `.aider.chat.history.md` Markdown history files                                                                                 |
@@ -251,6 +262,7 @@ can still be parsed.
 | Cortex Code           | `~/.snowflake/cortex/conversations/`                                             | JSON / JSONL per session                                                                                                        |
 | Cursor                | `~/.cursor/projects/`                                                            | JSONL or plain-text transcripts                                                                                                 |
 | DeepSeek TUI          | `~/.codewhale/sessions/` and `~/.deepseek/sessions/`                             | JSON per session                                                                                                                |
+| DeepSeek Harness      | `~/.dsh/sessions/` (or `$DSH_HOME/sessions/`)                                    | Plain or multi-frame zstd JSONL per session                                                                                     |
 | Forge                 | `~/.forge/`                                                                      | SQLite database (`.forge.db`)                                                                                                   |
 | Gemini CLI            | `~/.gemini/`                                                                     | JSONL in `tmp/` subdirectory                                                                                                    |
 | Goose                 | (platform-specific, see below)                                                   | SQLite `sessions.db` with transcripts, tool activity, relationships, usage, and recorded costs                                  |
@@ -278,7 +290,7 @@ can still be parsed.
 | Posit Assistant       | `~/.posit/assistant/workspaces/`                                                 | Per-conversation `conversation.json` tree plus `lm-messages.jsonl` transcript                                                   |
 | Positron Assistant    | (platform-specific, see below)                                                   | JSON / JSONL per session                                                                                                        |
 | QClaw                 | `~/.qclaw/assets/static/agents/`                                                 | JSONL per session                                                                                                               |
-| Qoder                 | `~/.qoder/projects/` and `~/.qoderwork/projects/`                                | JSONL project transcripts plus sidecar metadata                                                                                 |
+| Qoder                 | Legacy export roots plus platform-specific `SharedClientCache` (see below)       | JSONL project transcripts plus sidecar metadata                                                                                 |
 | Qwen Code             | `~/.qwen/projects/`                                                              | JSONL per session                                                                                                               |
 | QwenPaw               | `~/.copaw/workspaces/`                                                           | JSON session files                                                                                                              |
 | Reasonix              | `~/.reasonix/` and `~/AppData/Roaming/reasonix/`                                 | JSONL sessions plus `.jsonl.meta` sidecars                                                                                      |
@@ -295,10 +307,28 @@ can still be parsed.
 | Zed                   | (platform-specific, see below)                                                   | SQLite database (`threads/threads.db`)                                                                                          |
 | Zencoder              | `~/.zencoder/sessions/`                                                          | JSONL per session                                                                                                               |
 
+DeepSeek Harness sessions are read from its default JSONL persistence backend,
+including plain `session.jsonl` and multi-frame `session.jsonl.zstd` files.
+`DSH_HOME` re-roots the default `<home>/sessions` path; set
+`DEEPSEEK_HARNESS_SESSIONS_DIR` or `deepseek_harness_sessions_dirs` to point
+directly at one or more session roots. The optional SQLite persistence backend
+is not supported.
+
 Prime Agent support targets the current flat session layout in v0.7.0. That
 release migrates the older per-project layout when Prime Agent opens its
 session store, so open the current Prime Agent once before syncing a legacy
 archive with AgentsView.
+
+**Qoder default directories** include the legacy `~/.qoder/projects/` and
+`~/.qoderwork/projects/` export roots plus the current IDE store:
+
+- **macOS:**
+  `~/Library/Application Support/Qoder/SharedClientCache/cli/projects/`
+- **Linux:** `~/.config/Qoder/SharedClientCache/cli/projects/`
+- **Windows:** `%APPDATA%\Qoder\SharedClientCache\cli\projects\`
+
+Set `QODER_PROJECTS_DIR` or `qoder_project_dirs` to replace these defaults with
+one or more explicit roots.
 
 Grok sessions are read from `summary.json` (title, timestamps, project),
 optional `signals.json` (token counters), and `chat_history.jsonl` when
@@ -640,6 +670,7 @@ export DEVIN_DIR=~/Library/Application\ Support/devin
 export CORTEX_DIR=~/custom/cortex
 export CURSOR_PROJECTS_DIR=~/custom/cursor
 export DEEPSEEK_TUI_SESSIONS_DIR=~/custom/deepseek/sessions
+export DEEPSEEK_HARNESS_SESSIONS_DIR=~/custom/deepseek-harness/sessions
 export FORGE_DIR=~/custom/forge
 export GEMINI_DIR=~/custom/gemini
 export GOOSE_PATH_ROOT=~/custom/goose
@@ -683,6 +714,30 @@ export ZED_DIR=~/custom/zed
 export ZENCODER_DIR=~/custom/zencoder
 ```
 
+### Disabling Session Providers
+
+Exclude session providers you do not use by listing their IDs in
+`disabled_agents`:
+
+```toml
+disabled_agents = ["gemini"]
+```
+
+Because Freebuff shares the Codebuff provider, listing `"codebuff"` disables
+local filesystem ingestion for both Codebuff and Freebuff.
+
+The setting applies only to local filesystem discovery, targeted local file
+sync, file watching, and scheduled polling. It does not affect HTTP or SSH
+remote imports, and it does not restrict HTTP, SSH, PostgreSQL, DuckDB, or
+archive exports. `RemoteSyncExcluded` is the separate provider capability that
+keeps unsafe source trees out of remote exports.
+
+Restart the AgentsView daemon and any separate `pg push --watch` or
+`duckdb push --watch` process after changing the setting. Previously archived
+sessions from a disabled provider remain available and exportable, including
+during archive rebuilds. The setting does not disable that provider as a Recall
+execution backend.
+
 ### Multiple Directories
 
 To scan more than one directory per agent — for example, when running Windows
@@ -703,7 +758,8 @@ The corresponding fields are `aider_dirs`, `amp_dirs`, `antigravity_dirs`,
 `antigravity_cli_dirs`, `claude_project_dirs`, `openclaude_project_dirs`,
 `cowork_dirs`, `devin_dirs`, `codebuff_dirs`, `codex_sessions_dirs`, `commandcode_project_dirs`,
 `copilot_dirs`, `cortex_dirs`, `cursor_project_dirs`,
-`deepseek_tui_sessions_dirs`, `forge_dirs`, `gemini_dirs`, `goose_dirs`,
+`deepseek_harness_sessions_dirs`, `deepseek_tui_sessions_dirs`, `forge_dirs`,
+`gemini_dirs`, `goose_dirs`,
 `gptme_dirs`, `grok_dirs`, `hermes_sessions_dirs`, `iflow_dirs`, `kilo_dirs`,
 `kilo_legacy_dirs`, `kimi_dirs`, `kimi_work_dirs`, `kiro_dirs`, `kiro_ide_dirs`,
 `mimocode_dirs`, `vibe_session_dirs`, `omp_dirs`, `openclaw_dirs`,
@@ -713,8 +769,9 @@ The corresponding fields are `aider_dirs`, `amp_dirs`, `antigravity_dirs`,
 `shelley_dirs`, `traex_sessions_dirs`, `visualstudio_copilot_dirs`,
 `vscode_copilot_dirs`, `windsurf_dirs`, `warp_dirs`,
 `workbuddy_project_dirs`, `zcode_dirs`, `zed_dirs`, and `zencoder_dirs`. Each
-accepts an array of paths. When set, these take precedence over the
-single-directory environment variable and the default path.
+accepts an array of paths. Environment variables take precedence over these
+arrays when both are set; otherwise, a non-empty array replaces the default
+path and an explicit empty array clears the default local directory.
 
 All listed directories are discovered, watched, and synced independently.
 
@@ -1126,7 +1183,8 @@ Optional features that send data externally when you enable them:
 - The [DuckDB mirror](/duckdb/) writes a local DuckDB file by default; data only
   leaves the machine if you expose the mirror over a remote Quack endpoint.
 - [Generated insights](/recall/#current-surface) sends scoped session content to
-  the selected agent CLI to generate reports.
+  the configured endpoint when `[insights]` is set, or to the selected agent
+  CLI when it is absent.
 - [Publish to Gist](/usage/#publish-to-gist) uploads a session to GitHub.
 
 The automatic outbound requests are update checks and an anonymous daemon ping:
