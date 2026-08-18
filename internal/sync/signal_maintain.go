@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -274,13 +275,9 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 	hasToolCalls := sess.HasToolCalls || len(appendedRows) > 0
 	hasContextData := sess.HasContextData || appendedHasContextData
 	noCodeContext := sess.NoCodeContextCount
-	if noCodeContext > 0 {
-		for _, r := range appendedRows {
-			if signals.IsContextToolCall(r) {
-				noCodeContext = 0
-				break
-			}
-		}
+	if noCodeContext > 0 &&
+		slices.ContainsFunc(appendedRows, signals.IsContextToolCall) {
+		noCodeContext = 0
 	}
 	// When the session has explicit compact boundaries the full compute
 	// derives the compaction count from the boundary count and ignores
@@ -400,11 +397,7 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 }
 
 func cloneCounts(in map[string]int) map[string]int {
-	out := make(map[string]int, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
+	return maps.Clone(in)
 }
 
 // mostCommonModelFromCounts mirrors extractMostCommonModel's tie-break:

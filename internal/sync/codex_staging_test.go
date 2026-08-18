@@ -799,10 +799,6 @@ func TestCodexStagedBlockedCategorySignalParity(t *testing.T) {
 		"a blocked output with a failure marker must never be a content failure")
 }
 
-func timePtr(s string) *string { return &s }
-
-var _ = timePtr // retained for future helpers
-
 func sortFindings(findings []db.SecretFinding) {
 	sort.Slice(findings, func(i, j int) bool {
 		a, b := findings[i], findings[j]

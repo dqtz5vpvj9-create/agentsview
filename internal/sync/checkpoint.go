@@ -265,9 +265,7 @@ func codexCheckpointAnchorDigest(
 		return "", nil
 	}
 	start := offset - codexCheckpointAnchorSize
-	if start < 0 {
-		start = 0
-	}
+	start = max(start, 0)
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err

@@ -274,8 +274,8 @@ func (b *codexSessionBuilder) refreshPendingCallPositions() {
 		)
 	}
 	for id, pendingIndexes := range pendingByID {
-		positions := positionsByID[id]
-		if len(positions) < len(pendingIndexes) {
+		positions, ok := positionsByID[id]
+		if !ok || len(positions) < len(pendingIndexes) {
 			b.checkpointUnsafe = true
 			return
 		}
@@ -2045,57 +2045,6 @@ func seedCodexIncrementalStateFromReader(
 		b.clearPendingCallPositions()
 	}
 	return b.codexCursorState, nil
-}
-
-func observeCodexIncrementalResponseItem(
-	s *codexIncrementalSeed,
-	payload gjson.Result,
-) {
-	switch payload.Get("type").Str {
-	case "function_call", "custom_tool_call":
-		s.rememberToolCall(
-			payload.Get("call_id").Str,
-			payload.Get("name").Str,
-			nil,
-		)
-	case "function_call_output", "custom_tool_call_output":
-		s.forgetToolCall(payload.Get("call_id").Str)
-	default:
-		observeCodexIncrementalUserMessage(s, payload)
-	}
-}
-
-// observeUserMessage feeds one response_item into the
-// re-emitted-prompt dedup state, mirroring handleResponseItem's
-// user-message filtering and full-content matching.
-func observeCodexIncrementalUserMessage(
-	s *codexIncrementalSeed,
-	payload gjson.Result,
-) {
-	if payload.Get("type").Str == "agent_message" {
-		content := extractCodexInboundAgentMessage(payload, s.agentPath)
-		if strings.TrimSpace(content) != "" {
-			s.observeUserPrompt(content)
-		}
-		return
-	}
-	if payload.Get("role").Str != "user" {
-		return
-	}
-	content := extractCodexContent(payload)
-	if !s.firstUserSeen {
-		content = extractCodexInitialUserContent(payload)
-	}
-	if strings.TrimSpace(content) == "" {
-		return
-	}
-	if isCodexTurnAbortedMessage(content) {
-		s.markFirstUserReplayPossible()
-	}
-	if isCodexSystemMessage(content) {
-		return
-	}
-	s.observeUserPrompt(content)
 }
 
 // CodexTranscriptConsumedSize returns the byte offset after the last complete,

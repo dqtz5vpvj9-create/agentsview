@@ -20,6 +20,7 @@ package signals
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 )
 
@@ -394,6 +395,9 @@ func (s *IncrementalState) FoldToolHealth(
 
 	// Full tail facts: old window + appended, then overlay modifications.
 	fullTail := mergeFacts(s.Trailing, factsFor(appended))
+	if fullTail == nil {
+		fullTail = []ToolFact{}
+	}
 	for pos, newFact := range modified {
 		idx := slices.IndexFunc(fullTail, func(f ToolFact) bool {
 			return f.CallPos == pos
@@ -408,12 +412,8 @@ func (s *IncrementalState) FoldToolHealth(
 	// fullTail[0] sits at absolute position oldCut, so the window offset
 	// is the difference between the two cuts.
 	newCut := newCutAbs - oldCut
-	if newCut < 0 {
-		newCut = 0
-	}
-	if newCut > len(fullTail) {
-		newCut = len(fullTail)
-	}
+	newCut = max(newCut, 0)
+	newCut = min(newCut, len(fullTail))
 	next.Trailing = append([]ToolFact(nil), fullTail[newCut:]...)
 
 	// Failure count: flips plus appended failures.
@@ -491,10 +491,7 @@ func (s *IncrementalState) FoldToolHealth(
 
 	// Edit churn: only appends add edit calls; a file counts once.
 	out.EditChurnCount = row.EditChurnCount
-	editLast := make(map[string]EditChurnState, len(s.EditLast))
-	for path, st := range s.EditLast {
-		editLast[path] = st
-	}
+	editLast := maps.Clone(s.EditLast)
 	for _, c := range appended {
 		if c.Category != "Edit" && c.Category != "Write" {
 			continue

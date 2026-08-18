@@ -444,11 +444,10 @@ func processRchar(t *testing.T) int64 {
 	t.Helper()
 	data, err := os.ReadFile("/proc/self/io")
 	require.NoError(t, err)
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "rchar: ") {
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if rest, ok := strings.CutPrefix(line, "rchar: "); ok {
 			v, err := strconv.ParseInt(
-				strings.TrimSpace(strings.TrimPrefix(line, "rchar: ")),
-				10, 64,
+				strings.TrimSpace(rest), 10, 64,
 			)
 			require.NoError(t, err)
 			return v

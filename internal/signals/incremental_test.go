@@ -381,7 +381,8 @@ func TestIncrementalFinalFailureStreakAcrossWindow(t *testing.T) {
 
 	// The 40-failure list itself: the final streak must be 40, not the
 	// 35-fact trailing window size.
-	next, got, ok := state.FoldToolHealth(nil, nil, row)
+	var next IncrementalState
+	_, got, ok := state.FoldToolHealth(nil, nil, row)
 	require.True(t, ok)
 	full := fullToolHealth(calls)
 	assert.Equal(t, full.FinalFailureStreak, got.FinalFailureStreak,

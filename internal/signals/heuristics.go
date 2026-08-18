@@ -539,12 +539,7 @@ func jaccardFromOverlap(currentUnique, previousTotal, intersections int) float64
 }
 
 func hasContextToolActivity(calls []ToolCallRow) bool {
-	for _, c := range calls {
-		if IsContextToolCall(c) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(calls, IsContextToolCall)
 }
 
 // IsContextToolCall reports whether a tool call counts as context-gathering

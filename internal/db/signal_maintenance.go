@@ -247,7 +247,7 @@ func (q signalTxQuery) TrailingToolCalls(
 		)
 	}
 	defer rows.Close()
-	var facts []ToolCallSignalFact
+	var facts = make([]ToolCallSignalFact, 0)
 	for rows.Next() {
 		var f ToolCallSignalFact
 		if err := rows.Scan(
@@ -635,9 +635,7 @@ func applySignalDeltaTx(
 		)
 	}
 	newLeak := currentLeak - deletedDefinite + addedDefinite
-	if newLeak < 0 {
-		newLeak = 0
-	}
+	newLeak = max(newLeak, 0)
 
 	if err := updateSessionSignalsTx(tx, sessionID, d.Update); err != nil {
 		return err

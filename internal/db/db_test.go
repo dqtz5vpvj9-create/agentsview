@@ -4112,7 +4112,7 @@ func TestWriteSessionIncrementalToolCallResultUpdate(t *testing.T) {
 func TestWriteSessionIncrementalTargetsDuplicateCallIDOccurrence(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "s1", "proj")
-	for ordinal := 0; ordinal < 2; ordinal++ {
+	for ordinal := range 2 {
 		insertMessages(t, d, Message{
 			SessionID:  "s1",
 			Ordinal:    ordinal,

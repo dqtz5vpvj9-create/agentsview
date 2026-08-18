@@ -165,7 +165,10 @@ func summarizeToolCallFromStateTx(
 	}
 	if len(latest) <= 1 {
 		if len(latest) == 1 {
-			summary := latest[orderedAgents[0]]
+			var summary string
+			for _, content := range latest {
+				summary = content
+			}
 			if lastAnon != "" {
 				return summary + "\n\n" + lastAnon, nil
 			}
@@ -251,7 +254,10 @@ func summarizeToolCallLengthFromStateTx(
 	case len(latest) == 0:
 		return lastAnonLen, nil
 	case len(latest) == 1:
-		total := latest[orderedAgents[0]]
+		var total int
+		for _, length := range latest {
+			total = length
+		}
 		if lastAnonLen > 0 {
 			total += 2 + lastAnonLen
 		}

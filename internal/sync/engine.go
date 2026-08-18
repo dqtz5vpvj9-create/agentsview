@@ -1493,7 +1493,7 @@ func (j *syncJob) releaseRetention() {
 // scratch database and pins the process GC percent at the staged value.
 func (j *syncJob) releaseAll() {
 	j.releaseRetention()
-	j.processResult.releaseStaged()
+	j.releaseStaged()
 }
 
 func (j syncJob) skipCacheKey() string {
@@ -14144,7 +14144,7 @@ func (e *Engine) recomputeSignalsFromDBWithHook(
 	beforePublish func(attempt int),
 ) (int, error) {
 	const maxSnapshotAttempts = 3
-	for attempt := 0; attempt < maxSnapshotAttempts; attempt++ {
+	for attempt := range maxSnapshotAttempts {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
