@@ -2575,7 +2575,7 @@ func TestCodexCursorWarmColdParity(t *testing.T) {
 	prefixInfo, err := os.Stat(path)
 	require.NoError(t, err)
 	prefixOffset := prefixInfo.Size()
-	inode, device := sourceFileIdentity(prefixInfo)
+	inode, device := sourceFileIdentityForPath(path, prefixInfo)
 	_, cursorHit := warmProvider.cursorCache.Get(
 		path, prefixOffset, inode, device,
 	)
@@ -2644,7 +2644,7 @@ func TestCodexPromptReplayDigestParity(t *testing.T) {
 	prefixInfo, err := os.Stat(path)
 	require.NoError(t, err)
 	prefixOffset := prefixInfo.Size()
-	inode, device := sourceFileIdentity(prefixInfo)
+	inode, device := sourceFileIdentityForPath(path, prefixInfo)
 	seed, cursorHit := warmProvider.cursorCache.Get(
 		path, prefixOffset, inode, device,
 	)

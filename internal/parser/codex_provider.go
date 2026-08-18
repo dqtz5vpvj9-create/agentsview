@@ -410,7 +410,7 @@ func (p *codexProvider) ParseIncremental(
 	if err != nil {
 		return IncrementalOutcome{}, IncrementalNeedsFullParse, err
 	}
-	inode, device := sourceFileIdentityForPath(path, info)
+	inode, device := sourceFileIdentityForFile(f, info)
 	if (req.Fingerprint.Inode != 0 && req.Fingerprint.Inode != inode) ||
 		(req.Fingerprint.Device != 0 && req.Fingerprint.Device != device) ||
 		info.Size() < req.Fingerprint.Size {

@@ -75,7 +75,7 @@ func TestCodexProviderSourceMethods(t *testing.T) {
 	assert.Equal(t, sourcePath, fingerprint.Key)
 	assert.Equal(t, info.Size(), fingerprint.Size)
 	assert.Equal(t, newer.UnixNano(), fingerprint.MTimeNS)
-	wantInode, wantDevice := sourceFileIdentity(info)
+	wantInode, wantDevice := sourceFileIdentityForPath(sourcePath, info)
 	assert.Equal(t, wantInode, fingerprint.Inode)
 	assert.Equal(t, wantDevice, fingerprint.Device)
 	assert.NotEmpty(t, fingerprint.Hash)
@@ -377,7 +377,7 @@ func TestCodexProviderFactoryScopesCursorCache(t *testing.T) {
 	require.NotNil(t, sess)
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	inode, device := sourceFileIdentity(info)
+	inode, device := sourceFileIdentityForPath(path, info)
 
 	_, siblingHit := siblingProvider.cursorCache.Get(
 		path, info.Size(), inode, device,
@@ -429,7 +429,7 @@ func TestCodexProviderFullParseSnapshotExcludesLaterGrowth(t *testing.T) {
 	require.Len(t, messages, 1)
 	assert.Equal(t, RoleUser, messages[0].Role)
 	assert.Equal(t, "captured request", messages[0].Content)
-	inode, device := sourceFileIdentity(capturedInfo)
+	inode, device := sourceFileIdentityForFile(snapshot, capturedInfo)
 	seed, seeded := concrete.cursorCache.Get(
 		path, int64(len(initial)), inode, device,
 	)
@@ -491,14 +491,14 @@ func TestCodexProviderFullParseSnapshotKeepsDescriptorIdentityAfterReplacement(
 	defer snapshot.Close()
 	snapshotInfo, err := snapshot.Stat()
 	require.NoError(t, err)
-	oldInode, oldDevice := sourceFileIdentity(snapshotInfo)
+	oldInode, oldDevice := sourceFileIdentityForFile(snapshot, snapshotInfo)
 
 	replacementPath := path + ".replacement"
 	require.NoError(t, os.WriteFile(replacementPath, []byte(replacement), 0o644))
 	require.NoError(t, os.Rename(replacementPath, path))
 	currentInfo, err := os.Stat(path)
 	require.NoError(t, err)
-	newInode, newDevice := sourceFileIdentity(currentInfo)
+	newInode, newDevice := sourceFileIdentityForPath(path, currentInfo)
 
 	sess, messages, err := concrete.parseSessionSnapshot(
 		path, "local", false, snapshot, snapshotInfo,

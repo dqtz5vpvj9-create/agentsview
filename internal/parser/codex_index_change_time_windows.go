@@ -20,15 +20,12 @@ type codexIndexWindowsFileBasicInfo struct {
 	_              uint32
 }
 
-func codexIndexChangeTime(path string, _ os.FileInfo) (int64, bool) {
-	file, err := os.Open(path)
-	if err != nil {
+func codexIndexChangeTimeForFile(file *os.File, _ os.FileInfo) (int64, bool) {
+	if file == nil {
 		return 0, false
 	}
-	defer file.Close()
-
 	var info codexIndexWindowsFileBasicInfo
-	err = windows.GetFileInformationByHandleEx(
+	err := windows.GetFileInformationByHandleEx(
 		windows.Handle(file.Fd()),
 		windows.FileBasicInfo,
 		(*byte)(unsafe.Pointer(&info)),
@@ -38,4 +35,13 @@ func codexIndexChangeTime(path string, _ os.FileInfo) (int64, bool) {
 		return 0, false
 	}
 	return (info.changeTime - codexNTFSEpochOffset) * 100, true
+}
+
+func codexIndexChangeTime(path string, info os.FileInfo) (int64, bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, false
+	}
+	defer file.Close()
+	return codexIndexChangeTimeForFile(file, info)
 }

@@ -238,7 +238,7 @@ func TestCodexCursorFullParseSeedBoundaries(t *testing.T) {
 		assert.Equal(t, int64(0), sess.File.Size)
 		info, err := os.Stat(path)
 		require.NoError(t, err)
-		inode, device := sourceFileIdentity(info)
+		inode, device := sourceFileIdentityForPath(path, info)
 		_, ok := provider.cursorCache.Get(path, 0, inode, device)
 		assert.True(t, ok)
 	})
@@ -261,7 +261,7 @@ func TestCodexCursorFullParseSeedBoundaries(t *testing.T) {
 		assert.Equal(t, int64(len(content)), sess.File.Size)
 		info, err := os.Stat(path)
 		require.NoError(t, err)
-		inode, device := sourceFileIdentity(info)
+		inode, device := sourceFileIdentityForPath(path, info)
 		_, ok := provider.cursorCache.Get(
 			path, int64(len(content)), inode, device,
 		)
@@ -282,7 +282,7 @@ func TestCodexCursorFullParseSeedBoundaries(t *testing.T) {
 		assert.Equal(t, int64(len(content)), sess.File.Size)
 		info, err := os.Stat(path)
 		require.NoError(t, err)
-		inode, device := sourceFileIdentity(info)
+		inode, device := sourceFileIdentityForPath(path, info)
 		_, ok := provider.cursorCache.Get(
 			path, int64(len(content)), inode, device,
 		)

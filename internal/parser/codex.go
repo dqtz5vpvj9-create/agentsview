@@ -1642,8 +1642,8 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 	b.refreshPendingCallPositions()
 	msgs := b.sink.Messages()
 	seed := b.incrementalSeed()
-	inode, device := sourceFileIdentityForPath(path, info)
-	changeTime, _ := codexIndexChangeTime(path, info)
+	inode, device := sourceFileIdentityForFile(f, info)
+	changeTime, _ := codexIndexChangeTimeForFile(f, info)
 	safe := false
 	// A snapshot that ends while the fork replay gate is still active
 	// contains only replayed parent history so far. Persisting a cursor
