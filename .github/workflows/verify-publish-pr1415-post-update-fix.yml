@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - repair/pr1415-post-update-unified-fix
-    paths:
-      - .github/workflows/verify-publish-pr1415-post-update-fix.yml
 
 permissions:
   contents: read
