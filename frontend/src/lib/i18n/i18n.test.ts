@@ -16,6 +16,7 @@ import zhCN from "../../../messages/zh-CN.json";
 import zhTW from "../../../messages/zh-TW.json";
 import ko from "../../../messages/ko.json";
 import fr from "../../../messages/fr.json";
+import ja from "../../../messages/ja.json";
 
 describe("i18n locale selection", () => {
   beforeEach(() => {
@@ -37,6 +38,8 @@ describe("i18n locale selection", () => {
     expect(normalizeLocale("fr-FR")).toBe("fr");
     expect(normalizeLocale("fr-CA")).toBe("fr");
     expect(normalizeLocale("fr-CH")).toBe("fr");
+    expect(normalizeLocale("ja")).toBe("ja");
+    expect(normalizeLocale("ja-JP")).toBe("ja");
   });
 
   it("falls back to English for unsupported locales", () => {
@@ -82,7 +85,7 @@ describe("i18n locale selection", () => {
   });
 
   it("keeps the supported locale list explicit", () => {
-    expect(SUPPORTED_LOCALES).toEqual(["en", "zh-CN", "zh-TW", "ko", "fr"]);
+    expect(SUPPORTED_LOCALES).toEqual(["en", "zh-CN", "zh-TW", "ko", "fr", "ja"]);
   });
 
   it("keeps every translated locale's keys aligned with English", () => {
@@ -90,6 +93,7 @@ describe("i18n locale selection", () => {
     expect(Object.keys(zhTW).sort()).toEqual(Object.keys(en).sort());
     expect(Object.keys(ko).sort()).toEqual(Object.keys(en).sort());
     expect(Object.keys(fr).sort()).toEqual(Object.keys(en).sort());
+    expect(Object.keys(ja).sort()).toEqual(Object.keys(en).sort());
   });
 
   it("points auth recovery at pre-auth token sources", () => {
@@ -138,6 +142,14 @@ describe("i18n locale selection", () => {
       count: 12,
       countLabel: "12",
     })).toBe("12 sessions");
+
+    runtime.setLocale("ja", { reload: false });
+    expect(m.nav_sessions()).toBe(ja.nav_sessions);
+    expect(m.session_breadcrumb_usage_breakdown_steps({
+      count: 5,
+      countLabel: "5",
+    })).toBe("5 ステップ");
+    expect(m.trash_deleted_ago({ time: "ちょうど今" })).toBe("削除: ちょうど今");
   });
 
   it("selects cardinal plural variants per locale", () => {

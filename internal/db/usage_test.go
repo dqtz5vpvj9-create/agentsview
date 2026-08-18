@@ -1504,6 +1504,49 @@ func TestParseUsageTokenCounters(t *testing.T) {
 	assert.Zero(t, cacheRead)
 }
 
+// TestParseJSONStringMatchesEncodingJSON pins the string scanner to
+// json.Unmarshal: the escape-free fast path and the encoding/json fallback
+// must decode identically and reject the same input.
+func TestParseJSONStringMatchesEncodingJSON(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+		next  int
+		ok    bool
+	}{
+		{"plain", `"input_tokens":1`, "input_tokens", 14, true},
+		{"empty", `""`, "", 2, true},
+		{"escaped quote", `"a\"b"`, `a"b`, 6, true},
+		{"escaped slash", `"https:\/\/x"`, "https://x", 13, true},
+		{"unicode escape", `"\u00e9"`, "é", 8, true},
+		{"raw utf8", `"é"`, "é", 4, true},
+		{"trailing escape", `"abc\`, "", 5, false},
+		{"unterminated", `"abc`, "", 4, false},
+		{"not a string", `123`, "", 0, false},
+		{"raw control char", "\"a\tb\"", "", 5, false},
+		{"invalid utf8", "\"a\xffb\"", "a\ufffdb", 5, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, next, ok := parseJSONString(tc.input, 0)
+			assert.Equal(t, tc.ok, ok, "ok")
+			assert.Equal(t, tc.next, next, "next")
+			assert.Equal(t, tc.want, got, "value")
+			var want string
+			if !tc.ok {
+				require.Error(t,
+					json.Unmarshal([]byte(tc.input), &want),
+					"json.Unmarshal parity")
+				return
+			}
+			require.NoError(t, json.Unmarshal(
+				[]byte(tc.input[:tc.next]), &want))
+			assert.Equal(t, want, got, "json.Unmarshal parity")
+		})
+	}
+}
+
 func TestUsageAggregationClampsMessageTokenJSON(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()
@@ -1615,6 +1658,46 @@ func TestGetDailyUsage_DedupesByClaudeMessageAndRequestID(t *testing.T) {
 	assert.Equal(t, 580, day.OutputTokens, "output")
 	assert.Equal(t, 1200, day.CacheCreationTokens, "cache_cr")
 	assert.Equal(t, 55000, day.CacheReadTokens, "cache_rd")
+}
+
+func TestGetDailyUsage_DistinguishesClaudeIDsContainingNUL(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "nul-identities", "project", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = new("2026-04-10T10:00:00Z")
+	})
+
+	insertMessages(t, d,
+		Message{
+			SessionID: "nul-identities", Ordinal: 0, Role: "assistant",
+			Timestamp: "2026-04-10T10:01:00Z", Model: "model",
+			ClaudeMessageID: "a\x00", ClaudeRequestID: "x",
+			TokenUsage: json.RawMessage(
+				`{"input_tokens":100,"output_tokens":10}`),
+		},
+		Message{
+			SessionID: "nul-identities", Ordinal: 1, Role: "assistant",
+			Timestamp: "2026-04-10T10:02:00Z", Model: "model",
+			ClaudeMessageID: "a\x00", ClaudeRequestID: "x",
+			TokenUsage: json.RawMessage(
+				`{"input_tokens":200,"output_tokens":20}`),
+		},
+		Message{
+			SessionID: "nul-identities", Ordinal: 2, Role: "assistant",
+			Timestamp: "2026-04-10T10:03:00Z", Model: "model",
+			ClaudeMessageID: "a", ClaudeRequestID: "\x00x",
+			TokenUsage: json.RawMessage(
+				`{"input_tokens":300,"output_tokens":30}`),
+		},
+	)
+
+	result, err := d.GetDailyUsage(t.Context(), UsageFilter{
+		From: "2026-04-10", To: "2026-04-10", Timezone: "UTC",
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Daily, 1)
+	assert.Equal(t, 500, result.Daily[0].InputTokens)
+	assert.Equal(t, 50, result.Daily[0].OutputTokens)
 }
 
 func TestUsageAggregatesPreferCompleteClaudeSnapshotAcrossSessions(t *testing.T) {
@@ -3863,6 +3946,8 @@ func TestExcludeModelFilter(t *testing.T) {
 	}
 }
 
+// BenchmarkGetDailyUsage retains the original 100,000-row fixture and name
+// so benchgate can compare this branch directly with its merge base.
 func BenchmarkGetDailyUsage(b *testing.B) {
 	d := testDB(b)
 	ctx := context.Background()
@@ -3959,6 +4044,223 @@ func BenchmarkGetDailyUsage(b *testing.B) {
 			b.Fatalf("GetDailyUsage: %v", err)
 		}
 	}
+}
+
+// BenchmarkGetDailyUsageSnapshotWindows measures the ordinary CLI query
+// shape over bounded windows with duplicated Claude streaming snapshots.
+func BenchmarkGetDailyUsageSnapshotWindows(b *testing.B) {
+	d := testDB(b)
+	seedDailyUsageSnapshotBenchmark(b, d)
+
+	windows := []struct {
+		name string
+		from string
+		want benchmarkDailyUsageExpectation
+	}{
+		{"window=1d", "2024-07-30", benchmarkDailyUsageExpectation{
+			days: 1, input: 1_920_000, output: 768_000,
+			cacheCreation: 480_000, cacheRead: 3_840_000,
+		}},
+		{"window=7d", "2024-07-24", benchmarkDailyUsageExpectation{
+			days: 7, input: 13_440_000, output: 5_376_000,
+			cacheCreation: 3_360_000, cacheRead: 26_880_000,
+		}},
+		{"window=30d", "2024-07-01", benchmarkDailyUsageExpectation{
+			days: 30, input: 57_600_000, output: 23_040_000,
+			cacheCreation: 14_400_000, cacheRead: 115_200_000,
+		}},
+		{"window=60d", "2024-06-01", benchmarkDailyUsageExpectation{
+			days: 60, input: 120_000_000, output: 48_000_000,
+			cacheCreation: 30_000_000, cacheRead: 240_000_000,
+		}},
+	}
+	for _, window := range windows {
+		b.Run(window.name, func(b *testing.B) {
+			benchmarkDailyUsageSnapshotWindow(
+				b, d, window.from, window.want,
+			)
+		})
+	}
+}
+
+// BenchmarkGetDailyUsageSnapshotAutomaticIndexOff keeps the survivor query
+// fast even when SQLite cannot create an automatic join index.
+func BenchmarkGetDailyUsageSnapshotAutomaticIndexOff(b *testing.B) {
+	d := testDB(b)
+	seedDailyUsageSnapshotBenchmark(b, d)
+	reader := d.rawReader()
+	reader.SetMaxOpenConns(1)
+	_, err := reader.ExecContext(b.Context(), "PRAGMA automatic_index = OFF")
+	require.NoError(b, err)
+	var automaticIndex int
+	require.NoError(b,
+		reader.QueryRowContext(b.Context(), "PRAGMA automatic_index").
+			Scan(&automaticIndex))
+	require.Zero(b, automaticIndex)
+
+	benchmarkDailyUsageSnapshotWindow(
+		b, d, "2024-07-01", benchmarkDailyUsageExpectation{
+			days: 30, input: 57_600_000, output: 23_040_000,
+			cacheCreation: 14_400_000, cacheRead: 115_200_000,
+		},
+	)
+}
+
+type benchmarkDailyUsageExpectation struct {
+	days          int
+	input         int
+	output        int
+	cacheCreation int
+	cacheRead     int
+}
+
+func benchmarkDailyUsageSnapshotWindow(
+	b *testing.B,
+	d *DB,
+	from string,
+	want benchmarkDailyUsageExpectation,
+) {
+	b.Helper()
+	ctx := context.Background()
+	filter := UsageFilter{
+		From: from, To: "2024-07-30", Timezone: "UTC",
+		SkipSessionCounts: true,
+	}
+
+	result, err := d.GetDailyUsage(ctx, filter)
+	require.NoError(b, err)
+	require.Len(b, result.Daily, want.days)
+	assert.Equal(b, want.input, result.Totals.InputTokens)
+	assert.Equal(b, want.output, result.Totals.OutputTokens)
+	assert.Equal(b, want.cacheCreation, result.Totals.CacheCreationTokens)
+	assert.Equal(b, want.cacheRead, result.Totals.CacheReadTokens)
+	assert.Zero(b, result.SessionCounts.Total)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, err := d.GetDailyUsage(ctx, filter)
+		if err != nil {
+			b.Fatalf("GetDailyUsage: %v", err)
+		}
+	}
+}
+
+// seedDailyUsageSnapshotBenchmark adds 100,000 base messages and 3,320
+// lower-output snapshots across 500 sessions and 60 days.
+func seedDailyUsageSnapshotBenchmark(tb testing.TB, d *DB) {
+	tb.Helper()
+	origLog := log.Writer()
+	log.SetOutput(io.Discard)
+	defer log.SetOutput(origLog)
+
+	require.NoError(tb, d.UpsertModelPricing([]ModelPricing{
+		{ModelPattern: "claude-sonnet-4-20250514",
+			InputPerMTok: money.MustParseDollars("3.0"), OutputPerMTok: money.MustParseDollars("15.0"),
+			CacheCreationPerMTok: money.MustParseDollars("3.75"), CacheReadPerMTok: money.MustParseDollars("0.30")},
+		{ModelPattern: "claude-opus-4-20250514",
+			InputPerMTok: money.MustParseDollars("15.0"), OutputPerMTok: money.MustParseDollars("75.0"),
+			CacheCreationPerMTok: money.MustParseDollars("18.75"), CacheReadPerMTok: money.MustParseDollars("1.50")},
+		{ModelPattern: "gpt-5",
+			InputPerMTok: money.MustParseDollars("2.5"), OutputPerMTok: money.MustParseDollars("10.0"),
+			CacheCreationPerMTok: money.MustParseDollars("2.5"), CacheReadPerMTok: money.MustParseDollars("0.25")},
+		{ModelPattern: "gemini-2.5-pro",
+			InputPerMTok: money.MustParseDollars("1.25"), OutputPerMTok: money.MustParseDollars("5.0"),
+			CacheCreationPerMTok: money.MustParseDollars("1.25"), CacheReadPerMTok: money.MustParseDollars("0.125")},
+	}))
+
+	projects := []string{
+		"agentsview", "quokka", "arrow-rs", "side-quests",
+		"infrastructure", "blog", "experiments", "docs",
+		"dotfiles", "playground",
+	}
+	agents := []string{"claude", "codex", "openhands"}
+	claudeModels := []string{
+		"claude-sonnet-4-20250514", "claude-opus-4-20250514",
+	}
+	otherModels := []string{"gpt-5", "gemini-2.5-pro"}
+
+	const sessionCount = 500
+	const msgsPerSession = 200
+	const snapshotEvery = 10
+	tokenUsage := json.RawMessage(
+		`{"input_tokens":1200,"output_tokens":480,` +
+			`"cache_creation_input_tokens":300,` +
+			`"cache_read_input_tokens":2400}`)
+	snapshotTokenUsage := json.RawMessage(
+		`{"input_tokens":1200,"output_tokens":120,` +
+			`"cache_creation_input_tokens":300,` +
+			`"cache_read_input_tokens":2400}`)
+	startTime, err := time.Parse(time.RFC3339, "2024-06-01T00:00:00Z")
+	require.NoError(tb, err)
+
+	for i := range sessionCount {
+		id := "bench-sess-" + strconv.Itoa(i)
+		agent := agents[i%len(agents)]
+		day := startTime.AddDate(0, 0, i%60)
+		msgs := make([]Message, 0, msgsPerSession+msgsPerSession/snapshotEvery)
+		for j := range msgsPerSession {
+			ts := day.Add(time.Duration(j) * time.Minute)
+			msg := Message{
+				SessionID: id, Ordinal: len(msgs), Role: "assistant",
+				Timestamp:  ts.Format(time.RFC3339),
+				Model:      otherModels[(i+j)%len(otherModels)],
+				TokenUsage: tokenUsage,
+			}
+			if agent == "claude" {
+				msg.Model = claudeModels[(i+j)%len(claudeModels)]
+				msg.ClaudeMessageID = benchClaudeID("msg", i, j)
+				msg.ClaudeRequestID = benchClaudeID("req", i, j)
+				msg.OutputTokens = 480
+				msg.HasOutputTokens = true
+			}
+			msgs = append(msgs, msg)
+
+			prev := i - len(agents)
+			if agent == "claude" && prev >= 0 && j%snapshotEvery == 0 {
+				prevDay := startTime.AddDate(0, 0, prev%60)
+				msgs = append(msgs, Message{
+					SessionID: id, Ordinal: len(msgs), Role: "assistant",
+					Timestamp: prevDay.Add(time.Duration(j)*time.Minute +
+						30*time.Second).Format(time.RFC3339),
+					Model:           claudeModels[(prev+j)%len(claudeModels)],
+					TokenUsage:      snapshotTokenUsage,
+					ClaudeMessageID: benchClaudeID("msg", prev, j),
+					ClaudeRequestID: benchClaudeID("req", prev, j),
+					OutputTokens:    120, HasOutputTokens: true,
+				})
+			}
+		}
+
+		require.NoError(tb, d.UpsertSession(Session{
+			ID: id, Project: projects[i%len(projects)],
+			Machine: defaultMachine, Agent: agent,
+			MessageCount: len(msgs), StartedAt: new(day.Format(time.RFC3339)),
+		}))
+		require.NoError(tb, d.InsertMessages(msgs))
+	}
+
+	var messageRows, recordedMessages, duplicateRequests int
+	require.NoError(tb, d.rawWriter().QueryRow(
+		`SELECT COUNT(*) FROM messages`).Scan(&messageRows))
+	require.NoError(tb, d.rawWriter().QueryRow(
+		`SELECT SUM(message_count) FROM sessions`).Scan(&recordedMessages))
+	require.NoError(tb, d.rawWriter().QueryRow(`
+		SELECT COUNT(*) FROM (
+			SELECT claude_message_id, claude_request_id
+			FROM messages
+			WHERE claude_message_id != '' AND claude_request_id != ''
+			GROUP BY claude_message_id, claude_request_id
+			HAVING COUNT(*) > 1
+		)`).Scan(&duplicateRequests))
+	require.Equal(tb, 103_320, messageRows)
+	require.Equal(tb, 103_320, recordedMessages)
+	require.Equal(tb, 3_320, duplicateRequests)
+}
+
+func benchClaudeID(kind string, session, ordinal int) string {
+	return kind + "-bench-" + strconv.Itoa(session) + "-" +
+		strconv.Itoa(ordinal)
 }
 
 func TestGetDailyUsage_PricingPrecedence(t *testing.T) {
