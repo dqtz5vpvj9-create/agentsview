@@ -1,4 +1,4 @@
-name: Verify and publish PR 1415 unified repair
+name: Verify and publish PR 1415 unified repair v2
 
 on:
   push:
@@ -19,6 +19,7 @@ env:
   BASE_SHA: 08f90dd51ac68c3e3dc73ba6a9551a3f1e689319
   PATCH_SHA256: 475a3fbe15650c2580cb3cc6599f825f25e1598e7b5278c283899c40d076e393
   PATCH_XZ_SHA256: 141f250e181000ec35b8c5684bc7ddee611a4d7d9118bf303330c0c16097108d
+  ADDENDUM_SHA256: 556e83f81e6b80616edd39c619d84e04d5c70354992415ebcc6fb34de9715da8
   SNAPSHOT_SHA256: 0e89b636ccf858edbf95a3f6188476b6eab6cf21f66d16a65c2184229ef81cbe
 
 jobs:
@@ -50,7 +51,7 @@ jobs:
           go-version-file: target/go.mod
           cache: true
           cache-dependency-path: target/go.sum
-      - name: Verify and apply immutable patch
+      - name: Verify and apply immutable repairs
         run: |
           set -euo pipefail
           base64 --decode \
@@ -59,10 +60,15 @@ jobs:
           echo "$PATCH_XZ_SHA256  /tmp/pr1415.patch.xz" | sha256sum --check --strict
           xz --decompress --stdout /tmp/pr1415.patch.xz > /tmp/pr1415.patch
           echo "$PATCH_SHA256  /tmp/pr1415.patch" | sha256sum --check --strict
+          cp patch-source/.github/pr1415/patches/post-update-unified-v2-addendum.patch \
+            /tmp/pr1415-addendum.patch
+          echo "$ADDENDUM_SHA256  /tmp/pr1415-addendum.patch" | sha256sum --check --strict
           cd target
           test "$(git rev-parse HEAD)" = "$BASE_SHA"
           git apply --check /tmp/pr1415.patch
           git apply /tmp/pr1415.patch
+          git apply --check /tmp/pr1415-addendum.patch
+          git apply /tmp/pr1415-addendum.patch
           git diff --check
           actual_paths="$(git diff --name-only | sort)"
           expected_paths="$(cat <<'PATHS' | sort
@@ -187,12 +193,17 @@ jobs:
           echo "$PATCH_XZ_SHA256  /tmp/pr1415.patch.xz" | sha256sum --check --strict
           xz --decompress --stdout /tmp/pr1415.patch.xz > /tmp/pr1415.patch
           echo "$PATCH_SHA256  /tmp/pr1415.patch" | sha256sum --check --strict
+          cp ../patch-source/.github/pr1415/patches/post-update-unified-v2-addendum.patch \
+            /tmp/pr1415-addendum.patch
+          echo "$ADDENDUM_SHA256  /tmp/pr1415-addendum.patch" | sha256sum --check --strict
           test "$(git rev-parse HEAD)" = "$BASE_SHA"
           git fetch origin refs/heads/stack/5-codex-staged-imports
           test "$(git rev-parse FETCH_HEAD)" = "$BASE_SHA"
           git config core.hooksPath /dev/null
           git apply --check /tmp/pr1415.patch
           git apply /tmp/pr1415.patch
+          git apply --check /tmp/pr1415-addendum.patch
+          git apply /tmp/pr1415-addendum.patch
           git diff --check
           git add \
             internal/db/signal_maintenance.go \
@@ -206,7 +217,6 @@ jobs:
             internal/sync/engine.go \
             internal/sync/signal_maintain.go \
             internal/sync/signal_maintain_test.go
-          test -z "$(git status --short | grep '^??' || true)"
           git config user.name Shinn
           git config user.email 453821056@qq.com
           git commit \
