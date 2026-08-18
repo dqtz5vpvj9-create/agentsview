@@ -1,0 +1,33 @@
+name: Cleanup completed PR 1415 repair facilities
+
+on:
+  push:
+    branches:
+      - repair/pr1415-unified-derived-fix
+    paths:
+      - .github/workflows/cleanup-pr1415-unified-derived.yml
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: repair/pr1415-unified-derived-fix
+          persist-credentials: true
+          fetch-depth: 0
+      - name: Remove one-shot repair files
+        run: |
+          set -euo pipefail
+          git config user.name Shinn
+          git config user.email 453821056@qq.com
+          git rm -f --ignore-unmatch \
+            .github/workflows/export-pr1415-unified-source.yml \
+            .github/workflows/verify-publish-pr1415-unified-derived.yml \
+            .github/workflows/cleanup-pr1415-unified-derived.yml \
+            .github/pr1415/unified_derived_fix.py
+          git commit -m "chore: remove completed PR 1415 repair facilities"
+          git push origin HEAD:refs/heads/repair/pr1415-unified-derived-fix
