@@ -88,12 +88,26 @@ jobs:
           internal/sync/signal_maintain_test.go
           PATHS
           )"
-          test "$actual_paths" = "$expected_paths"
+          if [ "$actual_paths" != "$expected_paths" ]; then
+            echo 'Actual paths:'
+            printf '%s\n' "$actual_paths"
+            echo 'Expected paths:'
+            printf '%s\n' "$expected_paths"
+            diff -u <(printf '%s\n' "$expected_paths") <(printf '%s\n' "$actual_paths") || true
+            exit 1
+          fi
 
           unformatted="$(gofmt -l $(git diff --name-only -- '*.go'))"
-          test -z "$unformatted" || { echo "$unformatted"; exit 1; }
+          if [ -n "$unformatted" ]; then
+            echo 'Unformatted files:'
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
           git add --all
-          test "$(git write-tree)" = "$EXPECTED_TREE"
+          actual_tree="$(git write-tree)"
+          echo "actual tree:   $actual_tree"
+          echo "expected tree: $EXPECTED_TREE"
+          test "$actual_tree" = "$EXPECTED_TREE"
       - name: Restore exact pricing snapshot
         working-directory: target
         run: |
