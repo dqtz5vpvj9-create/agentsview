@@ -11,6 +11,10 @@ permissions:
   contents: read
   statuses: write
 
+concurrency:
+  group: verify-pr1415-occurrence-fixes
+  cancel-in-progress: true
+
 jobs:
   verify:
     name: ${{ matrix.mode }}
@@ -22,14 +26,14 @@ jobs:
         mode: [tests-vet, race, bench]
     steps:
       - name: Check out immutable patch source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ github.sha }}
           path: patch-source
           persist-credentials: false
           fetch-depth: 1
       - name: Check out exact PR head
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: 09b43810514e9b511dd0ba4156ea655f1c379621
           path: target
@@ -53,65 +57,19 @@ jobs:
           echo "$EXPECTED_XZ_SHA256  /tmp/pr1415.patch.xz" | sha256sum --check --strict
           xz --decompress --stdout /tmp/pr1415.patch.xz > /tmp/pr1415.patch
           echo "$EXPECTED_PATCH_SHA256  /tmp/pr1415.patch" | sha256sum --check --strict
-
           cd target
           test "$(git rev-parse HEAD)" = "$EXPECTED_BASE"
           git apply --check /tmp/pr1415.patch
           git apply /tmp/pr1415.patch
           git diff --check
-
-          actual_paths="$(
-            { git diff --name-only; git ls-files --others --exclude-standard; } |
-              sort -u
-          )"
-          expected_paths="$(cat <<'PATHS' | sort
-          internal/db/db_test.go
-          internal/db/messages.go
-          internal/db/messages_diff.go
-          internal/db/schema.sql
-          internal/db/sessions.go
-          internal/db/signal_maintenance.go
-          internal/parser/codex.go
-          internal/parser/codex_checkpoint_test.go
-          internal/parser/codex_collecting_sink.go
-          internal/parser/codex_cursor.go
-          internal/parser/codex_cursor_test.go
-          internal/parser/codex_parser_test.go
-          internal/parser/codex_provider_test.go
-          internal/parser/codex_seed_sink.go
-          internal/parser/codex_sink.go
-          internal/parser/types.go
-          internal/signals/incremental.go
-          internal/signals/incremental_test.go
-          internal/sync/checkpoint_review_test.go
-          internal/sync/codex_staging.go
-          internal/sync/codex_staging_test.go
-          internal/sync/engine.go
-          internal/sync/signal_maintain.go
-          internal/sync/signal_maintain_test.go
-          PATHS
-          )"
-          if [ "$actual_paths" != "$expected_paths" ]; then
-            echo 'Actual paths:'
-            printf '%s\n' "$actual_paths"
-            echo 'Expected paths:'
-            printf '%s\n' "$expected_paths"
-            diff -u <(printf '%s\n' "$expected_paths") <(printf '%s\n' "$actual_paths") || true
-            exit 1
-          fi
-
-          unformatted="$(gofmt -l $actual_paths)"
-          if [ -n "$unformatted" ]; then
-            echo 'Unformatted files:'
-            printf '%s\n' "$unformatted"
-            exit 1
-          fi
+          actual_paths="$({ git diff --name-only; git ls-files --others --exclude-standard; } | sort -u)"
+          test -z "$(gofmt -l $actual_paths)"
           git add --all
           actual_tree="$(git write-tree)"
           echo "actual tree:   $actual_tree"
           echo "expected tree: $EXPECTED_TREE"
           test "$actual_tree" = "$EXPECTED_TREE"
-      - name: Restore exact pricing snapshot
+      - name: Restore exact generated inputs
         working-directory: target
         run: |
           set -euo pipefail
