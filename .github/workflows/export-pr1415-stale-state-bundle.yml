@@ -1,0 +1,57 @@
+name: Export PR 1415 stale-state repair bundle
+
+on:
+  push:
+    branches:
+      - repair/pr1415-stale-derived-state
+    paths:
+      - .github/workflows/export-pr1415-stale-state-bundle.yml
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: 2fc13215651b6a752cce108cd1307c0027bd1280
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch exact upstream base and create bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/kenn-io/agentsview.git
+          git fetch --no-tags upstream bf3f2f033c9d687a9f0bc08143afecb1dbf0965e
+          git branch pr-head 2fc13215651b6a752cce108cd1307c0027bd1280
+          git branch upstream-main bf3f2f033c9d687a9f0bc08143afecb1dbf0965e
+          git bundle create /tmp/pr1415-stale-state.bundle \
+            refs/heads/pr-head refs/heads/upstream-main
+          git bundle verify /tmp/pr1415-stale-state.bundle
+          sha256sum /tmp/pr1415-stale-state.bundle > /tmp/SHA256SUMS
+          curl --fail-with-body \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/$SOURCE_SHA" \
+            --data "$(jq -n \
+              --arg state success \
+              --arg target_url "$RUN_URL" \
+              --arg description 'PR 1415 stale-state bundle exported' \
+              --arg context 'pr1415-stale-state-bundle' \
+              '{state:$state,target_url:$target_url,description:$description,context:$context}')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr1415-stale-state-bundle
+          path: |
+            /tmp/pr1415-stale-state.bundle
+            /tmp/SHA256SUMS
+          retention-days: 1
+          compression-level: 0
