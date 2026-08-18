@@ -1,0 +1,123 @@
+name: Verify PR 1415 stale-derived-state repair
+
+on:
+  push:
+    branches:
+      - repair/pr1415-stale-derived-state
+    paths:
+      - .github/workflows/verify-pr1415-stale-state-targeted.yml
+      - .github/pr1415/patches/stale-derived-state.xz.b64
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: verify-pr1415-stale-state-targeted
+  cancel-in-progress: true
+
+env:
+  EXPECTED_BASE: 2fc13215651b6a752cce108cd1307c0027bd1280
+  EXPECTED_B64_SHA256: 992a8bade7464a8f3c63f993bfdc6bdce70a91405a4bc38f2945e4fa43de3d6f
+  EXPECTED_XZ_SHA256: e26406c9bb62c2cffc8830d0207a3aaa0c6028eabbc868c244bf35441aeb1b0d
+  EXPECTED_PATCH_SHA256: 6161bfb6f6e030651f71a106753659f19aaea160d16a21dab6a2f9c9ef4494ba
+  EXPECTED_TREE: 68e5250cff9d9124f7eeb40a33d1a912692cd787
+
+jobs:
+  targeted:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out immutable patch source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: patch-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out exact PR head
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.EXPECTED_BASE }}
+          path: target
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.26.6
+          cache: true
+          cache-dependency-path: target/go.sum
+      - name: Verify and apply exact patch
+        run: |
+          set -euo pipefail
+          cp patch-source/.github/pr1415/patches/stale-derived-state.xz.b64 /tmp/patch.xz.b64
+          echo "$EXPECTED_B64_SHA256  /tmp/patch.xz.b64" | sha256sum --check --strict
+          base64 --decode /tmp/patch.xz.b64 > /tmp/patch.xz
+          echo "$EXPECTED_XZ_SHA256  /tmp/patch.xz" | sha256sum --check --strict
+          xz --decompress --stdout /tmp/patch.xz > /tmp/patch
+          echo "$EXPECTED_PATCH_SHA256  /tmp/patch" | sha256sum --check --strict
+          cd target
+          test "$(git rev-parse HEAD)" = "$EXPECTED_BASE"
+          git apply --check /tmp/patch
+          git apply /tmp/patch
+          git diff --check
+          actual_paths="$(git diff --name-only | sort)"
+          expected_paths="$(printf '%s\n' \
+            internal/db/signal_maintenance.go \
+            internal/db/signal_snapshot_test.go \
+            internal/db/staged_content.go \
+            internal/db/staged_content_test.go \
+            internal/sync/engine.go \
+            internal/sync/signal_maintain.go \
+            internal/sync/signal_maintain_test.go | sort)"
+          test "$actual_paths" = "$expected_paths"
+          test -z "$(gofmt -l $actual_paths)"
+          git add --all
+          test "$(git write-tree)" = "$EXPECTED_TREE"
+      - name: Restore exact generated inputs
+        working-directory: target
+        run: |
+          set -euo pipefail
+          mkdir -p internal/pricing/snapshot
+          curl --fail --location \
+            https://raw.githubusercontent.com/kenn-io/agentsview/db257992fb8e3048af8c1cec9da738c28b4fe603/litellm_snapshot.json.gz \
+            --output internal/pricing/snapshot/litellm_snapshot.json.gz
+          echo '0e89b636ccf858edbf95a3f6188476b6eab6cf21f66d16a65c2184229ef81cbe  internal/pricing/snapshot/litellm_snapshot.json.gz' | sha256sum --check --strict
+          make sqlite-vec-header
+      - name: Run database regressions
+        working-directory: target
+        run: |
+          set -euo pipefail
+          go test -tags fts5 ./internal/db \
+            -run 'TestReplaceSessionSignalsIfSnapshot|TestReplaceSessionContentStagedMetadataOnlyRepublishRefreshesDerivedState|TestReplaceSessionContentStagedIdenticalPublishKeepsRevision|TestReplaceSessionContentStagedAttachLifecycle|TestReplaceSessionContentStagedRollbackDetaches' \
+            -count=1 -v -timeout=15m
+      - name: Run sync concurrency regressions
+        working-directory: target
+        run: |
+          set -euo pipefail
+          go test -tags fts5 ./internal/sync \
+            -run 'TestFullSignalRecomputeRetriesWhenTranscriptRevisionChanges|TestFullSignalRecomputeRetriesWhenSignalMetadataChanges|TestCodexEngineStagedSyncParity|TestSyncSingleSessionStagedPublishesRealContent' \
+            -count=1 -v -timeout=15m
+      - name: Vet affected packages
+        working-directory: target
+        run: go vet -tags fts5 ./internal/db ./internal/sync
+      - name: Publish status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          JOB_STATUS: ${{ job.status }}
+          TARGET_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          state=failure
+          description='PR 1415 targeted stale-state verification failed'
+          if [ "$JOB_STATUS" = success ]; then
+            state=success
+            description='PR 1415 targeted stale-state verification passed'
+          fi
+          curl --fail-with-body --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/$SHA" \
+            --data "$(jq -n --arg state "$state" --arg target_url "$TARGET_URL" --arg description "$description" --arg context 'pr1415-stale-state/targeted' '{state:$state,target_url:$target_url,description:$description,context:$context}')"
