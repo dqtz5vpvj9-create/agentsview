@@ -919,3 +919,95 @@ func TestFullSignalRecomputeRetriesWhenTranscriptRevisionChanges(t *testing.T) {
 	require.Equal(t, "new answer", state.LastContent,
 		"the current revision must never be stamped onto the stale snapshot")
 }
+
+func TestFullSignalRecomputeRetriesWhenMetadataChanges(t *testing.T) {
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122d88"
+	root := t.TempDir()
+	day := filepath.Join(root, "2024", "01", "01")
+	require.NoError(t, os.MkdirAll(day, 0o755))
+	path := filepath.Join(
+		day, "rollout-2024-01-01T10-00-00-"+uuid+".jsonl",
+	)
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/workspace/project", "codex_cli_rs",
+			"2024-01-01T10:00:00Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"user", "start", "2024-01-01T10:00:01Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"assistant", "answer", "2024-01-01T10:00:02Z",
+		),
+	)
+	require.NoError(t, os.WriteFile(path, []byte(initial), 0o644))
+
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+
+	sessionID := "codex:" + uuid
+	before, err := database.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.NotNil(t, before.TranscriptRevision)
+	originalRevision := *before.TranscriptRevision
+
+	hookCalls := 0
+	_, err = engine.recomputeSignalsFromDBWithHook(
+		t.Context(), sessionID,
+		func(attempt int) {
+			hookCalls++
+			if attempt != 0 {
+				return
+			}
+			current, loadErr := database.GetSessionFull(t.Context(), sessionID)
+			require.NoError(t, loadErr)
+			require.NotNil(t, current)
+			endedAt := "2026-08-18T12:00:00Z"
+			current.EndedAt = &endedAt
+			current.IsAutomated = true
+			current.MessageCount = 7
+			current.PeakContextTokens = 12345
+			current.HasPeakContextTokens = true
+			require.NoError(t, database.UpsertSession(*current))
+			afterMetadata, loadErr := database.GetSessionFull(
+				t.Context(), sessionID,
+			)
+			require.NoError(t, loadErr)
+			require.NotNil(t, afterMetadata)
+			require.NotNil(t, afterMetadata.TranscriptRevision)
+			require.Equal(t, originalRevision, *afterMetadata.TranscriptRevision,
+				"metadata-only update must leave transcript revision unchanged")
+		},
+	)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, hookCalls, 2,
+		"metadata-only input changes must force a fresh snapshot attempt")
+
+	after, err := database.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.TranscriptRevision)
+	require.Equal(t, originalRevision, *after.TranscriptRevision)
+	require.Equal(t, 7, after.MessageCount)
+	require.True(t, after.IsAutomated)
+	require.Equal(t, 12345, after.PeakContextTokens)
+	stored, ok, err := database.GetSessionSignalState(sessionID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, originalRevision, stored.TranscriptRevision)
+}
+
+func TestCloneCountsNilReturnsWritableMap(t *testing.T) {
+	counts := cloneCounts(nil)
+	require.NotNil(t, counts)
+	counts["gpt-test"] = 1
+	require.Equal(t, 1, counts["gpt-test"])
+}

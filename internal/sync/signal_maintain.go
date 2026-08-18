@@ -397,7 +397,11 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 }
 
 func cloneCounts(in map[string]int) map[string]int {
-	return maps.Clone(in)
+	out := maps.Clone(in)
+	if out == nil {
+		out = make(map[string]int)
+	}
+	return out
 }
 
 // mostCommonModelFromCounts mirrors extractMostCommonModel's tie-break:

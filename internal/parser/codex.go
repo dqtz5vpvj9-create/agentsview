@@ -1486,7 +1486,7 @@ func (p *codexProvider) parentTurnResolver(
 	return func(parentID string) (map[string]struct{}, bool) {
 		parentKey := strings.Join(p.sources.roots, "\x00") + "\x00" + parentID
 		if turnIDs, ok := p.parentTurnCache.GetParent(parentKey); ok {
-			return turnIDs, true
+			return turnIDs, len(turnIDs) > 0
 		}
 		parentPath := ""
 		for _, root := range p.sources.roots {
@@ -1506,7 +1506,7 @@ func (p *codexProvider) parentTurnResolver(
 		}
 		cacheKey := codexParentTurnCacheKeyFor(parentPath, info)
 		if turnIDs, ok := p.parentTurnCache.Get(cacheKey); ok {
-			return turnIDs, true
+			return turnIDs, len(turnIDs) > 0
 		}
 
 		turnIDs := make(map[string]struct{})
@@ -1520,7 +1520,7 @@ func (p *codexProvider) parentTurnResolver(
 			return nil, false
 		}
 		p.parentTurnCache.PutParent(parentKey, cacheKey, turnIDs)
-		return turnIDs, true
+		return turnIDs, len(turnIDs) > 0
 	}
 }
 

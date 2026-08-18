@@ -240,6 +240,131 @@ func TestReplaceSessionContentStagedIdenticalPublishKeepsRevision(t *testing.T) 
 		"an identical staged verification must not bump transcript revision")
 }
 
+func TestReplaceSessionContentStagedIdenticalPublishRefreshesDerivedState(
+	t *testing.T,
+) {
+	database, err := Open(filepath.Join(t.TempDir(), "staged-derived.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+
+	const sessionID = "codex:derived"
+	firstMessage := "Warmup"
+	require.NoError(t, database.UpsertSession(Session{
+		ID: sessionID, Agent: "codex", Project: "project", Machine: "local",
+		FirstMessage: &firstMessage, MessageCount: 1, UserMessageCount: 1,
+	}))
+
+	publish := func(outcome, rules string, finding bool) {
+		t.Helper()
+		staged := newScratchStagedResults(t)
+		staged.AddEvent(t, "call_1", "same output")
+		require.NoError(t, database.ReplaceSessionContentStaged(
+			context.Background(), sessionID, []Message{{
+				SessionID: sessionID, Ordinal: 0, Role: "assistant",
+				Content: "running", HasToolUse: true,
+				ToolCalls: []ToolCall{{
+					SessionID: sessionID, ToolUseID: "call_1",
+					ToolName: "exec_command", Category: "Bash", CallIndex: 0,
+				}},
+			}}, staged, map[string]bool{},
+			func(map[string]bool) (SessionSignalUpdate, []SecretFinding, error) {
+				update := SessionSignalUpdate{
+					Outcome: outcome, OutcomeConfidence: "high",
+					SecretsRulesVersion: rules,
+					QualitySignals:      QualitySignals{Version: CurrentQualitySignalVersion},
+				}
+				if !finding {
+					return update, nil, nil
+				}
+				update.SecretLeakCount = 1
+				return update, []SecretFinding{{
+					SessionID: sessionID, RuleName: "refreshed-secret",
+					Confidence: "definite", LocationKind: "message",
+					MessageOrdinal: 0, MatchEnd: 4,
+					RedactedMatch: "****", RulesVersion: rules,
+				}}, nil
+			},
+		))
+	}
+
+	publish("old", "old-rules", false)
+	first, err := database.GetSessionFull(context.Background(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	require.NotNil(t, first.TranscriptRevision)
+	firstRevision := *first.TranscriptRevision
+
+	var firstMessageID, firstCallID, firstEventID int64
+	require.NoError(t, database.getReader().QueryRow(`
+		SELECT m.id, tc.id, tre.id
+		FROM messages m
+		JOIN tool_calls tc ON tc.message_id = m.id
+		JOIN tool_result_events tre
+		  ON tre.session_id = tc.session_id
+		 AND tre.tool_call_message_ordinal = m.ordinal
+		 AND tre.call_index = tc.call_index
+		WHERE m.session_id = ?`, sessionID,
+	).Scan(&firstMessageID, &firstCallID, &firstEventID))
+
+	// Simulate metadata-only drift and stale post-processing while preserving
+	// the normalized transcript and its revision.
+	_, err = database.getWriter().Exec(`
+		UPDATE sessions
+		SET outcome = 'stale', quality_signal_version = 0,
+		    secrets_rules_version = 'stale-rules',
+		    last_write_incremental = 1, is_automated = 0
+		WHERE id = ?`, sessionID)
+	require.NoError(t, err)
+	_, err = database.getWriter().Exec(`
+		INSERT INTO secret_findings (
+			session_id, rule_name, confidence, location_kind,
+			message_ordinal, match_start, match_end, match_index,
+			redacted_match, rules_version
+		) VALUES (?, 'stale-secret', 'definite', 'message', 0, 0, 1, 0,
+		          '*', 'stale-rules')`, sessionID)
+	require.NoError(t, err)
+
+	publish("completed", "fresh-rules", true)
+
+	after, err := database.GetSessionFull(context.Background(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.TranscriptRevision)
+	require.Equal(t, firstRevision, *after.TranscriptRevision,
+		"metadata-only staged repair must preserve transcript revision")
+	require.Equal(t, "completed", after.Outcome)
+	require.Equal(t, CurrentQualitySignalVersion, after.QualitySignalVersion)
+	require.Equal(t, "fresh-rules", after.SecretsRulesVersion)
+	require.Equal(t, 1, after.SecretLeakCount)
+	require.True(t, after.IsAutomated,
+		"unchanged staged publish must refresh automation from stored messages")
+	require.False(t, after.LastWriteIncremental,
+		"unchanged staged publish must clear the incremental marker")
+
+	var messageID, callID, eventID int64
+	require.NoError(t, database.getReader().QueryRow(`
+		SELECT m.id, tc.id, tre.id
+		FROM messages m
+		JOIN tool_calls tc ON tc.message_id = m.id
+		JOIN tool_result_events tre
+		  ON tre.session_id = tc.session_id
+		 AND tre.tool_call_message_ordinal = m.ordinal
+		 AND tre.call_index = tc.call_index
+		WHERE m.session_id = ?`, sessionID,
+	).Scan(&messageID, &callID, &eventID))
+	require.Equal(t, firstMessageID, messageID)
+	require.Equal(t, firstCallID, callID)
+	require.Equal(t, firstEventID, eventID)
+
+	var findingName, findingRules string
+	require.NoError(t, database.getReader().QueryRow(`
+		SELECT rule_name, rules_version FROM secret_findings
+		WHERE session_id = ?`, sessionID,
+	).Scan(&findingName, &findingRules))
+	require.Equal(t, "refreshed-secret", findingName)
+	require.Equal(t, "fresh-rules", findingRules)
+}
+
 func TestReplaceSessionContentStagedWithCheckpointUsesPrefixedSessionID(t *testing.T) {
 	database, err := Open(filepath.Join(t.TempDir(), "staged-prefix.db"))
 	require.NoError(t, err)

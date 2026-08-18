@@ -14157,15 +14157,13 @@ func (e *Engine) recomputeSignalsFromDBWithHook(
 		if sess == nil {
 			return 0, nil
 		}
-		if sess.TranscriptRevision == nil {
-			return 0, fmt.Errorf(
-				"session %s has no transcript revision", sessionID,
-			)
+		// Capture every session-row input consumed by the signal compute before
+		// loading transcript rows. The conditional transaction below rejects
+		// transcript changes and metadata-only races alike.
+		expectedInputs, err := db.SignalInputSnapshot(*sess)
+		if err != nil {
+			return 0, err
 		}
-		// Capture the verification token before loading transcript rows. The
-		// conditional transaction below refuses every write if another sync
-		// advances this revision at any point during the compute.
-		expectedRevision := *sess.TranscriptRevision
 		msgs, err := e.db.GetAllMessages(ctx, sessionID)
 		if err != nil {
 			log.Printf(
@@ -14179,7 +14177,8 @@ func (e *Engine) recomputeSignalsFromDBWithHook(
 		update, findings := computeSignalsAndSecrets(*sess, msgs)
 		heapBytes := recomputeHeapBytes(msgs, findings)
 		state, err := buildSignalStateFromRows(
-			sessionID, msgs, extractToolCallRows(msgs), expectedRevision,
+			sessionID, msgs, extractToolCallRows(msgs),
+			expectedInputs.TranscriptRevision,
 		)
 		if err != nil {
 			return 0, err
@@ -14187,8 +14186,8 @@ func (e *Engine) recomputeSignalsFromDBWithHook(
 		if beforePublish != nil {
 			beforePublish(attempt)
 		}
-		applied, err := e.db.ReplaceSessionSignalsIfRevision(
-			sessionID, expectedRevision, findings, update, state,
+		applied, err := e.db.ReplaceSessionSignalsIfInputsMatch(
+			sessionID, expectedInputs, findings, update, state,
 		)
 		if err != nil {
 			return 0, fmt.Errorf(

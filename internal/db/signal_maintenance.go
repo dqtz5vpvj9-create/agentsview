@@ -57,6 +57,42 @@ type SessionSignalState struct {
 	UpdatedAt          string
 }
 
+// SessionSignalInputSnapshot is the complete session-row input set consumed
+// by the full signal recompute. TranscriptRevision protects message and tool
+// rows; the remaining fields protect metadata that can change without a
+// transcript rewrite. A full recompute may publish only while every field
+// still matches the snapshot it computed from.
+type SessionSignalInputSnapshot struct {
+	TranscriptRevision   string
+	MessageCount         int
+	IsAutomated          bool
+	EndedAt              string
+	HasEndedAt           bool
+	PeakContextTokens    int
+	HasPeakContextTokens bool
+}
+
+// SignalInputSnapshot returns the signal-driving session-row inputs from s.
+func SignalInputSnapshot(s Session) (SessionSignalInputSnapshot, error) {
+	if s.TranscriptRevision == nil {
+		return SessionSignalInputSnapshot{}, fmt.Errorf(
+			"session %s has no transcript revision", s.ID,
+		)
+	}
+	snapshot := SessionSignalInputSnapshot{
+		TranscriptRevision:   *s.TranscriptRevision,
+		MessageCount:         s.MessageCount,
+		IsAutomated:          s.IsAutomated,
+		PeakContextTokens:    s.PeakContextTokens,
+		HasPeakContextTokens: s.HasPeakContextTokens,
+	}
+	if s.EndedAt != nil {
+		snapshot.EndedAt = *s.EndedAt
+		snapshot.HasEndedAt = true
+	}
+	return snapshot, nil
+}
+
 // SignalMaintainer computes the incremental signal delta inside the
 // incremental write transaction, after messages and result updates are
 // applied but before the transaction commits. It may return a nil delta to
@@ -474,12 +510,13 @@ func (db *DB) UpsertSessionSignalStateIfRevision(
 	return true, nil
 }
 
-// ReplaceSessionSignalsIfRevision atomically publishes findings, aggregate
-// columns, and compact incremental state for one coherent transcript snapshot.
-// It returns false without modifying any rows when a concurrent writer has
-// advanced the session beyond expectedRevision.
-func (db *DB) ReplaceSessionSignalsIfRevision(
-	sessionID, expectedRevision string,
+// ReplaceSessionSignalsIfInputsMatch atomically publishes findings, aggregate
+// columns, and compact incremental state for one coherent signal-input
+// snapshot. It returns false without modifying any rows when a concurrent
+// writer changes either the transcript or metadata consumed by the recompute.
+func (db *DB) ReplaceSessionSignalsIfInputsMatch(
+	sessionID string,
+	expected SessionSignalInputSnapshot,
 	findings []SecretFinding,
 	update SessionSignalUpdate,
 	state SessionSignalState,
@@ -491,8 +528,8 @@ func (db *DB) ReplaceSessionSignalsIfRevision(
 		return false, fmt.Errorf("beginning conditional signal recompute tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	matches, err := sessionTranscriptRevisionMatchesTx(
-		tx, sessionID, expectedRevision,
+	matches, err := sessionSignalInputSnapshotMatchesTx(
+		tx, sessionID, expected,
 	)
 	if err != nil || !matches {
 		return false, err
@@ -507,7 +544,7 @@ func (db *DB) ReplaceSessionSignalsIfRevision(
 		return false, err
 	}
 	state.SessionID = sessionID
-	state.TranscriptRevision = expectedRevision
+	state.TranscriptRevision = expected.TranscriptRevision
 	if err := upsertSessionSignalStateTx(tx, state); err != nil {
 		return false, err
 	}
@@ -517,6 +554,72 @@ func (db *DB) ReplaceSessionSignalsIfRevision(
 		)
 	}
 	return true, nil
+}
+
+// ReplaceSessionSignalsIfRevision is retained for callers that only have a
+// transcript token. New full-recompute code should use
+// ReplaceSessionSignalsIfInputsMatch so metadata-only races are rejected too.
+func (db *DB) ReplaceSessionSignalsIfRevision(
+	sessionID, expectedRevision string,
+	findings []SecretFinding,
+	update SessionSignalUpdate,
+	state SessionSignalState,
+) (bool, error) {
+	sess, err := db.GetSessionFull(context.Background(), sessionID)
+	if err != nil {
+		return false, err
+	}
+	if sess == nil || sess.TranscriptRevision == nil ||
+		*sess.TranscriptRevision != expectedRevision {
+		return false, nil
+	}
+	snapshot, err := SignalInputSnapshot(*sess)
+	if err != nil {
+		return false, err
+	}
+	return db.ReplaceSessionSignalsIfInputsMatch(
+		sessionID, snapshot, findings, update, state,
+	)
+}
+
+func sessionSignalInputSnapshotMatchesTx(
+	tx *sql.Tx, sessionID string,
+	expected SessionSignalInputSnapshot,
+) (bool, error) {
+	var (
+		currentRevision string
+		messageCount    int
+		isAutomated     int
+		endedAt         sql.NullString
+		peakTokens      int
+		hasPeak         int
+	)
+	err := tx.QueryRow(`
+		SELECT transcript_revision, message_count, is_automated, ended_at,
+		       peak_context_tokens, has_peak_context_tokens
+		FROM sessions WHERE id = ?`, sessionID,
+	).Scan(
+		&currentRevision, &messageCount, &isAutomated, &endedAt,
+		&peakTokens, &hasPeak,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf(
+			"loading signal input snapshot %s: %w", sessionID, err,
+		)
+	}
+	current := SessionSignalInputSnapshot{
+		TranscriptRevision:   currentRevision,
+		MessageCount:         messageCount,
+		IsAutomated:          isAutomated != 0,
+		EndedAt:              endedAt.String,
+		HasEndedAt:           endedAt.Valid,
+		PeakContextTokens:    peakTokens,
+		HasPeakContextTokens: hasPeak != 0,
+	}
+	return current == expected, nil
 }
 
 func sessionTranscriptRevisionMatchesTx(

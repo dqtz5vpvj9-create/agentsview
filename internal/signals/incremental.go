@@ -177,6 +177,8 @@ func SeedIncrementalState(
 	msgIndex int,
 	lastValidTokens int,
 ) IncrementalState {
+	modelCounts = writableIntMap(modelCounts)
+	modelFirstSeen = writableIntMap(modelFirstSeen)
 	s := IncrementalState{
 		CodecVersion:          IncrementalStateCodecVersion,
 		EditLast:              map[string]EditChurnState{},
@@ -298,6 +300,14 @@ func SeedIncrementalState(
 		})
 	}
 	return s
+}
+
+func writableIntMap(in map[string]int) map[string]int {
+	out := maps.Clone(in)
+	if out == nil {
+		out = make(map[string]int)
+	}
+	return out
 }
 
 func factsFor(calls []ToolCallRow) []ToolFact {
@@ -492,6 +502,9 @@ func (s *IncrementalState) FoldToolHealth(
 	// Edit churn: only appends add edit calls; a file counts once.
 	out.EditChurnCount = row.EditChurnCount
 	editLast := maps.Clone(s.EditLast)
+	if editLast == nil {
+		editLast = make(map[string]EditChurnState)
+	}
 	for _, c := range appended {
 		if c.Category != "Edit" && c.Category != "Write" {
 			continue
@@ -843,6 +856,18 @@ func (s *IncrementalState) UnmarshalBinary(data []byte) error {
 			"incremental signal state codec %d != %d",
 			s.CodecVersion, IncrementalStateCodecVersion,
 		)
+	}
+	// Empty mutable maps are omitted by the JSON codec. Normalize decoded
+	// state before any fold mutates it so the first edit or model append cannot
+	// panic on assignment to a nil map.
+	if s.EditLast == nil {
+		s.EditLast = make(map[string]EditChurnState)
+	}
+	if s.ModelCounts == nil {
+		s.ModelCounts = make(map[string]int)
+	}
+	if s.ModelFirstSeen == nil {
+		s.ModelFirstSeen = make(map[string]int)
 	}
 	return nil
 }

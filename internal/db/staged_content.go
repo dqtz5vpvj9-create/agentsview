@@ -277,8 +277,9 @@ func stagedSessionContentDigestTx(
 	return digest, nil
 }
 
-func commitStagedCheckpointOnly(
+func commitStagedDerivedStateAndCheckpoint(
 	ctx context.Context, conn *sql.Conn, sessionID string,
+	signals SessionSignalUpdate, findings []SecretFinding,
 	cp *ParserCheckpoint, blobs *ParserCheckpointBlobs,
 ) error {
 	tx, err := conn.BeginTx(ctx, nil)
@@ -286,6 +287,25 @@ func commitStagedCheckpointOnly(
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// The staged transcript is byte-for-byte identical, so preserve every
+	// message/tool row and the transcript revision. Metadata, detector rules,
+	// and prior failed post-processing may still have changed; refresh every
+	// derived projection in one transaction with the checkpoint.
+	if err := resetIncrementalMarkerTx(tx, sessionID); err != nil {
+		return err
+	}
+	if err := updateSessionAutomationFromMessagesTx(tx, sessionID); err != nil {
+		return err
+	}
+	if err := updateSessionSignalsTx(tx, sessionID, signals); err != nil {
+		return err
+	}
+	if err := replaceSecretFindingsTx(
+		tx, sessionID, findings,
+		signals.SecretLeakCount, signals.SecretsRulesVersion,
+	); err != nil {
+		return err
+	}
 	if cp == nil || blobs == nil {
 		if err := deleteParserCheckpointTx(tx, sessionID); err != nil {
 			return err
@@ -354,13 +374,22 @@ func (db *DB) replaceSessionContentStaged(
 		return fmt.Errorf("fingerprinting proposed staged content: %w", err)
 	}
 	if contentBefore == contentAfter {
-		// Keep the existing row identities, revision, export marker, and recall
-		// evidence. Only the machine-local checkpoint may need to advance.
+		// Keep the existing row identities, transcript revision, and recall
+		// evidence. The session row may have received metadata-only updates
+		// before this publish, and detector rules may have advanced, so derived
+		// state still has to be refreshed from the verified staged snapshot.
+		signals, findings, err := signalsFn(contentFailureVerdicts(staged))
+		if err != nil {
+			return fmt.Errorf(
+				"computing unchanged staged signals for %s: %w",
+				sessionID, err,
+			)
+		}
 		if err := tx.Rollback(); err != nil {
 			return err
 		}
-		return commitStagedCheckpointOnly(
-			ctx, conn, sessionID, cp, blobs,
+		return commitStagedDerivedStateAndCheckpoint(
+			ctx, conn, sessionID, signals, findings, cp, blobs,
 		)
 	}
 	// Summary resolution above recorded per-call content-failure

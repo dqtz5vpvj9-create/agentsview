@@ -656,3 +656,22 @@ func TestFoldRunawayWindowCrossingNewRetainedBoundaryLatches(t *testing.T) {
 	assert.True(t, final.RunawayHistorical)
 	assert.Equal(t, 1, out.RunawayToolLoopCount)
 }
+
+func TestIncrementalStateUnmarshalInitializesMutableMaps(t *testing.T) {
+	var state IncrementalState
+	require.NoError(t, state.UnmarshalBinary([]byte(
+		`{"codec_version":2,"total_calls":0}`,
+	)))
+	require.NotNil(t, state.EditLast)
+	require.NotNil(t, state.ModelCounts)
+	require.NotNil(t, state.ModelFirstSeen)
+
+	next, _, ok := state.FoldToolHealth([]ToolCallRow{{
+		Category:       "Edit",
+		InputJSON:      `{"file_path":"main.go"}`,
+		MessageOrdinal: 1,
+	}}, nil, ToolHealthRow{})
+	require.True(t, ok)
+	require.Contains(t, next.EditLast, "main.go",
+		"the first edit append must not panic on a decoded empty map")
+}
