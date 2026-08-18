@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  statuses: write
 
 concurrency:
   group: verify-publish-pr1415-post-update-fix
@@ -124,6 +125,34 @@ jobs:
           set -euo pipefail
           export CGO_CFLAGS="-I$PWD/.sqlite-include"
           make bench-gate
+      - name: Publish verification status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+          MODE: ${{ matrix.mode }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          state=failure
+          description="PR 1415 $MODE verification failed"
+          if [ "$JOB_STATUS" = success ]; then
+            state=success
+            description="PR 1415 $MODE verification passed"
+          fi
+          curl --fail-with-body \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/$SOURCE_SHA" \
+            --data "$(jq -n \
+              --arg state "$state" \
+              --arg target_url "$RUN_URL" \
+              --arg description "$description" \
+              --arg context "pr1415-post-update/$MODE" \
+              '{state:$state,target_url:$target_url,description:$description,context:$context}')"
 
   publish:
     name: Fast-forward PR branch
@@ -132,6 +161,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      statuses: write
     steps:
       - name: Check out immutable patch source
         uses: actions/checkout@v5
@@ -184,3 +214,30 @@ jobs:
             -m "Guard full signal publication with every session-row input consumed by recomputation, and refresh automation, signals, findings, rule versions, markers, and checkpoints when staged transcript content is unchanged." \
             -m "Normalize mutable incremental-state maps after decode and keep zero-turn Codex parents unresolved until replay filtering can be proven."
           git push origin HEAD:refs/heads/stack/5-codex-staged-imports
+      - name: Publish release status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          state=failure
+          description="PR 1415 fast-forward publication failed"
+          if [ "$JOB_STATUS" = success ]; then
+            state=success
+            description="PR 1415 tested repair published"
+          fi
+          curl --fail-with-body \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/$SOURCE_SHA" \
+            --data "$(jq -n \
+              --arg state "$state" \
+              --arg target_url "$RUN_URL" \
+              --arg description "$description" \
+              --arg context pr1415-post-update/publish \
+              '{state:$state,target_url:$target_url,description:$description,context:$context}')"
