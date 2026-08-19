@@ -28,8 +28,8 @@ const (
 	// IncrementalStateCodecVersion is the wire version for IncrementalState.
 	// Bump when the struct or any detector semantics change; a mismatch
 	// makes the caller fall back to a full recompute.
-	// The codec has had a single released shape.
-	IncrementalStateCodecVersion = 2
+	// v3 added LastValidTokensOrdinal.
+	IncrementalStateCodecVersion = 3
 
 	// TrailingFactCount is the size of the trailing facts window. It must
 	// cover every window any delta can affect: a modified call in the last
@@ -116,12 +116,19 @@ type IncrementalState struct {
 	ExactHistorical  bool   `json:"exact_historical"`
 
 	// Message-derived aggregates not stored on the sessions row.
-	LastRole        string         `json:"last_role,omitempty"`
-	LastContent     string         `json:"last_content,omitempty"`
-	MsgIndex        int            `json:"msg_index"`
-	LastValidTokens int            `json:"last_valid_tokens"`
-	ModelCounts     map[string]int `json:"model_counts,omitempty"`
-	ModelFirstSeen  map[string]int `json:"model_first_seen,omitempty"`
+	LastRole    string `json:"last_role,omitempty"`
+	LastContent string `json:"last_content,omitempty"`
+	MsgIndex    int    `json:"msg_index"`
+	// LastValidTokens is the most recent assistant context-token
+	// measurement folded so far; LastValidTokensOrdinal is the ordinal of
+	// the message it was measured from (meaningless when LastValidTokens
+	// is 0). A late usage update targeting an ordinal at or before this one
+	// arrived chronologically out of order -- a later assistant already
+	// contributed a newer measurement -- and must not be folded forward.
+	LastValidTokens        int            `json:"last_valid_tokens"`
+	LastValidTokensOrdinal int            `json:"last_valid_tokens_ordinal"`
+	ModelCounts            map[string]int `json:"model_counts,omitempty"`
+	ModelFirstSeen         map[string]int `json:"model_first_seen,omitempty"`
 
 	// TotalCalls counts calls folded so far; used for window arithmetic.
 	TotalCalls int `json:"total_calls"`
@@ -168,28 +175,31 @@ type ToolHealthResult struct {
 // order extractToolCallRows produces. boundaries must be ascending
 // compact-boundary ordinals. modelCounts/modelFirstSeen/msgIndex mirror
 // extractMostCommonModel's inputs; lastValidTokens is the last assistant
-// context-token measurement (0 when none).
+// context-token measurement (0 when none) and lastValidTokensOrdinal is
+// the ordinal of the message it came from (meaningless when
+// lastValidTokens is 0).
 func SeedIncrementalState(
 	calls []ToolCallRow,
 	boundaries []int,
 	lastRole, lastContent string,
 	modelCounts, modelFirstSeen map[string]int,
 	msgIndex int,
-	lastValidTokens int,
+	lastValidTokens, lastValidTokensOrdinal int,
 ) IncrementalState {
 	modelCounts = writableIntMap(modelCounts)
 	modelFirstSeen = writableIntMap(modelFirstSeen)
 	s := IncrementalState{
-		CodecVersion:          IncrementalStateCodecVersion,
-		EditLast:              map[string]EditChurnState{},
-		LastRole:              lastRole,
-		LastContent:           lastContent,
-		LastValidTokens:       lastValidTokens,
-		MsgIndex:              msgIndex,
-		ModelCounts:           modelCounts,
-		ModelFirstSeen:        modelFirstSeen,
-		TotalCalls:            len(calls),
-		HasExplicitBoundaries: len(boundaries) > 0,
+		CodecVersion:           IncrementalStateCodecVersion,
+		EditLast:               map[string]EditChurnState{},
+		LastRole:               lastRole,
+		LastContent:            lastContent,
+		LastValidTokens:        lastValidTokens,
+		LastValidTokensOrdinal: lastValidTokensOrdinal,
+		MsgIndex:               msgIndex,
+		ModelCounts:            modelCounts,
+		ModelFirstSeen:         modelFirstSeen,
+		TotalCalls:             len(calls),
+		HasExplicitBoundaries:  len(boundaries) > 0,
 	}
 	cut := max(0, len(calls)-TrailingFactCount)
 	s.Trailing = factsFor(calls[cut:])

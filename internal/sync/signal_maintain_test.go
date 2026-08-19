@@ -94,7 +94,7 @@ func newTestMaintainer(
 func currentStateBlob(t *testing.T) []byte {
 	t.Helper()
 	state := signals.SeedIncrementalState(
-		nil, nil, "", "", nil, nil, 0, 0,
+		nil, nil, "", "", nil, nil, 0, 0, 0,
 	)
 	blob, err := state.MarshalBinary()
 	require.NoError(t, err)
@@ -209,7 +209,7 @@ func TestIncrementalMaintainerScansOnlyInsertedResultEvents(t *testing.T) {
 			CallIndex:      0,
 			EventStatus:    "completed",
 		}},
-		nil, "", "", nil, nil, 0, 0,
+		nil, "", "", nil, nil, 0, 0, 0,
 	)
 	blob, err := state.MarshalBinary()
 	require.NoError(t, err)
@@ -286,7 +286,7 @@ func TestIncrementalMaintainerTargetsDuplicateCallIDOccurrence(t *testing.T) {
 				CallIndex: second.CallIndex,
 			},
 		},
-		nil, "", "", nil, nil, 0, 0,
+		nil, "", "", nil, nil, 0, 0, 0,
 	)
 	blob, err := state.MarshalBinary()
 	require.NoError(t, err)
@@ -360,7 +360,7 @@ func TestIncrementalMaintainerCompactionExplicitBoundaryParity(t *testing.T) {
 		require.Equal(t, 1, full.CompactionCount)
 
 		state := signals.SeedIncrementalState(
-			nil, []int{0}, "", "", nil, nil, 0, 1000,
+			nil, []int{0}, "", "", nil, nil, 0, 1000, 1,
 		)
 		blob, err := state.MarshalBinary()
 		require.NoError(t, err)
@@ -393,7 +393,7 @@ func TestIncrementalMaintainerCompactionExplicitBoundaryParity(t *testing.T) {
 		require.Equal(t, 1, full.CompactionCount)
 
 		state := signals.SeedIncrementalState(
-			nil, nil, "", "", nil, nil, 0, 1000,
+			nil, nil, "", "", nil, nil, 0, 1000, 1,
 		)
 		blob, err := state.MarshalBinary()
 		require.NoError(t, err)
@@ -419,6 +419,88 @@ func TestIncrementalMaintainerCompactionExplicitBoundaryParity(t *testing.T) {
 	})
 }
 
+// TestIncrementalMaintainerDeclinesOutOfOrderLateUsage pins the guard for
+// a resumed Codex tail whose token_count targets an assistant message
+// earlier than one that already carries usage: a later sync can already
+// have resolved a chronologically-later assistant's usage (via the
+// in-memory backward-walk ApplyTokenUsageToLastAssistant performs when
+// multiple token_count events land in one parse) before an earlier
+// assistant's own token_count -- appearing later in the file -- is ever
+// read. Folding that late update forward would treat an older
+// measurement as newer and corrupt compaction detection. The maintainer
+// must decline (nil, nil) so the caller falls back to a full recompute.
+func TestIncrementalMaintainerDeclinesOutOfOrderLateUsage(t *testing.T) {
+	state := signals.SeedIncrementalState(
+		nil, nil, "", "", nil, nil, 0, 1000, 5,
+	)
+	blob, err := state.MarshalBinary()
+	require.NoError(t, err)
+
+	m := newTestMaintainer("rev", secrets.DefiniteRulesVersion(), nil)
+	m.messageUsageUpdates = []db.MessageTokenUsageUpdate{{
+		Ordinal: 3, ContextTokens: 200, HasContextTokens: true,
+	}}
+	q := &fakeSignalQuery{
+		sess: &db.Session{
+			QualitySignalVersion: db.CurrentQualitySignalVersion,
+		},
+		state: db.SessionSignalState{
+			State:              blob,
+			TranscriptRevision: "rev",
+			SignalVersion:      db.CurrentQualitySignalVersion,
+		},
+		hasState:            true,
+		revision:            "rev",
+		updatedUsageOrdinal: map[int]bool{3: true},
+	}
+	delta, err := m.MaintainTx(context.Background(), q)
+	require.NoError(t, err)
+	assert.Nil(t, delta,
+		"a late usage update targeting an ordinal at or before the "+
+			"recorded last measurement must decline, not fold out of order")
+}
+
+// TestIncrementalMaintainerAppliesInOrderLateUsage is the companion
+// positive case: a late usage update targeting an ordinal after the
+// recorded last measurement folds normally and advances both the token
+// value and its ordinal in the persisted compact state.
+func TestIncrementalMaintainerAppliesInOrderLateUsage(t *testing.T) {
+	state := signals.SeedIncrementalState(
+		nil, nil, "", "", nil, nil, 0, 1000, 3,
+	)
+	blob, err := state.MarshalBinary()
+	require.NoError(t, err)
+
+	m := newTestMaintainer("rev", secrets.DefiniteRulesVersion(), nil)
+	m.messageUsageUpdates = []db.MessageTokenUsageUpdate{{
+		Ordinal: 5, ContextTokens: 200, HasContextTokens: true,
+	}}
+	q := &fakeSignalQuery{
+		sess: &db.Session{
+			QualitySignalVersion: db.CurrentQualitySignalVersion,
+		},
+		state: db.SessionSignalState{
+			State:              blob,
+			TranscriptRevision: "rev",
+			SignalVersion:      db.CurrentQualitySignalVersion,
+		},
+		hasState:            true,
+		revision:            "rev",
+		updatedUsageOrdinal: map[int]bool{5: true},
+	}
+	delta, err := m.MaintainTx(context.Background(), q)
+	require.NoError(t, err)
+	require.NotNil(t, delta,
+		"a late usage update after the recorded last measurement must fold")
+	assert.Equal(t, 1, delta.Update.CompactionCount,
+		"the 1000->200 drop must be detected as a compaction")
+
+	var next signals.IncrementalState
+	require.NoError(t, next.UnmarshalBinary(delta.State.State))
+	assert.Equal(t, 200, next.LastValidTokens)
+	assert.Equal(t, 5, next.LastValidTokensOrdinal)
+}
+
 // TestIncrementalMaintainerContextPressureSessionPeakParity pins parity
 // for context pressure when the session-level peak exceeds per-message
 // maxima: both paths must feed sess.PeakContextTokens into
@@ -440,7 +522,7 @@ func TestIncrementalMaintainerContextPressureSessionPeakParity(t *testing.T) {
 
 	state := signals.SeedIncrementalState(
 		nil, nil, "", "",
-		map[string]int{model: 1}, map[string]int{model: 0}, 1, 0,
+		map[string]int{model: 1}, map[string]int{model: 0}, 1, 0, 0,
 	)
 	blob, err := state.MarshalBinary()
 	require.NoError(t, err)

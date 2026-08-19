@@ -224,6 +224,7 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 	modelFirstSeen := cloneCounts(nextState.ModelFirstSeen)
 	compactionDelta := 0
 	lastTokens := nextState.LastValidTokens
+	lastTokensOrdinal := nextState.LastValidTokensOrdinal
 	appendedHasContextData := false
 
 	// A resumed Codex tail may carry token_count for the final assistant
@@ -237,12 +238,21 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 			!usage.HasContextTokens {
 			continue
 		}
+		if lastTokens > 0 && usage.Ordinal <= lastTokensOrdinal {
+			// A later assistant already contributed a newer measurement
+			// than the one this late update targets: applying it here
+			// would fold tokens out of chronological order and corrupt
+			// compaction detection and the tail token value. Decline and
+			// let the caller fall back to a full recompute.
+			return nil, nil
+		}
 		appendedHasContextData = true
 		if lastTokens > 0 &&
 			float64(usage.ContextTokens) < 0.7*float64(lastTokens) {
 			compactionDelta++
 		}
 		lastTokens = usage.ContextTokens
+		lastTokensOrdinal = usage.Ordinal
 	}
 	for _, msg := range m.appended {
 		msgIndex++
@@ -263,6 +273,7 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 				compactionDelta++
 			}
 			lastTokens = msg.ContextTokens
+			lastTokensOrdinal = msg.Ordinal
 		}
 	}
 	nextState.LastRole = lastRole
@@ -271,6 +282,7 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 	nextState.ModelCounts = modelCounts
 	nextState.ModelFirstSeen = modelFirstSeen
 	nextState.LastValidTokens = lastTokens
+	nextState.LastValidTokensOrdinal = lastTokensOrdinal
 
 	hasToolCalls := sess.HasToolCalls || len(appendedRows) > 0
 	hasContextData := sess.HasContextData || appendedHasContextData
@@ -496,10 +508,11 @@ func buildSignalStateFromRows(
 ) (db.SessionSignalState, error) {
 	lastRole, lastContent := extractLastMessageRole(msgs)
 	counts, firstSeen, msgIndex := extractModelCounts(msgs)
-	lastTokens := 0
+	lastTokens, lastTokensOrdinal := 0, 0
 	for _, m := range slices.Backward(msgs) {
 		if m.Role == "assistant" && m.HasContextTokens {
 			lastTokens = m.ContextTokens
+			lastTokensOrdinal = m.Ordinal
 			break
 		}
 	}
@@ -507,7 +520,7 @@ func buildSignalStateFromRows(
 		toolRows,
 		extractCompactBoundaryOrdinals(msgs),
 		lastRole, lastContent,
-		counts, firstSeen, msgIndex, lastTokens,
+		counts, firstSeen, msgIndex, lastTokens, lastTokensOrdinal,
 	)
 	blob, err := state.MarshalBinary()
 	if err != nil {

@@ -112,7 +112,7 @@ func TestIncrementalFoldParityRandomized(t *testing.T) {
 	}
 
 	state := SeedIncrementalState(
-		calls, boundaries, "", "", nil, nil, 0, 0,
+		calls, boundaries, "", "", nil, nil, 0, 0, 0,
 	)
 	full := fullToolHealth(calls)
 	row := ToolHealthRow{
@@ -159,7 +159,7 @@ func TestIncrementalFoldParityRandomized(t *testing.T) {
 				// full recompute, which reseeds the state.
 				full = fullToolHealth(calls)
 				state = SeedIncrementalState(
-					calls, boundaries, "", "", nil, nil, 0, 0,
+					calls, boundaries, "", "", nil, nil, 0, 0, 0,
 				)
 				row = ToolHealthRow{
 					FailureCount:   full.FailureCount,
@@ -224,7 +224,7 @@ func TestIncrementalFoldRejectsOutOfWindowModification(t *testing.T) {
 		calls = append(calls, parityRow(rng, i))
 	}
 	state := SeedIncrementalState(
-		calls, nil, "", "", nil, nil, 0, 0,
+		calls, nil, "", "", nil, nil, 0, 0, 0,
 	)
 	full := fullToolHealth(calls)
 	row := ToolHealthRow{
@@ -248,7 +248,7 @@ func TestIncrementalStateRoundTrip(t *testing.T) {
 		calls = append(calls, parityRow(rng, i))
 	}
 	state := SeedIncrementalState(
-		calls, []int{5, 20}, "assistant", "done", nil, nil, 12, 4000,
+		calls, []int{5, 20}, "assistant", "done", nil, nil, 12, 4000, 11,
 	)
 	blob, err := state.MarshalBinary()
 	require.NoError(t, err)
@@ -280,7 +280,7 @@ func TestIncrementalFoldLongCrossingRun(t *testing.T) {
 		})
 	}
 	state := SeedIncrementalState(
-		calls, nil, "", "", nil, nil, 0, 0,
+		calls, nil, "", "", nil, nil, 0, 0, 0,
 	)
 	row := ToolHealthRow{
 		FailureCount:   100,
@@ -338,7 +338,7 @@ func TestIncrementalFoldRetryAcrossSeed(t *testing.T) {
 	}
 	calls := []ToolCallRow{mk(0), mk(1)}
 	state := SeedIncrementalState(
-		calls, nil, "", "", nil, nil, 0, 0,
+		calls, nil, "", "", nil, nil, 0, 0, 0,
 	)
 	row := ToolHealthRow{}
 	for step := range 6 {
@@ -375,7 +375,7 @@ func TestIncrementalFinalFailureStreakAcrossWindow(t *testing.T) {
 		calls = append(calls, mk(i, true))
 	}
 	state := SeedIncrementalState(
-		calls, nil, "", "", nil, nil, 0, 0,
+		calls, nil, "", "", nil, nil, 0, 0, 0,
 	)
 	row := ToolHealthRow{FailureCount: 40}
 
@@ -425,7 +425,7 @@ func TestIncrementalEditChurnOrdinalZero(t *testing.T) {
 		"full compute must count one churn for edits at 0,1,2")
 
 	state := SeedIncrementalState(
-		[]ToolCallRow{mk(0), mk(1)}, nil, "", "", nil, nil, 0, 0,
+		[]ToolCallRow{mk(0), mk(1)}, nil, "", "", nil, nil, 0, 0, 0,
 	)
 	next, got, ok := state.FoldToolHealth(
 		[]ToolCallRow{mk(2)}, nil, ToolHealthRow{},
@@ -455,7 +455,7 @@ func TestIncrementalFoldMidTaskAcrossSeed(t *testing.T) {
 		})
 	}
 	state := SeedIncrementalState(
-		calls, []int{10}, "", "", nil, nil, 0, 0,
+		calls, []int{10}, "", "", nil, nil, 0, 0, 0,
 	)
 	require.Len(t, state.PendingBoundaries, 1)
 	row := ToolHealthRow{}
@@ -485,7 +485,7 @@ func TestFoldToolHealthRunawayMutableWindowHeals(t *testing.T) {
 			CallIndex:      0,
 		}
 	}
-	state := SeedIncrementalState(calls, nil, "", "", nil, nil, 0, 0)
+	state := SeedIncrementalState(calls, nil, "", "", nil, nil, 0, 0, 0)
 
 	pos := func(i int) CallPos {
 		return CallPos{MessageOrdinal: i, CallIndex: 0}
@@ -535,7 +535,7 @@ func TestFoldToolHealthRunawayHistoricalStaysLatched(t *testing.T) {
 			CallIndex:      0,
 		}
 	}
-	state := SeedIncrementalState(calls, nil, "", "", nil, nil, 0, 0)
+	state := SeedIncrementalState(calls, nil, "", "", nil, nil, 0, 0, 0)
 	require.True(t, state.RunawayHistorical,
 		"the seeded archive already has a fully exited runaway window")
 
@@ -580,7 +580,7 @@ func TestSeedRunawayWindowCrossingRetainedBoundaryStaysHistorical(t *testing.T) 
 		}
 	}
 
-	state := SeedIncrementalState(calls, nil, "", "", nil, nil, 0, 0)
+	state := SeedIncrementalState(calls, nil, "", "", nil, nil, 0, 0, 0)
 	require.True(t, state.RunawayHistorical,
 		"an immutable runaway window crossing the retained boundary must latch")
 
@@ -621,7 +621,7 @@ func TestFoldRunawayWindowCrossingNewRetainedBoundaryLatches(t *testing.T) {
 		calls[i].ResultContent = "failed"
 		calls[i].EventStatus = "errored"
 	}
-	state := SeedIncrementalState(calls, nil, "", "", nil, nil, 0, 0)
+	state := SeedIncrementalState(calls, nil, "", "", nil, nil, 0, 0, 0)
 	require.False(t, state.RunawayHistorical)
 
 	appendHealthy := func(start, count int) []ToolCallRow {
@@ -660,7 +660,7 @@ func TestFoldRunawayWindowCrossingNewRetainedBoundaryLatches(t *testing.T) {
 func TestIncrementalStateUnmarshalInitializesMutableMaps(t *testing.T) {
 	var state IncrementalState
 	require.NoError(t, state.UnmarshalBinary([]byte(
-		`{"codec_version":2,"total_calls":0}`,
+		`{"codec_version":3,"total_calls":0}`,
 	)))
 	require.NotNil(t, state.EditLast)
 	require.NotNil(t, state.ModelCounts)
