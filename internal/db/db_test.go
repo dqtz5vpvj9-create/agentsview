@@ -4437,6 +4437,83 @@ func TestWriteSessionIncrementalBlockedResultKeepsRawLengthWithControlChars(t *t
 		"the stored event's content_length must also be the raw byte count")
 }
 
+// TestWriteSessionIncrementalBlockedResultsDedupByLengthAcrossBatches pins
+// the blocked-category equivalence rule for late results arriving in
+// separate incremental writes. Every stored blocked row has an empty
+// content column, so equivalence must be decided by original length: two
+// outputs of different length for the same agent and status are distinct
+// events (the full parse keeps both), while a replay of the same length is
+// the same event and must not be stored twice.
+func TestWriteSessionIncrementalBlockedResultsDedupByLengthAcrossBatches(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			ToolUseID: "call_cmd",
+		}},
+	})
+	write := func(content string) {
+		t.Helper()
+		_, err := d.WriteSessionIncremental("s1", nil, IncrementalSessionUpdate{
+			MsgCount:                1,
+			NextOrdinal:             1,
+			BlockedResultCategories: map[string]bool{"Bash": true},
+			ToolCallResultUpdates: []ToolCallResultUpdate{{
+				ToolUseID: "call_cmd",
+				Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
+				Events: []ToolResultEvent{{
+					ToolUseID:     "call_cmd",
+					Source:        "function_call_output",
+					Content:       content,
+					ContentLength: len(content),
+				}},
+			}},
+		})
+		require.NoError(t, err)
+	}
+	countEvents := func() int {
+		t.Helper()
+		var n int
+		require.NoError(t, d.Reader().QueryRow(`
+			SELECT COUNT(*) FROM tool_result_events
+			WHERE session_id = ? AND tool_use_id = ?`,
+			"s1", "call_cmd",
+		).Scan(&n))
+		return n
+	}
+
+	write("x")
+	write("yy")
+	assert.Equal(t, 2, countEvents(),
+		"blocked events of different length are distinct and must both be stored")
+
+	write("zz")
+	assert.Equal(t, 2, countEvents(),
+		"a blocked replay of an already-stored length is the same event")
+
+	var lengths []int
+	rows, err := d.Reader().Query(`
+		SELECT content_length FROM tool_result_events
+		WHERE session_id = ? AND tool_use_id = ? ORDER BY event_index`,
+		"s1", "call_cmd")
+	require.NoError(t, err)
+	defer rows.Close()
+	for rows.Next() {
+		var n int
+		require.NoError(t, rows.Scan(&n))
+		lengths = append(lengths, n)
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, []int{1, 2}, lengths)
+}
+
 func TestBackfillToolCallAgentStateTracksFirstAndLatest(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "s1", "proj")

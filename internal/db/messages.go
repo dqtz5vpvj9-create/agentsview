@@ -3150,24 +3150,26 @@ func applyToolCallResultUpdateTx(
 		if blocked {
 			stored.Content = ""
 		}
-		// Equivalence: same agent, status, and (for a storable content
-		// column) identical content, or -- for blocked categories, whose
-		// stored content is always blanked -- identical content length.
-		// Compare against stored, not candidate: for a blocked category
-		// candidate.Content is the raw, un-sanitized event content, which
-		// may carry embedded NUL bytes the sqlite driver truncates on
-		// bind, and the blocked branch below never needs it anyway since
-		// every stored blocked row's content column is empty.
+		// Equivalence mirrors the parser's raw dedup as closely as the
+		// stored columns allow: same agent and status, plus identical
+		// (sanitized) content for storable categories, or identical
+		// original length for blocked categories. The two arms are
+		// exclusive on purpose: every stored blocked row has an empty
+		// content column, so a content comparison there would match any
+		// earlier blocked event of the same agent/status and collapse
+		// distinct outputs; and the raw blocked content is never bound.
 		var exists int
 		err := tx.QueryRow(
 			`SELECT 1 FROM tool_result_events
 			 WHERE session_id = ? AND tool_call_message_ordinal = ?
 			   AND call_index = ? AND COALESCE(agent_id, '') IS ?
 			   AND status IS ?
-			   AND (content IS ? OR (? = 1 AND content_length = ?))
+			   AND ((? = 0 AND content IS ?)
+			        OR (? = 1 AND content_length = ?))
 			 LIMIT 1`,
 			sessionID, position.MessageOrdinal, position.CallIndex,
-			stored.AgentID, stored.Status, stored.Content,
+			stored.AgentID, stored.Status,
+			blocked, stored.Content,
 			blocked, stored.ContentLength,
 		).Scan(&exists)
 		if err == nil {
