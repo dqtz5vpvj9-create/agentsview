@@ -10468,6 +10468,7 @@ func (e *Engine) processProviderFile(
 				noCacheSkip: true,
 			}, true
 		}
+		stagedSink.idPrefix = e.idPrefix
 		stagedGCRelease = beginStagedColdSync()
 	}
 	var outcome parser.ParseOutcome

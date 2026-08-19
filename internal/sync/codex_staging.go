@@ -38,6 +38,12 @@ type codexStagingSink struct {
 	scratch *sql.DB
 	path    string
 
+	// idPrefix is applied to subagent_session_id at publish time, mirroring
+	// applyRemoteRewrites on the collecting path: staged events are inserted
+	// directly from scratch and never pass through the in-memory rewrite
+	// that prefixes remote (SSH/S3) session ids.
+	idPrefix string
+
 	// blocked marks categories whose stored content is blanked. Their raw
 	// content never enters scratch storage; only digest, original length,
 	// ordering metadata, and summary participation are retained.
@@ -632,8 +638,12 @@ func (s *codexStagingSink) InsertEventsTx(
 			)
 			SELECT ?, ?, ?, tool_use_id,
 			       CASE WHEN agent_id = '' THEN NULL ELSE agent_id END,
-			       CASE WHEN subagent_session_id = ''
-			            THEN NULL ELSE subagent_session_id END,
+			       CASE
+			           WHEN subagent_session_id = '' THEN NULL
+			           WHEN ? = '' OR instr(subagent_session_id, ?) = 1
+			               THEN subagent_session_id
+			           ELSE ? || subagent_session_id
+			       END,
 			       source, status,
 			       CASE WHEN blanked = 1 THEN '' ELSE content END,
 			       content_length,
@@ -642,7 +652,8 @@ func (s *codexStagingSink) InsertEventsTx(
 			FROM codex_staging.stage_events
 			WHERE call_key = ?
 			ORDER BY seq`,
-			sessionID, pos.Ordinal, pos.CallIndex, stageKey,
+			sessionID, pos.Ordinal, pos.CallIndex,
+			s.idPrefix, s.idPrefix, s.idPrefix, stageKey,
 		); err != nil {
 			return fmt.Errorf(
 				"publishing staged events for %s/%s: %w",

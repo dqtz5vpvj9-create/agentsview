@@ -450,6 +450,84 @@ func TestCodexEngineStagedSanitizesToolResultContent(t *testing.T) {
 	assert.Equal(t, legacyMsgs, stagedMsgs)
 }
 
+// TestCodexEngineStagedSubagentEventIDPrefix pins the staged publish path's
+// event-level id-prefix contract for a remote (IDPrefix-configured) sync.
+// The collecting path prefixes a subagent result event's SubagentSessionID
+// in memory through applyRemoteRewrites before the write; the staged path
+// inserts straight from scratch storage and must apply the same prefix at
+// publish time, or a large remote Codex import would persist an unprefixed
+// native id that cannot resolve to the session it actually belongs to.
+func TestCodexEngineStagedSubagentEventIDPrefix(t *testing.T) {
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122b13"
+	transcript := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/workspace/project-a", "codex_cli_rs",
+			"2024-01-01T10:00:00Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"user", "wait for the subagent", "2024-01-01T10:00:01Z",
+		),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"wait", "call_wait", map[string]any{
+				"ids": []string{"agent-1"},
+			}, "2024-01-01T10:00:02Z",
+		),
+		testjsonl.CodexFunctionCallOutputJSON(
+			"call_wait", map[string]any{
+				"status": map[string]any{
+					"agent-1": map[string]any{
+						"completed": "subagent finished",
+					},
+				},
+			}, "2024-01-01T10:00:03Z",
+		),
+	)
+
+	syncPrefixed := func(t *testing.T, stagedMin int64) *db.DB {
+		t.Helper()
+		database := openTestDB(t)
+		engine := NewEngine(database, EngineConfig{
+			AgentDirs: map[parser.AgentType][]string{
+				parser.AgentCodex: {writeCodexTranscriptRoot(t, uuid, transcript)},
+			},
+			Machine:                  "remote",
+			IDPrefix:                 "remote-host~",
+			StagedCodexParseMinBytes: stagedMin,
+		})
+		t.Cleanup(engine.Close)
+		stats := engine.SyncAll(t.Context(), nil)
+		require.Zero(t, stats.Failed)
+		require.Equal(t, 1, stats.Synced)
+		return database
+	}
+
+	legacyDB := syncPrefixed(t, 0)
+	stagedDB := syncPrefixed(t, 1)
+	sessionID := "remote-host~codex:" + uuid
+
+	assertPrefixed := func(t *testing.T, database *db.DB) db.ToolResultEvent {
+		t.Helper()
+		msgs, err := database.GetAllMessages(t.Context(), sessionID)
+		require.NoError(t, err)
+		var events []db.ToolResultEvent
+		for _, msg := range msgs {
+			for _, call := range msg.ToolCalls {
+				events = append(events, call.ResultEvents...)
+			}
+		}
+		require.Len(t, events, 1)
+		return events[0]
+	}
+
+	legacyEvent := assertPrefixed(t, legacyDB)
+	stagedEvent := assertPrefixed(t, stagedDB)
+	const wantSubagentID = "remote-host~codex:agent-1"
+	assert.Equal(t, wantSubagentID, legacyEvent.SubagentSessionID)
+	assert.Equal(t, wantSubagentID, stagedEvent.SubagentSessionID,
+		"staged publish must prefix the event's subagent session id "+
+			"the same way the collecting path's applyRemoteRewrites does")
+}
+
 // TestCodexEngineResyncBulkStagedParity pins the bulk-write blocker: a
 // full rebuild (ResyncAll) with the staged streaming path active must
 // publish real tool outputs, never the staged placeholders, and must
