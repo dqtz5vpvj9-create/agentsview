@@ -3129,11 +3129,20 @@ func applyToolCallResultUpdateTx(
 			incoming[i].ContentLength = len(incoming[i].Content)
 		}
 	}
-	toolCall := ToolCall{ResultEvents: incoming}
-	_ = SanitizeToolCall(&toolCall)
-	incoming = toolCall.ResultEvents
 
 	blocked := blockedResultCategories[category]
+	// Blocked-category content is blanked below and never stored, so it
+	// must skip sanitization: sanitizing first (like the full-parse
+	// pairToolResultEventSummaries path avoids by blanking before its
+	// central validation pass runs) would shrink ContentLength by the
+	// stripped-byte count before the blank overwrites Content, losing the
+	// original result length the full and staged paths both preserve.
+	if !blocked {
+		toolCall := ToolCall{ResultEvents: incoming}
+		_ = SanitizeToolCall(&toolCall)
+		incoming = toolCall.ResultEvents
+	}
+
 	insertRows := make([]toolResultEventRow, 0, len(incoming))
 	var inserted []ToolResultEvent
 	for _, candidate := range incoming {
@@ -3141,9 +3150,14 @@ func applyToolCallResultUpdateTx(
 		if blocked {
 			stored.Content = ""
 		}
-		// Mirror hasEquivalentToolResultEvent: same agent and status
-		// with either identical content, or — for blocked categories,
-		// whose stored content is blanked — identical content length.
+		// Equivalence: same agent, status, and (for a storable content
+		// column) identical content, or -- for blocked categories, whose
+		// stored content is always blanked -- identical content length.
+		// Compare against stored, not candidate: for a blocked category
+		// candidate.Content is the raw, un-sanitized event content, which
+		// may carry embedded NUL bytes the sqlite driver truncates on
+		// bind, and the blocked branch below never needs it anyway since
+		// every stored blocked row's content column is empty.
 		var exists int
 		err := tx.QueryRow(
 			`SELECT 1 FROM tool_result_events
@@ -3153,8 +3167,8 @@ func applyToolCallResultUpdateTx(
 			   AND (content IS ? OR (? = 1 AND content_length = ?))
 			 LIMIT 1`,
 			sessionID, position.MessageOrdinal, position.CallIndex,
-			candidate.AgentID, candidate.Status, candidate.Content,
-			blocked, candidate.ContentLength,
+			stored.AgentID, stored.Status, stored.Content,
+			blocked, stored.ContentLength,
 		).Scan(&exists)
 		if err == nil {
 			continue // equivalent event already stored

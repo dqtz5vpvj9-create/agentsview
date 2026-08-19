@@ -4374,6 +4374,69 @@ func TestWriteSessionIncrementalBlockedResultKeepsLength(t *testing.T) {
 			"\"a:\\nx\\n\\nb:\\nyy\"")
 }
 
+// TestWriteSessionIncrementalBlockedResultKeepsRawLengthWithControlChars
+// pins the length invariant blocked categories keep on the full-parse and
+// staged paths: sanitizing (which strips control/NUL bytes) must never run
+// against content this path is about to blank, or the stored length would
+// come up short by however many bytes sanitize removed instead of
+// reflecting the original raw output size.
+func TestWriteSessionIncrementalBlockedResultKeepsRawLengthWithControlChars(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			ToolUseID: "call_cmd",
+		}},
+	})
+
+	const raw = "before\x00after\x1b[31mred\u0085done"
+	_, werr := d.WriteSessionIncremental("s1", nil, IncrementalSessionUpdate{
+		MsgCount:                1,
+		NextOrdinal:             1,
+		BlockedResultCategories: map[string]bool{"Bash": true},
+		ToolCallResultUpdates: []ToolCallResultUpdate{{
+			ToolUseID: "call_cmd",
+			Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
+			Events: []ToolResultEvent{{
+				ToolUseID:     "call_cmd",
+				Source:        "function_call_output",
+				Content:       raw,
+				ContentLength: len(raw),
+			}},
+		}},
+	})
+	require.NoError(t, werr)
+
+	var storedContent string
+	var storedLen int
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT COALESCE(result_content, ''), result_content_length
+		FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "call_cmd",
+	).Scan(&storedContent, &storedLen))
+	assert.Empty(t, storedContent, "blocked result content stays blank")
+	assert.Equal(t, len(raw), storedLen,
+		"blocked result length must be the original raw byte count, "+
+			"not the sanitized (control-stripped) count")
+
+	var eventLen int
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT content_length FROM tool_result_events
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "call_cmd",
+	).Scan(&eventLen))
+	assert.Equal(t, len(raw), eventLen,
+		"the stored event's content_length must also be the raw byte count")
+}
+
 func TestBackfillToolCallAgentStateTracksFirstAndLatest(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "s1", "proj")
