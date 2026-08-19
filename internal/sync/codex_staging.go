@@ -462,12 +462,16 @@ func (s *codexStagingSink) AppendToolResultEvent(
 	// timeutil.Format before storing them; the staged rows must store the
 	// same normalized form so stored projections match byte for byte.
 	tsStr := timeutil.Format(ev.Timestamp)
-	// Events for calls that never registered in the message model follow
-	// the legacy orphan path (toolCallUpdates, discarded by full-parse
-	// consumers) instead of being staged: publishing them would diverge
-	// from the collecting path, which has always dropped full-parse
-	// orphans. Late outputs still merge through the incremental append
-	// path on later syncs, unchanged.
+	// Events for calls that never registered in the message model are
+	// unreachable regardless of how they are held: parser.ParseResult
+	// carries no ToolCallUpdates field, so every full-parse consumer
+	// (collecting and staged alike) discards them. Drop the event outright
+	// instead of forwarding it to the embedded collecting sink's orphan
+	// path, which would retain ev.Content -- an uncloned reference into
+	// the source line's backing buffer -- purely to be thrown away,
+	// defeating the staged sink's bounded-memory guarantee on large
+	// orphan outputs. Late outputs still merge through the incremental
+	// append path on later syncs, unchanged.
 	stageKey, ok := "", false
 	if target != nil {
 		stageKey, ok = s.callKeyByPosition[*target]
@@ -475,7 +479,6 @@ func (s *codexStagingSink) AppendToolResultEvent(
 		stageKey, ok = s.currentCallKey[callID]
 	}
 	if !ok {
-		s.CodexCollectingSink.AppendToolResultEvent(callID, target, ev)
 		return
 	}
 	// The legacy deduplication compares raw parser content before the central

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,6 +80,40 @@ func TestCodexStagingBlockedContentNeverEntersScratch(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, string(raw), secret,
 		"blocked raw content must not be recoverable from scratch storage")
+}
+
+// TestCodexStagingDropsOrphanResultEvents pins the staged sink's
+// bounded-memory contract for tool-result events whose call never
+// registered a message-model position. parser.ParseResult carries no
+// ToolCallUpdates field, so every full-parse consumer discards such
+// events; the staged sink must not retain their content on the way to
+// being discarded, since that content is an uncloned reference into the
+// source line's backing buffer and can be arbitrarily large.
+func TestCodexStagingDropsOrphanResultEvents(t *testing.T) {
+	dir := t.TempDir()
+	sink, err := newCodexStagingSink(dir, nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, sink.Close()) }()
+
+	large := strings.Repeat("orphan output ", 1000)
+	sink.AppendToolResultEvent("call_never_registered", nil,
+		parser.ParsedToolResultEvent{
+			ToolUseID: "call_never_registered",
+			Source:    "function_call_output",
+			Content:   large,
+		},
+	)
+	require.NoError(t, sink.Err())
+
+	assert.Empty(t, sink.ToolCallUpdates(),
+		"an orphan event must not be retained in the collecting "+
+			"sink's toolCallUpdates, which no full-parse consumer reads")
+
+	var rowCount int
+	require.NoError(t, sink.scratch.QueryRow(
+		`SELECT COUNT(*) FROM stage_events`,
+	).Scan(&rowCount))
+	assert.Zero(t, rowCount, "an orphan event must not be staged either")
 }
 
 func TestStagedCodexParseOutcomeCopiesFingerprintHash(t *testing.T) {
