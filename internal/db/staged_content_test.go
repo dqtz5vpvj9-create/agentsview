@@ -28,6 +28,38 @@ func TestStagedToolCallKeyIsSQLiteTextSafeAndUnambiguous(t *testing.T) {
 	require.Len(t, keys, 6)
 }
 
+// TestStagedSessionHasStoredMessagesTx pins the fast-path check a cold
+// staged import uses to skip both of stagedSessionContentDigestTx's
+// full-table scans: a session with no message rows yet must report false,
+// and gains true as soon as any message row exists, regardless of whether
+// that row carries a tool call.
+func TestStagedSessionHasStoredMessagesTx(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	tx, err := d.getWriter().BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	has, err := stagedSessionHasStoredMessagesTx(tx, "s1")
+	require.NoError(t, err)
+	require.False(t, has, "a session with no stored messages must report false")
+	require.NoError(t, tx.Rollback())
+
+	insertMessages(t, d, Message{
+		SessionID: "s1", Ordinal: 0, Role: "user", Content: "hi",
+	})
+
+	tx, err = d.getWriter().BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	has, err = stagedSessionHasStoredMessagesTx(tx, "s1")
+	require.NoError(t, err)
+	require.True(t, has, "a session with a stored message must report true")
+
+	has, err = stagedSessionHasStoredMessagesTx(tx, "codex:never-synced")
+	require.NoError(t, err)
+	require.False(t, has, "an unrelated session id must not report true")
+	require.NoError(t, tx.Rollback())
+}
+
 // scratchStagedResults is a minimal StagedToolResults backed by a real
 // scratch SQLite file, so the publish transaction's ATTACH and
 // INSERT..SELECT run against genuine cross-database SQL.

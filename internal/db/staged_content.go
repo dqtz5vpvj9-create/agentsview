@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -127,6 +128,30 @@ func writeStagedDigestInt(h interface{ Write([]byte) (int, error) }, value int64
 	var encoded [8]byte
 	binary.LittleEndian.PutUint64(encoded[:], uint64(value))
 	_, _ = h.Write(encoded[:])
+}
+
+// stagedSessionHasStoredMessagesTx reports whether sessionID already has any
+// stored message rows. tool_calls and tool_result_events are always inserted
+// alongside the message they belong to, so a session with no message rows
+// can never have any content stagedSessionContentDigestTx would find either.
+// A cold staged import can use this to skip both full-table digest scans
+// entirely instead of proving byte-for-byte equality against nothing.
+func stagedSessionHasStoredMessagesTx(
+	tx *sql.Tx, sessionID string,
+) (bool, error) {
+	var exists int
+	err := tx.QueryRow(
+		`SELECT 1 FROM messages WHERE session_id = ? LIMIT 1`, sessionID,
+	).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf(
+			"checking existing staged content for %s: %w", sessionID, err,
+		)
+	}
+	return true, nil
 }
 
 // stagedSessionContentDigestTx hashes every parser-owned transcript field while
@@ -358,9 +383,21 @@ func (db *DB) replaceSessionContentStaged(
 	if err != nil {
 		return err
 	}
-	contentBefore, err := stagedSessionContentDigestTx(tx, sessionID)
+	// A cold import has no stored rows for stagedSessionContentDigestTx to
+	// find, so contentBefore can only ever prove "changed" against
+	// contentAfter -- skip both full-table scans and go straight to the
+	// changed-content path below instead of paying to read back every byte
+	// this same transaction is about to write.
+	hadStoredContent, err := stagedSessionHasStoredMessagesTx(tx, sessionID)
 	if err != nil {
-		return fmt.Errorf("fingerprinting stored staged content: %w", err)
+		return err
+	}
+	var contentBefore [sha256.Size]byte
+	if hadStoredContent {
+		contentBefore, err = stagedSessionContentDigestTx(tx, sessionID)
+		if err != nil {
+			return fmt.Errorf("fingerprinting stored staged content: %w", err)
+		}
 	}
 	var pendingRecallRevocations recallEvidenceRevocationEvents
 
@@ -369,11 +406,15 @@ func (db *DB) replaceSessionContentStaged(
 	); err != nil {
 		return err
 	}
-	contentAfter, err := stagedSessionContentDigestTx(tx, sessionID)
-	if err != nil {
-		return fmt.Errorf("fingerprinting proposed staged content: %w", err)
+	contentUnchanged := false
+	if hadStoredContent {
+		contentAfter, err := stagedSessionContentDigestTx(tx, sessionID)
+		if err != nil {
+			return fmt.Errorf("fingerprinting proposed staged content: %w", err)
+		}
+		contentUnchanged = contentBefore == contentAfter
 	}
-	if contentBefore == contentAfter {
+	if contentUnchanged {
 		// Keep the existing row identities, transcript revision, and recall
 		// evidence. The session row may have received metadata-only updates
 		// before this publish, and detector rules may have advanced, so derived
