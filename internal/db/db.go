@@ -542,6 +542,23 @@ AFTER UPDATE ON main.messages BEGIN
         VALUES('delete', old.id, old.content);
     INSERT INTO messages_chinese_fts(rowid, content) VALUES (new.id, new.content);
 END;
+
+CREATE TEMP TRIGGER IF NOT EXISTS sessions_chinese_pending_ai
+AFTER INSERT ON main.sessions BEGIN
+    DELETE FROM messages_chinese_fts_pending_sessions
+    WHERE session_id = new.id AND generation = 1;
+END;
+CREATE TEMP TRIGGER IF NOT EXISTS sessions_chinese_pending_au
+AFTER UPDATE OF transcript_revision ON main.sessions
+WHEN old.transcript_revision IS NOT new.transcript_revision BEGIN
+    DELETE FROM messages_chinese_fts_pending_sessions
+    WHERE session_id = new.id AND generation = 1;
+END;
+CREATE TEMP TRIGGER IF NOT EXISTS sessions_chinese_pending_ad
+AFTER DELETE ON main.sessions BEGIN
+    DELETE FROM messages_chinese_fts_pending_sessions
+    WHERE session_id = old.id AND generation = 1;
+END;
 `
 
 const recallEntriesFTS = `
@@ -4208,6 +4225,9 @@ func (db *DB) DropFTS() error {
 		"DROP TRIGGER IF EXISTS messages_chinese_ai",
 		"DROP TRIGGER IF EXISTS messages_chinese_ad",
 		"DROP TRIGGER IF EXISTS messages_chinese_au",
+		"DROP TRIGGER IF EXISTS sessions_chinese_pending_ai",
+		"DROP TRIGGER IF EXISTS sessions_chinese_pending_au",
+		"DROP TRIGGER IF EXISTS sessions_chinese_pending_ad",
 		"DROP TABLE IF EXISTS messages_chinese_fts",
 		"DROP TRIGGER IF EXISTS messages_ai",
 		"DROP TRIGGER IF EXISTS messages_ad",
@@ -4219,6 +4239,11 @@ func (db *DB) DropFTS() error {
 		if _, err := w.Exec(s); err != nil {
 			return fmt.Errorf("drop fts (%s): %w", s, err)
 		}
+	}
+	if _, err := w.Exec(
+		"DELETE FROM stats WHERE key = ?", chineseFTSFingerprintStatsKey,
+	); err != nil {
+		return fmt.Errorf("clearing Chinese fts fingerprint: %w", err)
 	}
 	return nil
 }
@@ -4239,19 +4264,8 @@ func (db *DB) RebuildFTS() error {
 	if err != nil {
 		return fmt.Errorf("rebuild fts index: %w", err)
 	}
-	if simpleFTSRuntimeConfig.available() {
-		if _, err := w.Exec(schemaChineseFTS); err != nil {
-			return fmt.Errorf("recreate Chinese fts: %w", err)
-		}
-		if _, err := w.Exec(
-			"INSERT INTO messages_chinese_fts(messages_chinese_fts)" +
-				" VALUES('rebuild')",
-		); err != nil {
-			return fmt.Errorf("rebuild Chinese fts index: %w", err)
-		}
-		if _, err := w.Exec(schemaChineseFTSTriggers); err != nil {
-			return fmt.Errorf("recreate Chinese fts triggers: %w", err)
-		}
+	if err := ensureChineseFTS(context.Background(), w, true); err != nil {
+		return fmt.Errorf("rebuild Chinese fts index: %w", err)
 	}
 	return nil
 }
@@ -4299,6 +4313,20 @@ func (db *DB) HasFTS() bool {
 // loaded and queryable on this database connection.
 func (db *DB) HasChineseFTS() bool {
 	if !simpleFTSRuntimeConfig.available() {
+		return false
+	}
+	var storedFingerprint string
+	if err := db.getReader().QueryRow(
+		"SELECT CAST(value AS TEXT) FROM stats WHERE key = ?",
+		chineseFTSFingerprintStatsKey,
+	).Scan(&storedFingerprint); err != nil ||
+		storedFingerprint != simpleFTSRuntimeConfig.fingerprint {
+		return false
+	}
+	var pendingSessions int
+	if err := db.getReader().QueryRow(
+		"SELECT count(*) FROM messages_chinese_fts_pending_sessions",
+	).Scan(&pendingSessions); err != nil || pendingSessions != 0 {
 		return false
 	}
 	_, err := db.getReader().Exec(
@@ -4389,40 +4417,8 @@ func (db *DB) init(ctx context.Context) error {
 		}
 	}
 
-	var chineseFTSCount int
-	if err := w.QueryRowContext(ctx,
-		"SELECT count(*) FROM sqlite_master"+
-			" WHERE type='table' AND name='messages_chinese_fts'",
-	).Scan(&chineseFTSCount); err != nil {
-		return fmt.Errorf("checking Chinese FTS table: %w", err)
-	}
-	hadChineseFTS := chineseFTSCount > 0
-	if !simpleFTSRuntimeConfig.available() {
-		if hadChineseFTS {
-			// The index is derived data. Dropping it keeps the archive writable
-			// when the optional sidecar is removed and guarantees a later
-			// sidecar-enabled open backfills instead of using a stale index.
-			if _, err := w.ExecContext(ctx,
-				"DROP TABLE messages_chinese_fts",
-			); err != nil {
-				return fmt.Errorf("dropping unavailable Chinese FTS: %w", err)
-			}
-		}
-	} else {
-		if _, err := w.ExecContext(ctx, schemaChineseFTS); err != nil {
-			return fmt.Errorf("initializing Chinese FTS: %w", err)
-		}
-		if !hadChineseFTS {
-			if _, err := w.ExecContext(ctx,
-				"INSERT INTO messages_chinese_fts(messages_chinese_fts)"+
-					" VALUES('rebuild')",
-			); err != nil {
-				return fmt.Errorf("backfilling Chinese FTS: %w", err)
-			}
-		}
-		if _, err := w.ExecContext(ctx, schemaChineseFTSTriggers); err != nil {
-			return fmt.Errorf("initializing Chinese FTS triggers: %w", err)
-		}
+	if err := ensureChineseFTS(ctx, w, false); err != nil {
+		return fmt.Errorf("initializing Chinese FTS: %w", err)
 	}
 
 	var recallFTSCount int

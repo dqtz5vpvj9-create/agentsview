@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"sync"
 
 	"github.com/mattn/go-sqlite3"
 )
@@ -12,6 +13,8 @@ const (
 	sqliteUsageDriverName   = "agentsview_sqlite3"
 	sqliteArchiveDriverName = "agentsview_archive_sqlite3"
 )
+
+var simpleFTSDictionaryMu sync.RWMutex
 
 func init() {
 	sql.Register(sqliteUsageDriverName, &sqlite3.SQLiteDriver{
@@ -56,6 +59,11 @@ func configureArchiveSQLiteConnection(conn *sqlite3.SQLiteConn) error {
 	if !simpleFTSRuntimeConfig.available() {
 		return nil
 	}
+	// The extension stores the dictionary path in module-global state. SQLite
+	// can unload and reload an extension when every archive connection closes,
+	// so configure each connection while serializing the shared assignment.
+	simpleFTSDictionaryMu.Lock()
+	defer simpleFTSDictionaryMu.Unlock()
 	if _, err := conn.Exec(
 		"SELECT jieba_dict(?)",
 		[]driver.Value{simpleFTSRuntimeConfig.dictionaryPath},
