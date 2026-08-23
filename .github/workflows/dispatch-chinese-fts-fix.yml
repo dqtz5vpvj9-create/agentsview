@@ -1,0 +1,92 @@
+name: One-shot Chinese FTS repair
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: one-shot-chinese-fts-repair
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    if: github.event.issue.title == '[ci] Run PR 1491 Chinese FTS repair'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Report workflow run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" \
+            --body "Started validation run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/chinese-fts
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Apply review fixes
+        run: |
+          python scripts/apply-chinese-fts-review-fixes.py
+          python scripts/finish-chinese-fts-review-fixes.py
+          python scripts/finalize-chinese-fts-locking.py
+          python scripts/finalize-chinese-fts-opt-in.py
+          gofmt -w \
+            internal/db/chinese_fts_runtime.go \
+            internal/db/chinese_fts_search.go \
+            internal/db/chinese_fts_test.go \
+            internal/db/db.go \
+            internal/db/sqlite_driver.go
+          rm scripts/apply-chinese-fts-review-fixes.py
+          rm scripts/finish-chinese-fts-review-fixes.py
+          rm scripts/finalize-chinese-fts-locking.py
+          rm scripts/finalize-chinese-fts-opt-in.py
+          rm .github/workflows/apply-chinese-fts-review-fixes.yml
+          git diff --check
+
+      - name: Build pinned simple and cppjieba sidecar
+        run: bash scripts/build-simple-fts.sh dist/agentsview-simple
+
+      - name: Run Chinese FTS integration tests
+        env:
+          AGENTSVIEW_SIMPLE_DIR: ${{ github.workspace }}/dist/agentsview-simple
+          CGO_ENABLED: "1"
+        run: |
+          go test -tags fts5 ./internal/db \
+            -run 'Test(ContainsCJK|DiscoverSimpleFTSRuntime|ChineseFTS)' \
+            -count=1 -v -timeout=12m
+
+      - name: Run database test suite with the sidecar loaded
+        env:
+          AGENTSVIEW_SIMPLE_DIR: ${{ github.workspace }}/dist/agentsview-simple
+          CGO_ENABLED: "1"
+        run: go test -tags fts5 ./internal/db -count=1 -timeout=25m
+
+      - name: Commit tested fixes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(search): harden Chinese FTS lifecycle"
+          git push origin HEAD:feature/chinese-fts
+
+      - name: Report result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+          STATUS: ${{ job.status }}
+        run: |
+          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" \
+            --body "Validation finished with status **$STATUS**: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
