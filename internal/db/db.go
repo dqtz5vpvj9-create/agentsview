@@ -4784,7 +4784,7 @@ func (db *DB) Reopen() error {
 // so the struct never points at closed handles on failure.
 func (db *DB) reopenLocked() error {
 	writer, err := sql.Open(
-		"sqlite3", makeDSN(db.path, false),
+		sqliteArchiveDriverName, makeDSN(db.path, false),
 	)
 	if err != nil {
 		return fmt.Errorf("reopening writer: %w", err)

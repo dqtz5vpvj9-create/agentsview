@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
@@ -127,4 +128,34 @@ func TestChineseFTSSearch(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, reopened.Matches)
 	assert.Equal(t, "reopened", reopened.Matches[0].SessionID)
+
+	require.NoError(t, d.Reopen())
+	seedSearchSession(t, d, "swapped", "proj", [][2]string{
+		{"user", "完整重开数据库以后继续索引中文消息。"},
+	})
+	swapped, err := d.SearchContent(context.Background(), ContentSearchFilter{
+		Pattern: "索引中文",
+		Mode:    "fts",
+		Sources: []string{"messages"},
+		Limit:   20,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, swapped.Matches)
+	assert.Equal(t, "swapped", swapped.Matches[0].SessionID)
+}
+
+func TestChineseFTSTableCanBeDroppedWithoutExtension(t *testing.T) {
+	if !simpleFTSRuntimeConfig.available() {
+		t.Skip("simple FTS5 runtime is not installed for this test process")
+	}
+	path := filepath.Join(t.TempDir(), "drop-without-extension.db")
+	d, err := Open(path)
+	require.NoError(t, err)
+	require.NoError(t, d.Close())
+
+	raw, err := sql.Open("sqlite3", makeDSN(path, false))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, raw.Close()) })
+	_, err = raw.Exec("DROP TABLE messages_chinese_fts")
+	require.NoError(t, err)
 }
