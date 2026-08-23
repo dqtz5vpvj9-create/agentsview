@@ -36,6 +36,9 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Restore pricing snapshot
+        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+
       - name: Apply review fixes
         run: |
           python scripts/apply-chinese-fts-review-fixes.py
