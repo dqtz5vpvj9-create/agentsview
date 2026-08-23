@@ -1,12 +1,12 @@
 name: One-shot Chinese FTS repair
 
 on:
-  issues:
-    types: [opened]
+  pull_request_target:
+    types: [opened, reopened, synchronize]
 
 permissions:
   contents: write
-  issues: write
+  pull-requests: write
 
 concurrency:
   group: one-shot-chinese-fts-repair
@@ -14,16 +14,16 @@ concurrency:
 
 jobs:
   repair:
-    if: github.event.issue.title == '[ci] Run PR 1491 Chinese FTS repair'
+    if: github.event.pull_request.title == '[ci] Run PR 1491 Chinese FTS repair'
     runs-on: ubuntu-latest
     timeout-minutes: 50
     steps:
       - name: Report workflow run
         env:
           GH_TOKEN: ${{ github.token }}
-          ISSUE: ${{ github.event.issue.number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" \
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
             --body "Started validation run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
       - uses: actions/checkout@v4
@@ -85,8 +85,8 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
-          ISSUE: ${{ github.event.issue.number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           STATUS: ${{ job.status }}
         run: |
-          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" \
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
             --body "Validation finished with status **$STATUS**: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
