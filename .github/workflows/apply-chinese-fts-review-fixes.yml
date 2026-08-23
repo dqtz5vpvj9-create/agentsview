@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: apply-chinese-fts-review-fixes
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   apply-and-test:
@@ -30,6 +30,7 @@ jobs:
       - name: Apply review fixes
         run: |
           python scripts/apply-chinese-fts-review-fixes.py
+          python scripts/finish-chinese-fts-review-fixes.py
           gofmt -w \
             internal/db/chinese_fts_runtime.go \
             internal/db/chinese_fts_search.go \
@@ -37,6 +38,7 @@ jobs:
             internal/db/db.go \
             internal/db/sqlite_driver.go
           rm scripts/apply-chinese-fts-review-fixes.py
+          rm scripts/finish-chinese-fts-review-fixes.py
           rm .github/workflows/apply-chinese-fts-review-fixes.yml
           git diff --check
 
