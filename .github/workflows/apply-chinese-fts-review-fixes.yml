@@ -32,6 +32,7 @@ jobs:
           python scripts/apply-chinese-fts-review-fixes.py
           python scripts/finish-chinese-fts-review-fixes.py
           python scripts/finalize-chinese-fts-locking.py
+          python scripts/finalize-chinese-fts-opt-in.py
           gofmt -w \
             internal/db/chinese_fts_runtime.go \
             internal/db/chinese_fts_search.go \
@@ -41,6 +42,7 @@ jobs:
           rm scripts/apply-chinese-fts-review-fixes.py
           rm scripts/finish-chinese-fts-review-fixes.py
           rm scripts/finalize-chinese-fts-locking.py
+          rm scripts/finalize-chinese-fts-opt-in.py
           rm .github/workflows/apply-chinese-fts-review-fixes.yml
           git diff --check
 
