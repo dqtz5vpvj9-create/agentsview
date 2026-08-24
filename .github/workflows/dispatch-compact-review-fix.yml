@@ -1,0 +1,74 @@
+name: One-shot compact review repair
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: one-shot-compact-review-repair
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    if: github.event.pull_request.title == '[ci] Run PR 1495 compact review repair'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Report workflow run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --body "Started compact review validation: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: draft/db-compact
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Apply review fixes
+        run: |
+          cat .github/scripts/compact-review/part-* > /tmp/apply_compact_review.py
+          python /tmp/apply_compact_review.py
+          gofmt -w \
+            internal/db/compact.go \
+            internal/db/compact_space_unix.go \
+            internal/db/compact_space_windows.go \
+            internal/db/compact_test.go \
+            cmd/agentsview/main.go \
+            cmd/agentsview/db_compact.go \
+            cmd/agentsview/db_compact_runner_test.go
+          git diff --check
+
+      - name: Run targeted tests
+        run: go test ./internal/db ./cmd/agentsview ./internal/server
+
+      - name: Commit tested fixes
+        run: |
+          rm -rf .github/scripts/compact-review
+          rm -f .github/workflows/apply-compact-review.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(db): address compaction peak-space and lifecycle review"
+          git push origin HEAD:draft/db-compact
+
+      - name: Report result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          STATUS: ${{ job.status }}
+        run: |
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --body "Compact review validation finished with status **$STATUS**: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
