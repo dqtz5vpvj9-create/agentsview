@@ -14,7 +14,11 @@ const (
 	sqliteArchiveDriverName = "agentsview_archive_sqlite3"
 )
 
-var simpleFTSDictionaryMu sync.RWMutex
+// simpleFTSJiebaMu serializes the two upstream entry points that share
+// cppjieba's module-global dictionary state: jieba_dict and jieba_query.
+// The simple FTS tokenizer used by MATCH, trigger maintenance, and rebuilds
+// does not read that state; it tokenizes documents directly by code point.
+var simpleFTSJiebaMu sync.Mutex
 
 func init() {
 	sql.Register(sqliteUsageDriverName, &sqlite3.SQLiteDriver{
@@ -56,14 +60,23 @@ func configureArchiveSQLiteConnection(conn *sqlite3.SQLiteConn) error {
 	if err := configureSQLiteConnection(conn); err != nil {
 		return err
 	}
+	if err := conn.RegisterFunc(
+		"agentsview_chinese_fts_fingerprint",
+		func() string { return simpleFTSRuntimeConfig.fingerprint },
+		true,
+	); err != nil {
+		return fmt.Errorf("registering Chinese FTS fingerprint: %w", err)
+	}
 	if !simpleFTSRuntimeConfig.available() {
 		return nil
 	}
-	// The extension stores the dictionary path in module-global state. SQLite
-	// can unload and reload an extension when every archive connection closes,
-	// so configure each connection while serializing the shared assignment.
-	simpleFTSDictionaryMu.Lock()
-	defer simpleFTSDictionaryMu.Unlock()
+
+	// Upstream reads jieba_dict_path only while constructing/using
+	// jieba_query's process-global cppjieba instance. Serialize the setter
+	// with every internal jieba_query call. MATCH and index maintenance use
+	// SimpleTokenizer::tokenize and do not consult this path.
+	simpleFTSJiebaMu.Lock()
+	defer simpleFTSJiebaMu.Unlock()
 	if _, err := conn.Exec(
 		"SELECT jieba_dict(?)",
 		[]driver.Value{simpleFTSRuntimeConfig.dictionaryPath},

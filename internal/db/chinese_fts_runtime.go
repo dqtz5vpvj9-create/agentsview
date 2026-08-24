@@ -16,7 +16,7 @@ const simpleFTSDirEnv = "AGENTSVIEW_SIMPLE_DIR"
 
 const (
 	chineseFTSFingerprintStatsKey = "messages_chinese_fts_fingerprint_v1"
-	chineseFTSSchemaVersion       = "messages-chinese-fts-v2"
+	chineseFTSSchemaVersion       = "messages-chinese-fts-v3"
 )
 
 var (

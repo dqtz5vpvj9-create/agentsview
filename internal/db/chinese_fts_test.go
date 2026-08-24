@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -96,6 +97,26 @@ func TestChineseFTSSearch(t *testing.T) {
 	seedSearchSession(t, d, "english", "proj", [][2]string{
 		{"user", "The runner is running get_views after error-401."},
 	})
+
+	var pending int
+	require.NoError(t, d.getReader().QueryRow(
+		"SELECT count(*) FROM messages_chinese_fts_pending_sessions",
+	).Scan(&pending))
+	assert.Zero(t, pending)
+
+	var pinyinMatch string
+	simpleFTSJiebaMu.Lock()
+	err := d.getReader().QueryRow(
+		"SELECT jieba_query(?, 0)", "zhong",
+	).Scan(&pinyinMatch)
+	simpleFTSJiebaMu.Unlock()
+	require.NoError(t, err)
+	var pinyinHits int
+	require.NoError(t, d.getReader().QueryRow(
+		`SELECT count(*) FROM messages_chinese_fts
+		 WHERE messages_chinese_fts MATCH ?`, pinyinMatch,
+	).Scan(&pinyinHits))
+	assert.Zero(t, pinyinHits)
 
 	for _, query := range []string{"中文搜索", "搜索", "错", "SQLite 中文搜索"} {
 		page, err := d.SearchContent(context.Background(), ContentSearchFilter{
@@ -326,4 +347,127 @@ func TestChineseFTSRebuildsAfterLegacyWriter(t *testing.T) {
 		"SELECT count(*) FROM messages_chinese_fts_pending_sessions",
 	).Scan(&pending))
 	assert.Zero(t, pending)
+}
+
+func TestChineseFTSForeignFingerprintDefersMaintenance(t *testing.T) {
+	if !simpleFTSRuntimeConfig.available() {
+		t.Skip("simple FTS5 runtime is not installed for this test process")
+	}
+	d := testDB(t)
+	seedSearchSession(t, d, "foreign-runtime", "proj", [][2]string{
+		{"user", "原始中文内容。"},
+	})
+
+	_, err := d.getWriter().Exec(
+		"UPDATE stats SET value = 'foreign-runtime' WHERE key = ?",
+		chineseFTSFingerprintStatsKey,
+	)
+	require.NoError(t, err)
+	assert.False(t, d.HasChineseFTS())
+
+	require.NoError(t, d.Update(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(
+			"UPDATE messages SET content = ? WHERE session_id = ?",
+			"跨版本写入的新中文内容。", "foreign-runtime",
+		); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`
+			UPDATE sessions
+			SET transcript_revision = CAST(
+				CAST(transcript_revision AS INTEGER) + 1 AS TEXT
+			)
+			WHERE id = ?`, "foreign-runtime")
+		return err
+	}))
+
+	var pending int
+	require.NoError(t, d.getReader().QueryRow(
+		"SELECT count(*) FROM messages_chinese_fts_pending_sessions",
+	).Scan(&pending))
+	assert.Equal(t, 1, pending)
+
+	var match string
+	simpleFTSJiebaMu.Lock()
+	err = d.getReader().QueryRow(
+		"SELECT jieba_query(?, 0)", "跨版本写入",
+	).Scan(&match)
+	simpleFTSJiebaMu.Unlock()
+	require.NoError(t, err)
+
+	var staleMatches int
+	require.NoError(t, d.getReader().QueryRow(
+		`SELECT count(*) FROM messages_chinese_fts
+		 WHERE messages_chinese_fts MATCH ?`, match,
+	).Scan(&staleMatches))
+	assert.Zero(t, staleMatches)
+
+	require.NoError(t, d.Reopen())
+	assert.True(t, d.HasChineseFTS())
+	page, err := d.SearchContent(context.Background(), ContentSearchFilter{
+		Pattern: "跨版本写入",
+		Mode:    "fts",
+		Sources: []string{"messages"},
+		Limit:   20,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, page.Matches)
+	assert.Equal(t, "foreign-runtime", page.Matches[0].SessionID)
+	require.NoError(t, d.getReader().QueryRow(
+		"SELECT count(*) FROM messages_chinese_fts_pending_sessions",
+	).Scan(&pending))
+	assert.Zero(t, pending)
+}
+
+func TestChineseFTSJiebaConfigurationSerializesWithQueries(t *testing.T) {
+	if !simpleFTSRuntimeConfig.available() {
+		t.Skip("simple FTS5 runtime is not installed for this test process")
+	}
+	path := filepath.Join(t.TempDir(), "jieba-concurrency.db")
+	d, err := Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, d.Close()) })
+	seedSearchSession(t, d, "concurrent", "proj", [][2]string{
+		{"user", "并发中文搜索。"},
+	})
+
+	const workers = 8
+	const iterations = 4
+	errs := make(chan error, workers*iterations)
+	var wg sync.WaitGroup
+	for worker := range workers {
+		wg.Add(1)
+		go func(openConnections bool) {
+			defer wg.Done()
+			for range iterations {
+				if openConnections {
+					conn, err := sql.Open(
+						sqliteArchiveDriverName, makeDSN(path, true),
+					)
+					if err == nil {
+						err = conn.Ping()
+					}
+					if conn != nil {
+						if closeErr := conn.Close(); err == nil {
+							err = closeErr
+						}
+					}
+					if err != nil {
+						errs <- err
+					}
+					continue
+				}
+				if _, err := d.prepareMessageFTSQuery(
+					context.Background(), "并发中文搜索",
+				); err != nil {
+					errs <- err
+				}
+			}
+		}(worker%2 == 0)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
 }

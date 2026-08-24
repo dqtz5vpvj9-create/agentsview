@@ -494,9 +494,16 @@ CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
 END;
 `
 
+const chineseFTSRuntimeMatchesSQL = `EXISTS (
+    SELECT 1 FROM main.stats
+    WHERE key = '` + chineseFTSFingerprintStatsKey + `'
+      AND CAST(value AS TEXT) = agentsview_chinese_fts_fingerprint()
+)`
+
 const messagesChineseADTriggerDDL = `
 CREATE TEMP TRIGGER IF NOT EXISTS messages_chinese_ad
-AFTER DELETE ON main.messages BEGIN
+AFTER DELETE ON main.messages
+WHEN ` + chineseFTSRuntimeMatchesSQL + ` BEGIN
     INSERT INTO messages_chinese_fts(messages_chinese_fts, rowid, content)
         VALUES('delete', old.id, old.content);
 END;
@@ -526,36 +533,41 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_chinese_fts USING fts5(
     content,
     content='messages',
     content_rowid='id',
-    tokenize='simple'
+    tokenize='simple 0'
 );
 `
 
 const schemaChineseFTSTriggers = `
 CREATE TEMP TRIGGER IF NOT EXISTS messages_chinese_ai
-AFTER INSERT ON main.messages BEGIN
+AFTER INSERT ON main.messages
+WHEN ` + chineseFTSRuntimeMatchesSQL + ` BEGIN
     INSERT INTO messages_chinese_fts(rowid, content) VALUES (new.id, new.content);
 END;
 ` + messagesChineseADTriggerDDL + `
 CREATE TEMP TRIGGER IF NOT EXISTS messages_chinese_au
-AFTER UPDATE ON main.messages BEGIN
+AFTER UPDATE ON main.messages
+WHEN ` + chineseFTSRuntimeMatchesSQL + ` BEGIN
     INSERT INTO messages_chinese_fts(messages_chinese_fts, rowid, content)
         VALUES('delete', old.id, old.content);
     INSERT INTO messages_chinese_fts(rowid, content) VALUES (new.id, new.content);
 END;
 
 CREATE TEMP TRIGGER IF NOT EXISTS sessions_chinese_pending_ai
-AFTER INSERT ON main.sessions BEGIN
+AFTER INSERT ON main.sessions
+WHEN ` + chineseFTSRuntimeMatchesSQL + ` BEGIN
     DELETE FROM messages_chinese_fts_pending_sessions
     WHERE session_id = new.id AND generation = 1;
 END;
 CREATE TEMP TRIGGER IF NOT EXISTS sessions_chinese_pending_au
 AFTER UPDATE OF transcript_revision ON main.sessions
-WHEN old.transcript_revision IS NOT new.transcript_revision BEGIN
+WHEN old.transcript_revision IS NOT new.transcript_revision
+ AND ` + chineseFTSRuntimeMatchesSQL + ` BEGIN
     DELETE FROM messages_chinese_fts_pending_sessions
     WHERE session_id = new.id AND generation = 1;
 END;
 CREATE TEMP TRIGGER IF NOT EXISTS sessions_chinese_pending_ad
-AFTER DELETE ON main.sessions BEGIN
+AFTER DELETE ON main.sessions
+WHEN ` + chineseFTSRuntimeMatchesSQL + ` BEGIN
     DELETE FROM messages_chinese_fts_pending_sessions
     WHERE session_id = old.id AND generation = 1;
 END;
@@ -4323,10 +4335,12 @@ func (db *DB) HasChineseFTS() bool {
 		storedFingerprint != simpleFTSRuntimeConfig.fingerprint {
 		return false
 	}
-	var pendingSessions int
-	if err := db.getReader().QueryRow(
-		"SELECT count(*) FROM messages_chinese_fts_pending_sessions",
-	).Scan(&pendingSessions); err != nil || pendingSessions != 0 {
+	var hasPendingSessions bool
+	if err := db.getReader().QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM messages_chinese_fts_pending_sessions LIMIT 1
+		)`,
+	).Scan(&hasPendingSessions); err != nil || hasPendingSessions {
 		return false
 	}
 	_, err := db.getReader().Exec(

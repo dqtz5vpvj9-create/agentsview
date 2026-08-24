@@ -44,11 +44,11 @@ func (db *DB) prepareMessageFTSQuery(
 	}
 	defer conn.Close()
 
-	simpleFTSDictionaryMu.RLock()
+	simpleFTSJiebaMu.Lock()
 	err = conn.QueryRowContext(
-		ctx, "SELECT jieba_query(?)", trimmed,
+		ctx, "SELECT jieba_query(?, 0)", trimmed,
 	).Scan(&query.match)
-	simpleFTSDictionaryMu.RUnlock()
+	simpleFTSJiebaMu.Unlock()
 	if err != nil {
 		return messageFTSQuery{}, fmt.Errorf(
 			"preparing Chinese FTS query: %w", err,
