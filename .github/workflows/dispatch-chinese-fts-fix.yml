@@ -43,8 +43,10 @@ jobs:
         run: |
           python3 scripts/normalize-chinese-fts-runtime-guard.py
           python3 scripts/apply-chinese-fts-runtime-guard.py
+          python3 scripts/finalize-chinese-fts-runtime-guard.py
           rm scripts/normalize-chinese-fts-runtime-guard.py
           rm scripts/apply-chinese-fts-runtime-guard.py
+          rm scripts/finalize-chinese-fts-runtime-guard.py
           rm .github/workflows/apply-chinese-fts-runtime-guard.yml
           go fmt ./...
           git diff --check
