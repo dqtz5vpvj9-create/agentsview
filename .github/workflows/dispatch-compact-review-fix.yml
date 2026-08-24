@@ -53,8 +53,12 @@ jobs:
             cmd/agentsview/db_compact_runner_test.go
           git diff --check
 
-      - name: Run targeted tests
-        run: go test ./internal/db ./cmd/agentsview ./internal/server
+      - name: Run compaction-focused tests
+        run: |
+          go test ./internal/db
+          go test ./internal/server
+          go test -tags fts5 ./cmd/agentsview -run 'Compact' -count=1
+          go test -tags fts5 ./cmd/agentsview -run '^$'
 
       - name: Commit tested fixes
         run: |
