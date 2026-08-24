@@ -270,7 +270,8 @@ func (p *codexProvider) Parse(
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 	parentID, parentResolved := p.codexParentResolution(path)
-	sess, msgs, err := p.parseSession(path, machine, false)
+	sess, msgs, cursor, safe, hashState, anchorDigest, err :=
+		p.parseSessionWithCursor(path, machine, false)
 	if err != nil {
 		return ParseOutcome{}, err
 	}
@@ -286,10 +287,22 @@ func (p *codexProvider) Parse(
 	if req.Fingerprint.Hash != "" {
 		sess.File.Hash = req.Fingerprint.Hash
 	}
+	var checkpoint []byte
+	if safe {
+		checkpoint, err = cursor.MarshalBinary()
+		if err != nil {
+			return ParseOutcome{}, fmt.Errorf(
+				"encoding codex checkpoint %s: %w", path, err,
+			)
+		}
+	}
 	result := ParseResultOutcome{
 		Result: ParseResult{
-			Session:  *sess,
-			Messages: msgs,
+			Session:                *sess,
+			Messages:               msgs,
+			Checkpoint:             checkpoint,
+			CheckpointHashState:    hashState,
+			CheckpointAnchorDigest: anchorDigest,
 		},
 		DataVersion: DataVersionCurrent,
 	}
@@ -354,15 +367,36 @@ func (p *codexProvider) ParseIncremental(
 		return IncrementalOutcome{}, IncrementalNoNewData, nil
 	}
 
-	result, err := p.parseSessionFromSnapshot(
-		path,
-		req.Offset,
-		req.StartOrdinal,
-		false,
-		f,
-		info,
-		req.Fingerprint.Size,
-	)
+	var result codexIncrementalParseResult
+	if len(req.Seed) > 0 {
+		var seed codexCursorState
+		if err := seed.UnmarshalBinary(req.Seed); err != nil {
+			// A persisted cursor the current binary cannot decode must not
+			// resume; rebuild the transcript authoritatively.
+			return IncrementalOutcome{ForceReplace: true},
+				IncrementalNeedsFullParse, nil
+		}
+		result, err = p.parseSessionFromCheckpoint(
+			path,
+			req.Offset,
+			req.StartOrdinal,
+			false,
+			f,
+			info,
+			req.Fingerprint.Size,
+			seed,
+		)
+	} else {
+		result, err = p.parseSessionFromSnapshot(
+			path,
+			req.Offset,
+			req.StartOrdinal,
+			false,
+			f,
+			info,
+			req.Fingerprint.Size,
+		)
+	}
 	if err != nil {
 		if IsIncrementalFullParseFallback(err) {
 			return IncrementalOutcome{ForceReplace: true},
@@ -402,9 +436,17 @@ func (p *codexProvider) ParseIncremental(
 	totalOut, peakCtx, hasTotalOut, hasPeakCtx :=
 		codexProviderTokenTotals(result.messages)
 	termination := codexIncrementalTermination(result.cursor.lastTaskEvent)
+	nextCursor, err := result.cursor.MarshalBinary()
+	if err != nil {
+		return IncrementalOutcome{}, IncrementalNeedsFullParse, fmt.Errorf(
+			"encoding codex cursor %s: %w", path, err,
+		)
+	}
 	return IncrementalOutcome{
 		SessionID:            req.SessionID,
 		Messages:             result.messages,
+		ToolCallUpdates:      result.toolCallUpdates,
+		NextCursor:           nextCursor,
 		EndedAt:              result.endedAt,
 		ConsumedBytes:        result.consumedBytes,
 		MessageCount:         len(result.messages),

@@ -6403,12 +6403,13 @@ func TestProjectIdentityIncrementalStatePreservesExplicitSourceProject(
 				func(
 					_ string,
 					inc *db.IncrementalInfo,
-				) ([]parser.ParsedMessage, []parser.ClaudeSubagentLink, time.Time, int64, *string, error) {
+				) ([]parser.ParsedMessage, []parser.ClaudeSubagentLink, []parser.ParsedToolCallUpdate, time.Time, int64, *string, []byte, error) {
 					return []parser.ParsedMessage{{
 						Role: parser.RoleAssistant, Content: "appended",
 						Ordinal: inc.NextOrdinal,
-					}}, nil, appendedInfo.ModTime(), int64(len(appended)), nil, nil
+					}}, nil, nil, appendedInfo.ModTime(), int64(len(appended)), nil, nil, nil
 				},
+				nil, "", nil,
 			)
 			require.True(t, ok)
 			require.NotNil(t, result.incremental)
@@ -6504,10 +6505,11 @@ func TestProjectIdentityLegacyMappedSnapshotReparsesBeforeIncrementalAppend(
 		func(
 			_ string,
 			_ *db.IncrementalInfo,
-		) ([]parser.ParsedMessage, []parser.ClaudeSubagentLink, time.Time, int64, *string, error) {
+		) ([]parser.ParsedMessage, []parser.ClaudeSubagentLink, []parser.ParsedToolCallUpdate, time.Time, int64, *string, []byte, error) {
 			parseCalled = true
-			return nil, nil, time.Time{}, 0, nil, nil
+			return nil, nil, nil, time.Time{}, 0, nil, nil, nil
 		},
+		nil, "", nil,
 	)
 	assert.False(t, ok,
 		"legacy snapshots must fall through to a source-aware full parse")
@@ -7540,15 +7542,25 @@ func TestProcessFileCodexDBFreshSkipIsNotCached(t *testing.T) {
 		},
 	}
 
-	res := e.processFile(context.Background(), parser.DiscoveredFile{
-		Agent:   parser.AgentCodex,
-		Path:    path,
-		Machine: "host",
-	})
-	require.NoError(t, res.err)
-	require.True(t, res.skip)
-	assert.True(t, res.noCacheSkip)
-	assert.Empty(t, e.SnapshotSkipCache())
+	_ = parser.AgentCodex
+	// A checkpointless stored session earns one lazy bootstrap: the first
+	// sync parses authoritatively and persists the checkpoint atomically
+	// with the content. The second sync then takes the fresh-session skip
+	// and must not cache it.
+	stats := e.SyncAll(context.Background(), nil)
+	require.Zero(t, stats.Failed)
+	require.Equal(t, 1, stats.Synced)
+	_, cpOk, cpErr := database.GetParserCheckpoint("host~codex:abc")
+	require.NoError(t, cpErr)
+	require.True(t, cpOk,
+		"the bootstrap must persist the checkpoint")
+
+	stats = e.SyncAll(context.Background(), nil)
+	require.Zero(t, stats.Failed)
+	require.Zero(t, stats.Synced,
+		"the second sync must skip the fresh session")
+	assert.Empty(t, e.SnapshotSkipCache(),
+		"the fresh skip must not be cached")
 }
 
 func TestClassifyCodexIndexPathSkipsMissingTranscript(t *testing.T) {
@@ -7974,6 +7986,7 @@ func TestTryProviderIncrementalAppendPassesPersistedSessionID(t *testing.T) {
 			Size:    info.Size(),
 			MTimeNS: info.ModTime().UnixNano(),
 		},
+		nil, "", nil, nil,
 	)
 
 	require.True(t, applied)

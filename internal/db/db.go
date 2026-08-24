@@ -637,6 +637,17 @@ type DB struct {
 	vectorMu       sync.RWMutex
 	vectorSearcher VectorSearcher
 	recallSearcher RecallVectorSearcher
+
+	// messagesLoadCount counts GetAllMessages calls. Tests use it to gate
+	// the incremental signal path: a maintained delta must not load
+	// session history.
+	messagesLoadCount atomic.Int64
+}
+
+// MessagesLoadCount returns the total number of GetAllMessages calls the
+// database has served. Monotonic; used by the incremental-path gates.
+func (db *DB) MessagesLoadCount() int64 {
+	return db.messagesLoadCount.Load()
 }
 
 // Reader exposes guarded read-only query operations. It intentionally does

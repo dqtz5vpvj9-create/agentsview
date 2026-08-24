@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -1700,6 +1701,53 @@ func TestParseCodexSession_ForkedSessionSkipsReplayedHistory(t *testing.T) {
 	})
 }
 
+func TestParseCodexSessionWithCursorActiveForkGateNeverPersistsCheckpoint(
+	t *testing.T,
+) {
+	forkCreatedMs := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC).UnixMilli()
+	forkID := testUUIDv7(forkCreatedMs, 1)
+	parentID := testUUIDv7(forkCreatedMs-7200_000, 0)
+	parentTurnID := testUUIDv7(forkCreatedMs-3600_000, 2)
+	root := t.TempDir()
+	parent := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(parentID, "/tmp", "user", tsEarly),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", parentTurnID, tsEarly),
+	)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "rollout-2024-01-01T08-00-00-"+parentID+".jsonl"),
+		[]byte(parent), 0o600,
+	))
+
+	// The fork ends while the replay gate is still open: only the copied
+	// parent meta and a replayed parent turn have arrived so far. Such a
+	// snapshot must not persist a resume cursor, or a later append would
+	// import the remaining replayed parent records as child content.
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexForkedSessionMetaJSON(
+			forkID, parentID, "/tmp", "user", tsEarly,
+		),
+		testjsonl.CodexSessionMetaJSON(parentID, "/tmp", "user", tsEarly),
+		testjsonl.CodexTurnContextWithIDJSON(
+			"gpt-5.4", parentTurnID, tsEarly,
+		),
+	)
+	path := filepath.Join(
+		root, "rollout-2024-01-01T10-00-00-"+forkID+".jsonl",
+	)
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	provider := newCodexTestProvider(t, root)
+	source := requireCodexProviderSource(t, provider, forkID)
+	outcome, err := provider.Parse(context.Background(), ParseRequest{
+		Source: source,
+	})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	assert.Empty(t, outcome.Results[0].Result.Checkpoint,
+		"a snapshot ending inside replayed parent history must not "+
+			"persist a checkpoint")
+}
+
 func TestParseCodexSession_ForkBoundaryTreatsTurnIDsAsOpaque(t *testing.T) {
 	t.Parallel()
 
@@ -2735,7 +2783,7 @@ func TestParseCodexSessionFrom_LateTokenCountRequiresFullParse(t *testing.T) {
 	assert.True(t, IsIncrementalFullParseFallback(err))
 }
 
-func TestParseCodexSessionFrom_FunctionCallOutputRequiresFullParse(t *testing.T) {
+func TestParseCodexSessionFrom_FunctionCallOutputUpdatesStoredCall(t *testing.T) {
 	t.Parallel()
 
 	initial := testjsonl.JoinJSONL(
@@ -2765,9 +2813,21 @@ func TestParseCodexSessionFrom_FunctionCallOutputRequiresFullParse(t *testing.T)
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	_, _, _, err = parseCodexTestSessionFrom(t, path, offset, 2, false)
-	require.Error(t, err)
-	assert.True(t, IsIncrementalFullParseFallback(err))
+	result, err := newCodexTestProvider(t).parseSessionFromDetailed(
+		path, offset, 2, false,
+	)
+	require.NoError(t, err)
+	assert.Empty(t, result.messages)
+	require.Len(t, result.toolCallUpdates, 1)
+	assert.Equal(t, "call_cmd", result.toolCallUpdates[0].ToolUseID)
+	assertToolResultEvents(t,
+		result.toolCallUpdates[0].ResultEvents,
+		[]ParsedToolResultEvent{{
+			ToolUseID: "call_cmd",
+			Source:    "function_call_output",
+			Content:   "done",
+		}},
+	)
 }
 
 // A tool call and its output that both arrive in the same appended

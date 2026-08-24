@@ -70,6 +70,7 @@ type codexSessionBuilder struct {
 	ordinal              int
 	callNames            map[string]string
 	callRefs             map[string]codexToolCallRef
+	toolCallUpdates      []ParsedToolCallUpdate
 	agentSpawnCalls      map[string]string
 	agentWaitCalls       map[string]string
 	pendingAgentEvents   map[string][]codexPendingEvent
@@ -516,6 +517,7 @@ func (b *codexSessionBuilder) handleFunctionCall(
 	callID := payload.Get("call_id").Str
 	if callID != "" {
 		b.callNames[callID] = name
+		b.rememberToolCall(callID, name)
 	}
 
 	content := formatCodexFunctionCall(name, payload)
@@ -566,6 +568,7 @@ func (b *codexSessionBuilder) handleFunctionCallOutput(
 	if callID == "" {
 		return
 	}
+	defer b.forgetToolCall(callID)
 
 	output, raw := parseCodexFunctionOutput(payload)
 	if !output.Exists() {
@@ -574,7 +577,7 @@ func (b *codexSessionBuilder) handleFunctionCallOutput(
 		}
 	}
 
-	switch b.callNames[callID] {
+	switch b.toolCallNameForOutput(callID) {
 	case "spawn_agent":
 		agentID := strings.TrimSpace(output.Get("agent_id").Str)
 		if agentID == "" {
@@ -624,6 +627,14 @@ func (b *codexSessionBuilder) handleFunctionCallOutput(
 			})
 		}
 	}
+}
+
+func (b *codexSessionBuilder) toolCallNameForOutput(callID string) string {
+	if name := b.callNames[callID]; name != "" {
+		return name
+	}
+	name, _ := b.toolCallName(callID)
+	return name
 }
 
 // setCallSubagentSessionID links a tool call to the session of
@@ -690,6 +701,7 @@ func (b *codexSessionBuilder) appendCallResultEvent(
 	}
 	ref, ok := b.callRefs[callID]
 	if !ok || ref.messageIndex < 0 || ref.messageIndex >= len(b.messages) {
+		b.appendToolCallUpdate(callID, ev)
 		return
 	}
 	if ref.callIndex < 0 || ref.callIndex >= len(b.messages[ref.messageIndex].ToolCalls) {
@@ -706,6 +718,29 @@ func (b *codexSessionBuilder) appendCallResultEvent(
 		return
 	}
 	tc.ResultEvents = append(tc.ResultEvents, ev)
+}
+
+func (b *codexSessionBuilder) appendToolCallUpdate(
+	callID string, ev ParsedToolResultEvent,
+) {
+	if ev.ToolUseID == "" {
+		ev.ToolUseID = callID
+	}
+	for i := range b.toolCallUpdates {
+		update := &b.toolCallUpdates[i]
+		if update.ToolUseID != callID {
+			continue
+		}
+		if b.hasEquivalentCallResultEvent(update.ResultEvents, ev) {
+			return
+		}
+		update.ResultEvents = append(update.ResultEvents, ev)
+		return
+	}
+	b.toolCallUpdates = append(b.toolCallUpdates, ParsedToolCallUpdate{
+		ToolUseID:    callID,
+		ResultEvents: []ParsedToolResultEvent{ev},
+	})
 }
 
 func (b *codexSessionBuilder) hasEquivalentCallResultEvent(
@@ -1489,6 +1524,27 @@ func (p *codexProvider) parseSession(
 	)
 }
 
+// parseSessionWithCursor is parseSession plus the end-of-snapshot
+// continuation cursor (and whether the end is a safe resume boundary).
+func (p *codexProvider) parseSessionWithCursor(
+	path, machine string, includeExec bool,
+) (*ParsedSession, []ParsedMessage, codexCursorState, bool, []byte, string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, codexCursorState{}, false, nil, "",
+			fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, nil, codexCursorState{}, false, nil, "",
+			fmt.Errorf("stat %s: %w", path, err)
+	}
+	return p.parseSessionSnapshotWithCursor(
+		path, machine, includeExec, f, info,
+	)
+}
+
 func (p *codexProvider) parentTurnResolver(
 	childPath string,
 ) codexParentTurnResolver {
@@ -1597,7 +1653,26 @@ func (p *codexProvider) parseSessionSnapshot(
 	f *os.File,
 	info os.FileInfo,
 ) (*ParsedSession, []ParsedMessage, error) {
-	lr := newLineReader(io.LimitReader(f, info.Size()), maxLineSize)
+	sess, msgs, _, _, _, _, err := p.parseSessionSnapshotWithCursor(
+		path, machine, includeExec, f, info,
+	)
+	return sess, msgs, err
+}
+
+// parseSessionSnapshotWithCursor is parseSessionSnapshot plus the
+// continuation state at the end of the parsed snapshot. safe reports whether
+// the file's end is a safe resume boundary; a false safe means the returned
+// cursor must not be persisted. hashState and anchorDigest cover the whole
+// snapshot [0, info.Size()) from the same read pass the parser performed;
+// they are meaningful only when safe is true.
+func (p *codexProvider) parseSessionSnapshotWithCursor(
+	path, machine string,
+	includeExec bool,
+	f *os.File,
+	info os.FileInfo,
+) (*ParsedSession, []ParsedMessage, codexCursorState, bool, []byte, string, error) {
+	tee := newCodexHashAnchorTee(io.LimitReader(f, info.Size()))
+	lr := newLineReader(tee, maxLineSize)
 	defer releaseLineReader(lr)
 	b := newCodexSessionBuilder(includeExec, p.parentTurnResolver(path))
 
@@ -1610,26 +1685,41 @@ func (p *codexProvider) parseSessionSnapshot(
 			continue
 		}
 		if b.processLine(line) {
-			return nil, nil, nil
+			return nil, nil, codexCursorState{}, false, nil, "", nil
 		}
 	}
 
 	if err := lr.Err(); err != nil {
 		return nil, nil,
+			codexCursorState{}, false, nil, "",
 			fmt.Errorf("reading codex %s: %w", path, err)
 	}
 
 	b.flushPendingAgentResults()
 	b.normalizeOrdinals()
+	seed := b.incrementalSeed()
 	inode, device := sourceFileIdentity(info)
-	if safe, safeErr := codexSafeResumeOffsetFile(f, info.Size()); safeErr == nil && safe {
-		p.cursorCache.Put(
-			path,
-			info.Size(),
-			inode,
-			device,
-			b.incrementalSeed(),
-		)
+	changeTime, _ := codexIndexChangeTime(path, info)
+	safe := false
+	// A snapshot that ends while the fork replay gate is still active
+	// contains only replayed parent history so far. Persisting a cursor
+	// here would resume past session_meta with the gate dropped, and the
+	// remaining replayed parent records would be imported as child
+	// content. Refuse the checkpoint until a genuine child turn opens the
+	// gate; the file then reparses authoritatively and earns its cursor.
+	if !b.forkGate.active {
+		if safeCheck, safeErr := codexSafeResumeOffsetFile(
+			f, info.Size(),
+		); safeErr == nil && safeCheck {
+			safe = true
+			p.cursorCache.Put(
+				path,
+				info.Size(),
+				inode,
+				device,
+				seed,
+			)
+		}
 	}
 
 	sessionID := b.sessionID
@@ -1682,17 +1772,30 @@ func (p *codexProvider) parseSessionSnapshot(
 		UserMessageCount:   userCount,
 		TerminationStatus:  classifyCodexTermination(b.lastTaskEvent),
 		File: FileInfo{
-			Path:   path,
-			Size:   info.Size(),
-			Mtime:  mtime,
-			Inode:  int64(inode),
-			Device: int64(device),
+			Path:       path,
+			Size:       info.Size(),
+			Mtime:      mtime,
+			Inode:      int64(inode),
+			Device:     int64(device),
+			ChangeTime: changeTime,
 		},
 	}
 
 	accumulateMessageTokenUsage(sess, b.messages)
 
-	return sess, b.messages, nil
+	var hashState []byte
+	var anchorDigest string
+	if safe {
+		state, err := tee.HashState()
+		if err != nil {
+			return nil, nil, codexCursorState{}, false, nil, "",
+				fmt.Errorf("capturing codex hash state %s: %w", path, err)
+		}
+		hashState = state
+		anchorDigest = tee.AnchorDigest()
+	}
+
+	return sess, b.messages, seed, safe, hashState, anchorDigest, nil
 }
 
 // CodexSessionIndexFilename is the name of the Codex index file that maps
@@ -2016,13 +2119,30 @@ func seedCodexIncrementalStateFromReader(
 				}
 			}
 		case codexTypeResponseItem:
-			observeCodexIncrementalUserMessage(&b.codexCursorState, payload)
+			observeCodexIncrementalResponseItem(&b.codexCursorState, payload)
 		}
 	}
 	if err := lr.Err(); err != nil {
 		return codexIncrementalSeed{}, err
 	}
 	return b.codexCursorState, nil
+}
+
+func observeCodexIncrementalResponseItem(
+	s *codexIncrementalSeed,
+	payload gjson.Result,
+) {
+	switch payload.Get("type").Str {
+	case "function_call", "custom_tool_call":
+		s.rememberToolCall(
+			payload.Get("call_id").Str,
+			payload.Get("name").Str,
+		)
+	case "function_call_output", "custom_tool_call_output":
+		s.forgetToolCall(payload.Get("call_id").Str)
+	default:
+		observeCodexIncrementalUserMessage(s, payload)
+	}
 }
 
 // observeUserMessage feeds one response_item into the
@@ -2169,13 +2289,14 @@ func codexSafeResumeOffsetFile(f *os.File, offset int64) (bool, error) {
 }
 
 type codexIncrementalParseResult struct {
-	messages      []ParsedMessage
-	endedAt       time.Time
-	consumedBytes int64
-	initialCursor codexCursorState
-	cursor        codexCursorState
-	inode         uint64
-	device        uint64
+	messages        []ParsedMessage
+	toolCallUpdates []ParsedToolCallUpdate
+	endedAt         time.Time
+	consumedBytes   int64
+	initialCursor   codexCursorState
+	cursor          codexCursorState
+	inode           uint64
+	device          uint64
 }
 
 // parseSessionFromDetailed parses only new lines from a Codex JSONL file. It
@@ -2230,6 +2351,34 @@ func (p *codexProvider) parseSessionFromSnapshot(
 				io.NewSectionReader(f, 0, offset),
 				p.parentTurnResolver(path),
 			)
+		},
+	)
+}
+
+// parseSessionFromCheckpoint is parseSessionFromSnapshot with the committed
+// prefix's continuation state supplied from a persisted checkpoint instead
+// of a prefix rescan.
+func (p *codexProvider) parseSessionFromCheckpoint(
+	path string,
+	offset int64,
+	startOrdinal int,
+	includeExec bool,
+	f *os.File,
+	info os.FileInfo,
+	limit int64,
+	seed codexCursorState,
+) (codexIncrementalParseResult, error) {
+	return p.parseSessionFromWithSources(
+		path,
+		offset,
+		startOrdinal,
+		includeExec,
+		info,
+		func(fn func(string)) (int64, error) {
+			return readCodexJSONLSection(f, offset, limit, fn)
+		},
+		func() (codexIncrementalSeed, error) {
+			return seed, nil
 		},
 	)
 }
@@ -2320,7 +2469,7 @@ func (p *codexProvider) parseSessionFromWithSources(
 				fallbackErr = errCodexIncrementalNeedsFullParse
 				return
 			}
-			if codexIncrementalNeedsFullParse(line) {
+			if b.codexIncrementalNeedsFullParse(line) {
 				fallbackErr = errCodexIncrementalNeedsFullParse
 				return
 			}
@@ -2354,13 +2503,14 @@ func (p *codexProvider) parseSessionFromWithSources(
 
 	b.flushPendingAgentResults()
 	result := codexIncrementalParseResult{
-		messages:      b.messages,
-		endedAt:       b.endedAt,
-		consumedBytes: consumed,
-		initialCursor: seed,
-		cursor:        b.incrementalSeed(),
-		inode:         inode,
-		device:        device,
+		messages:        b.messages,
+		toolCallUpdates: b.toolCallUpdates,
+		endedAt:         b.endedAt,
+		consumedBytes:   consumed,
+		initialCursor:   seed,
+		cursor:          b.incrementalSeed(),
+		inode:           inode,
+		device:          device,
 	}
 	return result, nil
 }
@@ -2390,8 +2540,8 @@ func (p *codexProvider) parseSessionFrom(
 // parse error requires the caller to fall back to a full parse.
 func IsIncrementalFullParseFallback(err error) bool {
 	return errors.Is(err, errCodexIncrementalNeedsFullParse) ||
-		errors.Is(err, ErrClaudeIncrementalNeedsFullParse) ||
-		errors.Is(err, ErrIncrementalNeedsFullParse)
+		errors.Is(err, ErrIncrementalNeedsFullParse) ||
+		errors.Is(err, ErrClaudeIncrementalNeedsFullParse)
 }
 
 func isCodexSystemMessage(content string) bool {
@@ -2495,6 +2645,13 @@ func isCodexSubagentNotification(content string) bool {
 }
 
 func codexIncrementalNeedsFullParse(line string) bool {
+	b := newCodexSessionBuilder(false, nil)
+	return b.codexIncrementalNeedsFullParse(line)
+}
+
+func (b *codexSessionBuilder) codexIncrementalNeedsFullParse(
+	line string,
+) bool {
 	switch gjson.Get(line, "type").Str {
 	case codexTypeEventMsg:
 		payload := gjson.Get(line, "payload")
@@ -2515,6 +2672,17 @@ func codexIncrementalNeedsFullParse(line string) bool {
 	switch payload.Get("type").Str {
 	case "function_call", "custom_tool_call":
 		return isCodexWaitAgentCall(payload.Get("name").Str)
+	case "function_call_output", "custom_tool_call_output":
+		output, raw := parseCodexFunctionOutput(payload)
+		if isCodexSubagentFunctionOutput(output) {
+			return true
+		}
+		if strings.TrimSpace(raw) == "" {
+			return false
+		}
+		name := b.toolCallNameForOutput(payload.Get("call_id").Str)
+		return name == "" || name == "spawn_agent" ||
+			isCodexWaitAgentCall(name)
 	default:
 		role := payload.Get("role").Str
 		if role != "user" {
@@ -2531,10 +2699,11 @@ func codexIncrementalNeedsFullParse(line string) bool {
 // function_call_output / custom_tool_call_output line cannot be
 // represented by an append-only incremental write. Subagent outputs
 // repair lineage on rows outside the append, and an output whose call
-// is not part of this appended chunk belongs to an already-stored tool
-// call; both need a replacing full parse. An output paired with its
-// call in the same chunk attaches in memory exactly as a full parse
-// would, so it stays on the incremental path.
+// is not part of this appended chunk or of the persisted cursor's
+// pending calls belongs to an already-stored tool call; both need a
+// replacing full parse. An output paired with its call in the same chunk
+// attaches in memory exactly as a full parse would, so it stays on the
+// incremental path.
 func (b *codexSessionBuilder) incrementalOutputNeedsFullParse(
 	payload gjson.Result,
 ) bool {
@@ -2550,10 +2719,7 @@ func (b *codexSessionBuilder) incrementalOutputNeedsFullParse(
 		// A full parse drops outputs without a call id too.
 		return false
 	}
-	switch b.callNames[callID] {
-	case "spawn_agent", "wait", "wait_agent":
-		return true
-	}
-	_, attachable := b.callRefs[callID]
-	return !attachable
+	name := b.toolCallNameForOutput(callID)
+	return name == "" || name == "spawn_agent" ||
+		isCodexWaitAgentCall(name)
 }

@@ -1137,6 +1137,10 @@ type FileInfo struct {
 	Inode  int64
 	Device int64
 	Hash   string
+	// ChangeTime is the change time captured from the same descriptor the
+	// parser read its snapshot from. Zero means the platform could not
+	// provide one; checkpoint consumers then rebuild conservatively.
+	ChangeTime int64
 }
 
 // ParsedSession holds session metadata extracted from a JSONL file.
@@ -1228,6 +1232,14 @@ type ParsedToolCall struct {
 	SkillName         string // skill name when ToolName is "Skill"
 	SubagentSessionID string // linked subagent session file (e.g. "agent-{task_id}")
 	ResultEvents      []ParsedToolResultEvent
+}
+
+// ParsedToolCallUpdate carries result events for a tool call that was parsed
+// before the current append-only chunk. Incremental sync uses the stable
+// tool_use_id to attach these events without rebuilding the whole transcript.
+type ParsedToolCallUpdate struct {
+	ToolUseID    string
+	ResultEvents []ParsedToolResultEvent
 }
 
 // ParsedToolResult holds metadata about a tool result block in a
@@ -1486,6 +1498,19 @@ type ParseResult struct {
 	Session     ParsedSession
 	Messages    []ParsedMessage
 	UsageEvents []ParsedUsageEvent
+	// Checkpoint is opaque provider continuation state (a parser
+	// checkpoint) that the sync engine persists after this result's
+	// session rows commit, so later appends can resume without rescanning
+	// the transcript prefix. Empty for providers without checkpoints.
+	Checkpoint []byte
+	// CheckpointHashState is the resumable SHA-256 state covering the
+	// parsed snapshot [0, Session.File.Size), captured on the same read
+	// pass as the parse. CheckpointAnchorDigest is the digest of the
+	// snapshot's trailing anchor window. Both are empty for providers
+	// without single-pass hashing; the engine persists them with the
+	// checkpoint so it never re-reads the source after a full parse.
+	CheckpointHashState    []byte
+	CheckpointAnchorDigest string
 }
 
 // InferRelationshipTypes sets RelationshipType on results that have
