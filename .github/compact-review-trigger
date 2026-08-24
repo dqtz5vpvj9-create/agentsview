@@ -1,2 +1,2 @@
 PR 1495 compact review repair trigger
-retry history cleanup with git identity
+retry history cleanup with Go 1.27
