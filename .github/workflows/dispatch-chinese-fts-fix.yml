@@ -1,4 +1,4 @@
-name: One-shot Chinese FTS repair
+name: One-shot Chinese FTS runtime guard
 
 on:
   pull_request_target:
@@ -9,12 +9,12 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: one-shot-chinese-fts-repair
+  group: one-shot-chinese-fts-runtime-guard
   cancel-in-progress: false
 
 jobs:
   repair:
-    if: github.event.pull_request.title == '[ci] Run PR 1491 Chinese FTS repair'
+    if: github.event.pull_request.title == '[ci] Run PR 1491 Chinese FTS runtime guard'
     runs-on: ubuntu-latest
     timeout-minutes: 50
     steps:
@@ -26,12 +26,12 @@ jobs:
           gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
             --body "Started validation run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: feature/chinese-fts
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
@@ -39,49 +39,36 @@ jobs:
       - name: Restore pricing snapshot
         run: go run ./internal/pricing/cmd/litellm-snapshot -restore
 
-      - name: Apply review fixes
+      - name: Apply runtime ownership guard
         run: |
-          python scripts/apply-chinese-fts-review-fixes.py
-          python scripts/finish-chinese-fts-review-fixes.py
-          python scripts/finalize-chinese-fts-locking.py
-          python scripts/finalize-chinese-fts-opt-in.py
-          gofmt -w \
-            internal/db/chinese_fts_runtime.go \
-            internal/db/chinese_fts_search.go \
-            internal/db/chinese_fts_test.go \
-            internal/db/db.go \
-            internal/db/sqlite_driver.go
-          rm scripts/apply-chinese-fts-review-fixes.py
-          rm scripts/finish-chinese-fts-review-fixes.py
-          rm scripts/finalize-chinese-fts-locking.py
-          rm scripts/finalize-chinese-fts-opt-in.py
-          rm .github/workflows/apply-chinese-fts-review-fixes.yml
+          python3 scripts/normalize-chinese-fts-runtime-guard.py
+          python3 scripts/apply-chinese-fts-runtime-guard.py
+          rm scripts/normalize-chinese-fts-runtime-guard.py
+          rm scripts/apply-chinese-fts-runtime-guard.py
+          rm .github/workflows/apply-chinese-fts-runtime-guard.yml
+          go fmt ./...
           git diff --check
+
+      - name: Vet Go packages
+        env:
+          CGO_ENABLED: "1"
+        run: go vet -tags "fts5" ./...
 
       - name: Build pinned simple and cppjieba sidecar
         run: bash scripts/build-simple-fts.sh dist/agentsview-simple
 
-      - name: Run Chinese FTS integration tests
+      - name: Run database suite with Chinese FTS enabled
         env:
           AGENTSVIEW_SIMPLE_DIR: ${{ github.workspace }}/dist/agentsview-simple
           CGO_ENABLED: "1"
-        run: |
-          go test -tags fts5 ./internal/db \
-            -run 'Test(ContainsCJK|DiscoverSimpleFTSRuntime|ChineseFTS)' \
-            -count=1 -v -timeout=12m
+        run: go test -tags "fts5" ./internal/db -count=1 -timeout=25m
 
-      - name: Run database test suite with the sidecar loaded
-        env:
-          AGENTSVIEW_SIMPLE_DIR: ${{ github.workspace }}/dist/agentsview-simple
-          CGO_ENABLED: "1"
-        run: go test -tags fts5 ./internal/db -count=1 -timeout=25m
-
-      - name: Commit tested fixes
+      - name: Commit validated changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "fix(search): harden Chinese FTS lifecycle"
+          git commit -m "fix(search): guard Chinese FTS runtime ownership"
           git push origin HEAD:feature/chinese-fts
 
       - name: Report result
