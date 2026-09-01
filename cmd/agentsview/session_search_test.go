@@ -113,6 +113,39 @@ func TestSessionSearchSinceFiltersByActivity(t *testing.T) {
 	assert.Equal(t, "fresh", got.Matches[0].SessionID)
 }
 
+func TestSessionSearchDocumentedIdentifierRecipeFindsToolInput(t *testing.T) {
+	const identifier = "ResolveTrackerIssue1511"
+	dataDir := newAgentDataDir(t)
+	seedSessionWithOpts(t, dataDir, "tool-only", "p", nil)
+
+	d, err := db.Open(sessionsDBPath(dataDir))
+	require.NoError(t, err)
+	require.NoError(t, d.ReplaceSessionMessages("tool-only", []db.Message{{
+		SessionID: "tool-only",
+		Ordinal:   1,
+		Role:      "assistant",
+		Content:   "running the requested tool",
+		Timestamp: "2026-04-01T00:00:00Z",
+		ToolCalls: []db.ToolCall{{
+			ToolName:  "Bash",
+			ToolUseID: "tool-use-1",
+			InputJSON: `{"command":"ResolveTrackerIssue1511"}`,
+		}},
+	}}))
+	require.NoError(t, d.Close())
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "search", identifier,
+		"--in", "tool_input,tool_result", "--json", "--limit", "8")
+	require.NoError(t, err)
+
+	got := decodeCLIJSON[service.ContentSearchResult](t, out)
+	require.Len(t, got.Matches, 1)
+	assert.Equal(t, "tool-only", got.Matches[0].SessionID)
+	assert.Equal(t, "tool_input", got.Matches[0].Location)
+	assert.Contains(t, got.Matches[0].Snippet, identifier)
+}
+
 func TestSessionSearchFTSWithToolSource(t *testing.T) {
 	cmd := newSessionSearchCommand()
 	cmd.SetArgs([]string{"needle", "--fts", "--in", "tool_result"})

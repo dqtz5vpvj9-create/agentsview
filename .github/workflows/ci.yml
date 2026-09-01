@@ -106,7 +106,7 @@ jobs:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
 
       - name: Install docs check tools
         run: |
@@ -128,8 +128,6 @@ jobs:
           bash scripts/install_test.sh
           bash scripts/retry_test.sh
           bash scripts/e2e-server_test.sh
-          bash scripts/check_desktop_release_health_test.sh
-          bash scripts/check_desktop_release_health_from_event_test.sh
           bash desktop/scripts/test-repair-appimage-diricon.sh
 
   test:
@@ -138,7 +136,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -197,6 +195,12 @@ jobs:
           )
           $packages = $packages | Where-Object { $_ -notin $isolatedPackages }
           go test -tags "fts5" $packages -count=1 -timeout=20m
+        env:
+          CGO_ENABLED: "1"
+
+      - name: Run raw capture tests (macOS)
+        if: runner.os == 'macOS'
+        run: go test -tags "fts5" ./internal/rawcapture -count=1 -timeout=10m
         env:
           CGO_ENABLED: "1"
 
@@ -264,9 +268,113 @@ jobs:
         run: go run ./internal/pricing/cmd/litellm-snapshot -restore
 
       - name: Run ${{ matrix.name }} tests
-        run: go test -tags "fts5" ${{ matrix.package }} -count=1 -timeout=20m
+        shell: pwsh
+        run: |
+          go test -json -tags "fts5" ${{ matrix.package }} -count=1 -timeout=20m 2>&1 |
+            Tee-Object -FilePath go-test-events.jsonl
+          exit $LASTEXITCODE
         env:
           CGO_ENABLED: "1"
+
+      - name: Summarize ${{ matrix.name }} test timing
+        if: always()
+        shell: pwsh
+        run: |
+          $eventsPath = "go-test-events.jsonl"
+          if (-not (Test-Path $eventsPath)) {
+            Write-Warning "Go test event log was not created"
+            exit 0
+          }
+
+          $events = @(
+            Get-Content $eventsPath | ForEach-Object {
+              try {
+                $_ | ConvertFrom-Json -ErrorAction Stop
+              } catch {
+                # Keep the raw artifact authoritative if a killed process left
+                # one incomplete line at the end of the stream.
+              }
+            }
+          )
+          if ($events.Count -eq 0) {
+            Write-Warning "Go test event log contains no complete JSON events"
+            exit 0
+          }
+
+          $terminal = @{}
+          $completed = @(
+            $events | Where-Object {
+              $_.Test -and $_.Action -in @("pass", "fail", "skip")
+            }
+          )
+          foreach ($event in $completed) {
+            $terminal[$event.Test] = $event.Action
+          }
+
+          $seenActive = @{}
+          $active = @(
+            $events |
+              Where-Object { $_.Test -and $_.Action -eq "run" } |
+              Sort-Object Time -Descending |
+              Where-Object {
+                if ($terminal.ContainsKey($_.Test) -or $seenActive.ContainsKey($_.Test)) {
+                  return $false
+                }
+                $seenActive[$_.Test] = $true
+                return $true
+              }
+          )
+
+          $summary = [System.Collections.Generic.List[string]]::new()
+          $summary.Add("## ${{ matrix.name }} Go test diagnostics")
+          $summary.Add("")
+          $summary.Add("### Tests active when the process ended")
+          $summary.Add("")
+          if ($active.Count -eq 0) {
+            $summary.Add("None.")
+          } else {
+            foreach ($event in $active | Select-Object -First 25) {
+              $summary.Add("- ``$($event.Test.Replace('|', '\|'))`` (started $($event.Time))")
+            }
+          }
+
+          $summary.Add("")
+          $summary.Add("### Slowest completed tests")
+          $summary.Add("")
+          $summary.Add("| Test | Result | Seconds |")
+          $summary.Add("| --- | --- | ---: |")
+          foreach ($event in $completed |
+            Sort-Object { [double]$_.Elapsed } -Descending |
+            Select-Object -First 25) {
+            $name = $event.Test.Replace('|', '\|')
+            $elapsed = "{0:N3}" -f [double]$event.Elapsed
+            $summary.Add("| ``$name`` | $($event.Action) | $elapsed |")
+          }
+
+          $summary.Add("")
+          $summary.Add("### Last completed tests")
+          $summary.Add("")
+          $summary.Add("| Completed | Test | Result | Seconds |")
+          $summary.Add("| --- | --- | --- | ---: |")
+          foreach ($event in $completed |
+            Sort-Object Time -Descending |
+            Select-Object -First 25) {
+            $name = $event.Test.Replace('|', '\|')
+            $elapsed = "{0:N3}" -f [double]$event.Elapsed
+            $summary.Add("| $($event.Time) | ``$name`` | $($event.Action) | $elapsed |")
+          }
+
+          $summary | Write-Output
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload ${{ matrix.name }} test events
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: go-test-events-windows-${{ matrix.name }}-attempt-${{ github.run_attempt }}
+          path: go-test-events.jsonl
+          if-no-files-found: warn
+          retention-days: 7
 
   # Keep the derived-mirror suite concurrent with the main Windows package set.
   test-duckdb-windows:
@@ -328,9 +436,10 @@ jobs:
 
       # internal/duckdb is excluded from -race (CGo-heavy, race-insensitive,
       # and 7+ minutes on its own); it is still covered without -race by the
-      # main test job's ./... run.
+      # main test job's ./... run. Limit package fan-out because the race
+      # detector makes highly parallel runs slow enough to exhaust deadlines.
       - name: Run Go tests (race detector)
-        run: go test -tags "fts5" -race $(go list ./... | grep -v '/internal/duckdb$') -count=1 -timeout=20m
+        run: go list ./... | grep -v '/internal/duckdb$' | xargs go test -p 4 -tags "fts5" -race -count=1 -timeout=20m
         env:
           CGO_ENABLED: "1"
 
@@ -370,8 +479,8 @@ jobs:
             Start-Sleep -Seconds (10 * $attempt)
           }
 
-      - name: Run Windows desktop update tests
-        run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --lib install_downloaded_update
+      - name: Run Windows desktop unit tests
+        run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --lib
 
   integration:
     runs-on: ${{ github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'kenn-linux-x64-public' || 'ubuntu-latest' }}

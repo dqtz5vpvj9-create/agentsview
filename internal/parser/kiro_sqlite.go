@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -40,8 +41,15 @@ type KiroSQLiteStore struct {
 
 // OpenKiroSQLiteStore opens a read-only current-store Kiro SQLite DB.
 func OpenKiroSQLiteStore(dbPath string) (*KiroSQLiteStore, error) {
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	info, err := os.Lstat(dbPath)
+	if os.IsNotExist(err) {
 		return nil, fmt.Errorf("kiro sqlite db not found: %s", dbPath)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("stat kiro sqlite db %s: %w", dbPath, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("refusing symlinked kiro sqlite db: %s", dbPath)
 	}
 	db, err := openKiroSQLiteDB(dbPath)
 	if err != nil {
@@ -61,15 +69,37 @@ func (s *KiroSQLiteStore) Close() error {
 // kiroSQLiteDBPath returns the current-store Kiro SQLite DB when the
 // configured root contains one.
 func kiroSQLiteDBPath(dir string) string {
+	path, _ := kiroSQLiteDBPathChecked(dir)
+	return path
+}
+
+func kiroSQLiteDBPathChecked(dir string) (string, error) {
 	if dir == "" {
-		return ""
+		return "", nil
 	}
 	path := filepath.Join(dir, kiroSQLiteDBName)
 	info, err := os.Stat(path)
-	if err != nil || info.IsDir() {
-		return ""
+	if os.IsNotExist(err) {
+		return "", nil
 	}
-	return path
+	if err != nil {
+		return "", fmt.Errorf("stat Kiro SQLite DB %s: %w", path, err)
+	}
+	if info.IsDir() {
+		return "", nil
+	}
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", nil
+	}
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", nil
+	}
+	if _, ok := relUnder(resolvedDir, resolvedPath); !ok {
+		return "", nil
+	}
+	return path, nil
 }
 
 // KiroSQLiteVirtualPath gives each conversation inside the shared
@@ -87,22 +117,77 @@ func kiroSQLiteVirtualPathParts(path string) (string, string, bool) {
 // KiroSQLiteSessionExists reports whether the current Kiro DB has
 // at least one row for sessionID.
 func KiroSQLiteSessionExists(dbPath, sessionID string) bool {
+	exists, _ := KiroSQLiteSessionExistsWithError(dbPath, sessionID)
+	return exists
+}
+
+func KiroSQLiteSessionExistsWithError(dbPath, sessionID string) (bool, error) {
 	if dbPath == "" || sessionID == "" {
-		return false
+		return false, nil
 	}
 	store, err := OpenKiroSQLiteStore(dbPath)
 	if err != nil {
-		return false
+		return false, err
 	}
 	defer store.Close()
-	return store.SessionExists(sessionID)
+	return store.sessionExists(sessionID)
+}
+
+// KiroSQLiteSessionMetaForID returns metadata for one logical conversation
+// without enumerating the rest of the database.
+func KiroSQLiteSessionMetaForID(
+	dbPath, sessionID string,
+) (KiroSQLiteSessionMeta, bool, error) {
+	if dbPath == "" || sessionID == "" {
+		return KiroSQLiteSessionMeta{}, false, nil
+	}
+	store, err := OpenKiroSQLiteStore(dbPath)
+	if err != nil {
+		return KiroSQLiteSessionMeta{}, false, err
+	}
+	defer store.Close()
+	return store.sessionMetaForID(sessionID)
 }
 
 // SessionExists reports whether the current Kiro DB has at least one
 // row for sessionID.
 func (s *KiroSQLiteStore) SessionExists(sessionID string) bool {
+	exists, _ := s.sessionExists(sessionID)
+	return exists
+}
+
+func (s *KiroSQLiteStore) sessionMetaForID(
+	sessionID string,
+) (KiroSQLiteSessionMeta, bool, error) {
+	if s == nil || s.db == nil {
+		return KiroSQLiteSessionMeta{}, false, fmt.Errorf("kiro sqlite store is closed")
+	}
+	var id string
+	var updatedAt int64
+	err := s.db.QueryRow(`
+		SELECT conversation_id, MAX(updated_at)
+		  FROM conversations_v2
+		 WHERE conversation_id = ?
+		 GROUP BY conversation_id
+	`, sessionID).Scan(&id, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return KiroSQLiteSessionMeta{}, false, nil
+	}
+	if err != nil {
+		return KiroSQLiteSessionMeta{}, false, fmt.Errorf(
+			"finding kiro sqlite session meta: %w", err,
+		)
+	}
+	return KiroSQLiteSessionMeta{
+		SessionID:   id,
+		VirtualPath: KiroSQLiteVirtualPath(s.dbPath, id),
+		FileMtime:   updatedAt * 1_000_000,
+	}, true, nil
+}
+
+func (s *KiroSQLiteStore) sessionExists(sessionID string) (bool, error) {
 	if s == nil || s.db == nil || sessionID == "" {
-		return false
+		return false, nil
 	}
 	var found int
 	err := s.db.QueryRow(
@@ -112,7 +197,10 @@ func (s *KiroSQLiteStore) SessionExists(sessionID string) bool {
 		  LIMIT 1`,
 		sessionID,
 	).Scan(&found)
-	return err == nil
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // ListKiroSQLiteSessionMeta returns one metadata row per logical

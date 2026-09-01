@@ -254,6 +254,47 @@ func TestCursorStreamingDiscoveryPropagatesAuthoritativeResolutionErrors(t *test
 	})
 }
 
+func TestCursorStreamingDiscoverySkipsTranscriptVanishedBeforeStat(t *testing.T) {
+	root := t.TempDir()
+	transcriptsDir := filepath.Join(root, "Users-demo", "agent-transcripts")
+	healthy := cursorProviderWriteJSONLTranscript(
+		t, transcriptsDir, "healthy.jsonl", "still on disk",
+	)
+	ctx := withStreamingDirectoryReader(t.Context(), func(
+		_ context.Context, dir string, yield func(os.DirEntry) error,
+	) error {
+		if samePath(dir, transcriptsDir) {
+			if err := yield(failingInfoDirEntry{
+				name: "a-vanished.jsonl", err: os.ErrNotExist,
+			}); err != nil {
+				return err
+			}
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if err := yield(entry); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	provider, ok := NewProvider(AgentCursor, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+
+	var streamed []string
+	err := provider.(StreamingDiscoverer).DiscoverEach(ctx, func(source SourceRef) error {
+		streamed = append(streamed, source.DisplayPath)
+		return nil
+	})
+
+	require.NoError(t, err,
+		"a transcript deleted between enumeration and stat must not fail discovery")
+	assert.Equal(t, []string{healthy}, streamed)
+}
+
 func TestCursorProviderResolvesDuplicateStemsWithinProject(t *testing.T) {
 	root := t.TempDir()
 	firstProject := "Users-fiona-Documents-first"
@@ -375,6 +416,17 @@ func TestCursorProviderFingerprintSkipsOversizedTranscriptHash(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "file too large")
+}
+
+func TestCursorPathFromSourceMaterializedFile(t *testing.T) {
+	s := newCursorSourceSet([]string{t.TempDir()})
+	path := filepath.Join(t.TempDir(), "abc.jsonl")
+	got, ok := s.pathFromSource(SourceRef{
+		Provider: AgentCursor,
+		Opaque:   MaterializedFileSource{Path: path},
+	})
+	require.True(t, ok)
+	assert.Equal(t, path, got)
 }
 
 func cursorProviderWriteTranscript(

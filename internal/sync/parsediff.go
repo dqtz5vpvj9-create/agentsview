@@ -47,6 +47,7 @@ func NewDiffEngine(database *db.DB, cfg EngineConfig) *Engine {
 // no skip cache, no sync state. It holds the engine's sync mutex for
 // the duration.
 func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDiffReport, error) {
+	ctx = e.parsePolicyContext(ctx)
 	e.syncMu.Lock()
 	defer e.syncMu.Unlock()
 	defer e.retentionBudget().scavengeIfNeeded()
@@ -71,8 +72,8 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 	}
 
 	// Discovery mirrors syncAllLocked's file phase: provider discovery over
-	// the configured dirs per agent, then dedupe and the legacy-Kiro shadow
-	// filter. Provider discovery already enumerates shared-SQLite sources
+	// the configured dirs per agent, then dedupe. Provider discovery already
+	// arbitrates Kiro shared-SQLite sources intrinsically and enumerates
 	// (Kiro's data.sqlite3, db-mode OpenCode's opencode.db) per session, so
 	// no separate db-source synthesis is needed.
 	var files []parser.DiscoveredFile
@@ -84,7 +85,6 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 		files = append(files, providerFiles...)
 	}
 	files = dedupeDiscoveredFiles(files)
-	files = e.filterShadowedLegacyKiroFiles(files)
 
 	// Newest first by source mtime (composite stats for virtual
 	// paths), tie-broken by path so the --limit sample is stable.
@@ -268,6 +268,8 @@ func (e *Engine) parseDiffProviderSources(
 			discovered.SourceSize = s3.Size
 			discovered.SourceMtime = s3.MtimeNS
 			discovered.SourceFingerprint = s3.Fingerprint
+			discovered.TranscriptSize = s3.TranscriptSize
+			discovered.TranscriptMtime = s3.TranscriptMtimeNS
 			if discovered.Project == "" {
 				discovered.Project = s3.Project
 			}
@@ -432,6 +434,10 @@ var perSessionDBVirtualSourceBases = []string{
 }
 
 func isPerSessionDBVirtualSource(agent parser.AgentType, path string) bool {
+	if agent == parser.AgentOpenCode {
+		_, _, ok := parser.ParseOpenCodeSQLiteVirtualPath(path)
+		return ok
+	}
 	if _, _, ok := parser.ParseVirtualSourcePathForBase(
 		path, parser.WindsurfStateDBName,
 	); ok {
@@ -962,10 +968,10 @@ func (e *Engine) parseDiffCollectFile(
 		report.Totals.ExcludedByParser++
 	}
 
-	// Virtual members gone from a still-existing shared container are
-	// tombstone-bound on a real sync only when their archived CWD passes the
-	// active allow-list. Mark both tombstone-bound and policy-preserved members
-	// visited so the presence sweep does not misreport them as parser drift.
+	// Virtual members gone from a still-existing shared container are marked
+	// source-missing on a real sync only when their archived CWD passes the active
+	// allow-list. Mark both source-missing and policy-preserved members visited so
+	// the presence sweep does not misreport them as parser drift.
 	for _, member := range job.sourceMissingMembers {
 		stored := storedByID[member.sessionID]
 		if stored == nil {
@@ -989,7 +995,7 @@ func (e *Engine) parseDiffCollectFile(
 			Agent:             stored.Agent,
 			FilePath:          member.filePath,
 			Class:             DiffExcluded,
-			Reason:            "member source missing (would tombstone)",
+			Reason:            "member source missing (would record source state)",
 			StoredDataVersion: stored.DataVersion,
 		})
 		report.Totals.ExcludedByParser++

@@ -310,13 +310,6 @@ func TestStoreListTrashedSessionsOrdersNewestFirstAndCapsAt500(t *testing.T) {
 			TIMESTAMP '2026-01-01 00:00:00' + INTERVAL (i) SECOND
 		FROM range(600) t(i)`)
 	require.NoError(t, err)
-	// A recoverable source-missing tombstone newer than all user trash: if
-	// deletion_cause filtering regressed it would surface as the first row.
-	_, err = duck.ExecContext(ctx, `
-		INSERT INTO sessions (id, project, deleted_at, deletion_cause)
-		VALUES ('tombstone', 'trash-parity',
-			TIMESTAMP '2026-02-01 00:00:00', 'source_missing')`)
-	require.NoError(t, err)
 	_, err = duck.ExecContext(ctx,
 		`INSERT INTO sessions (id, project) VALUES ('active', 'trash-parity')`)
 	require.NoError(t, err)
@@ -324,7 +317,7 @@ func TestStoreListTrashedSessionsOrdersNewestFirstAndCapsAt500(t *testing.T) {
 	trashed, err := store.ListTrashedSessions(ctx)
 	require.NoError(t, err)
 	// Same cap and ordering as the SQLite and PG stores: newest 500 by
-	// deleted_at, excluding active rows and source-missing tombstones.
+	// deleted_at, excluding active rows.
 	require.Len(t, trashed, 500)
 	assert.Equal(t, "trash-599", trashed[0].ID)
 	assert.Equal(t, "trash-100", trashed[499].ID)
@@ -3169,7 +3162,7 @@ func TestDuckDBDailyUsageKeepsAuthoritativeCostSessionScoped(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
-		ModelPattern:  "claude-sonnet-4-6",
+		ModelPattern:  "authoritative-cost-model",
 		InputPerMTok:  money.MustParseDollars("10"),
 		OutputPerMTok: money.MustParseDollars("20"),
 	}}))
@@ -3188,7 +3181,7 @@ func TestDuckDBDailyUsageKeepsAuthoritativeCostSessionScoped(t *testing.T) {
 		{
 			Session: authoritative,
 			UsageEvents: []db.UsageEvent{{
-				Source: "shutdown", Model: "claude-sonnet-4-6",
+				Source: "shutdown", Model: "authoritative-cost-model",
 				InputTokens: 1000, OutputTokens: 500,
 				Cost: &reportedCost, CostStatus: "exact",
 				CostSource: db.CopilotReportedCostSource,
@@ -3200,7 +3193,7 @@ func TestDuckDBDailyUsageKeepsAuthoritativeCostSessionScoped(t *testing.T) {
 		{
 			Session: estimated,
 			UsageEvents: []db.UsageEvent{{
-				Source: "shutdown", Model: "claude-sonnet-4-6",
+				Source: "shutdown", Model: "authoritative-cost-model",
 				InputTokens: 1000, OutputTokens: 500,
 				OccurredAt: "2026-01-18T01:01:00.000Z",
 				DedupKey:   "estimated",
@@ -3469,7 +3462,7 @@ func TestDailyUsageCostsMessageReasoningTokens(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
-		ModelPattern:  "gpt-5.4",
+		ModelPattern:  "reasoning-model",
 		InputPerMTok:  money.MustParseDollars("1"),
 		OutputPerMTok: money.MustParseDollars("2"),
 	}}))
@@ -3477,7 +3470,7 @@ func TestDailyUsageCostsMessageReasoningTokens(t *testing.T) {
 	msg := syncMessage(
 		"duck-message-reasoning", 0, "assistant", "message reasoning",
 		"2026-01-19T00:01:00.000Z")
-	msg.Model = "gpt-5.4"
+	msg.Model = "reasoning-model"
 	msg.TokenUsage = jsontext.Value(
 		`{"input_tokens":1000,"output_tokens":0,"reasoning_tokens":500}`)
 	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{

@@ -1027,8 +1027,33 @@ func TestCurrentDataVersionIncludesOpenCodeProjectMetadataChange(t *testing.T) {
 }
 
 func TestCurrentDataVersionGrokMessageTimestamps(t *testing.T) {
-	assert.Equal(t, 90, CurrentDataVersion(),
-		"Grok message timestamps require a sequential backfill")
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 90,
+		"version 90 is the data-version boundary for Grok message timestamps")
+}
+
+func TestCurrentDataVersionPositAssistantCacheAccounting(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 91,
+		"version 91 is the data-version boundary for Posit Assistant cache accounting")
+}
+
+func TestCurrentDataVersionPositAssistantUsageEventsSidecar(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 93,
+		"version 93 is the data-version boundary for Posit Assistant usage-events")
+}
+
+func TestCurrentDataVersionDevinMessageNodeTokenUsage(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 94,
+		"Devin message_nodes token usage requires re-parsing fallback sessions")
+}
+
+func TestCurrentDataVersionPositAssistantProviderIdentity(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 95,
+		"Posit Assistant provider identity requires re-parsing usage rows")
+}
+
+func TestCurrentDataVersionAntigravityCLICwdAndWorktreeProject(t *testing.T) {
+	assert.Equal(t, 96, CurrentDataVersion(),
+		"Antigravity CLI cwd and worktree project recovery require a sequential backfill")
 }
 
 func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {
@@ -6952,7 +6977,7 @@ func TestSoftDeleteSessions(t *testing.T) {
 	assert.Equal(t, 0, n, "empty: rows=")
 }
 
-func TestSoftDeleteConvertsSourceMissingTombstonesToUserTrash(t *testing.T) {
+func TestSoftDeleteKeepsSourceMissingStateIndependent(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
 	paths := map[string]string{
@@ -6965,7 +6990,7 @@ func TestSoftDeleteConvertsSourceMissingTombstonesToUserTrash(t *testing.T) {
 			s.FilePath = &path
 		})
 		baselineSessionSource(t, d, defaultMachine, "claude", path)
-		changed, err := d.SoftDeleteSessionSourceOwnership(
+		changed, err := d.MarkSessionSourceMissing(
 			ctx, defaultMachine, "claude", id, path,
 		)
 		require.NoError(t, err)
@@ -6981,8 +7006,8 @@ func TestSoftDeleteConvertsSourceMissingTombstonesToUserTrash(t *testing.T) {
 		full, err := d.GetSessionFull(ctx, id)
 		require.NoError(t, err)
 		require.NotNil(t, full)
-		assert.Nil(t, full.DeletionCause,
-			"an explicit user deletion must replace the recoverable source tombstone")
+		assert.NotNil(t, full.SourceMissingAt)
+		assert.Nil(t, full.DeletionCause)
 		assert.True(t, d.IsSessionTrashed(id))
 	}
 }

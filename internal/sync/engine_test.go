@@ -561,7 +561,7 @@ func TestWriteBatchResyncReplacementEmptyMachineRemainsEmpty(t *testing.T) {
 		"a rebuild must retain an empty attribution already in the replacement")
 }
 
-func TestClaudeIDFreshnessRejectsSourceMissingTombstone(t *testing.T) {
+func TestClaudeIDFreshnessRejectsSourceMissingState(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()
 	missingPath := filepath.Join(root, "missing.jsonl")
@@ -593,7 +593,7 @@ func TestClaudeIDFreshnessRejectsSourceMissingTombstone(t *testing.T) {
 			Agent: string(parser.AgentClaude), FilePath: missingPath,
 		}},
 	))
-	changed, err := database.SoftDeleteSessionSourceOwnership(
+	changed, err := database.MarkSessionSourceMissing(
 		t.Context(), "local", string(parser.AgentClaude), "missing", missingPath,
 	)
 	require.NoError(t, err)
@@ -612,7 +612,7 @@ func TestClaudeIDFreshnessRejectsSourceMissingTombstone(t *testing.T) {
 
 	assert.False(t, engine.shouldSkipFileWithPrefix(
 		"", "missing", info, hash,
-	), "a byte-identical restored source must be reparsed and revived")
+	), "a byte-identical restored source must be reparsed")
 	assert.True(t, engine.shouldSkipFileWithPrefix(
 		"", "user-deleted", info, hash,
 	), "ordinary user trash keeps the established freshness behavior")
@@ -1412,6 +1412,7 @@ type manyStreamingProvider struct {
 	parser.ProviderBase
 	sources       []parser.SourceRef
 	parseOutcome  *parser.ParseOutcome
+	parseOutcomes map[string]parser.ParseOutcome
 	discoverCalls atomic.Int32
 	streamCalls   atomic.Int32
 }
@@ -1460,6 +1461,9 @@ func (*manyStreamingProvider) WatchPlan(context.Context) (parser.WatchPlan, erro
 func (provider *manyStreamingProvider) Parse(
 	_ context.Context, req parser.ParseRequest,
 ) (parser.ParseOutcome, error) {
+	if outcome, ok := provider.parseOutcomes[req.Source.DisplayPath]; ok {
+		return outcome, nil
+	}
 	if provider.parseOutcome != nil {
 		return *provider.parseOutcome, nil
 	}
@@ -1476,6 +1480,93 @@ func (provider *manyStreamingProvider) Parse(
 		}},
 		ResultSetComplete: true,
 	}, nil
+}
+
+func TestIssue1476MissingParentForkDoesNotStarveLaterPages(t *testing.T) {
+	for _, agent := range []parser.AgentType{parser.AgentCodex, parser.AgentTraeX} {
+		t.Run(string(agent), func(t *testing.T) {
+			testIssue1476MissingParentForkDoesNotStarveLaterPages(t, agent)
+		})
+	}
+}
+
+func testIssue1476MissingParentForkDoesNotStarveLaterPages(
+	t *testing.T, agent parser.AgentType,
+) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	const sourceCount = reconciliationPageSize + 1
+	const deferredIndex = 8
+	sources := make([]parser.SourceRef, sourceCount)
+	outcomes := make(map[string]parser.ParseOutcome, sourceCount)
+	started := time.Unix(1704067200, 0)
+	for i := range sources {
+		path := filepath.Join(root, fmt.Sprintf("session-%03d.jsonl", i))
+		require.NoError(t, os.WriteFile(path, []byte("session"), 0o600))
+		sources[i] = parser.SourceRef{
+			Provider: agent, Key: path, DisplayPath: path, FingerprintKey: path,
+		}
+		id := fmt.Sprintf("session-%03d", i)
+		session := parser.ParsedSession{
+			ID: id, Agent: agent, Project: "project", Machine: "local",
+			StartedAt: started, EndedAt: started, File: parser.FileInfo{Path: path},
+		}
+		outcomes[path] = parser.ParseOutcome{
+			Results: []parser.ParseResultOutcome{{
+				Result:      parser.ParseResult{Session: session},
+				DataVersion: parser.DataVersionCurrent,
+			}}, ResultSetComplete: true,
+		}
+	}
+	deferredPath := sources[deferredIndex].Key
+	deferred := outcomes[deferredPath]
+	deferred.Results[0].Result.Session.ID = "forked-child"
+	deferred.Results[0].Result.Session.ParentSessionID = "codex:missing-parent"
+	deferred.Results[0].DataVersion = parser.DataVersionNeedsRetry
+	outcomes[deferredPath] = deferred
+	provider := &manyStreamingProvider{
+		Def: parser.AgentDef{Type: agent, FileBased: true},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			StreamingDiscovery: parser.CapabilitySupported,
+			WatchSources:       parser.CapabilitySupported,
+		}},
+		sources: sources, parseOutcomes: outcomes,
+	}
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{agent: {root}}, Machine: "local",
+		ProviderFactories: []parser.ProviderFactory{manyStreamingFactory{provider}},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			agent: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+
+	err := engine.ReconcileWatchRoots(t.Context(), []string{root}, false)
+	var retry interface{ ReconciliationRetryPaths() []string }
+	require.ErrorAs(t, err, &retry)
+	assert.Equal(t, []string{deferredPath}, retry.ReconciliationRetryPaths())
+	healthySamePageID := strings.TrimSuffix(
+		filepath.Base(sources[deferredIndex-1].DisplayPath),
+		filepath.Ext(sources[deferredIndex-1].DisplayPath),
+	)
+	healthySamePage, getErr := database.GetSession(t.Context(), healthySamePageID)
+	require.NoError(t, getErr)
+	require.NotNil(t, healthySamePage, "healthy session on the deferred page must be included")
+	laterSessionID := strings.TrimSuffix(
+		filepath.Base(sources[len(sources)-1].DisplayPath),
+		filepath.Ext(sources[len(sources)-1].DisplayPath),
+	)
+	later, getErr := database.GetSession(t.Context(), laterSessionID)
+	require.NoError(t, getErr)
+	require.NotNil(t, later, "cursor must advance beyond the deferred page")
+	assert.Less(t, database.GetSessionDataVersion("forked-child"), db.CurrentDataVersion())
+	assert.Equal(t, 1,
+		engine.LastReconciliationResult().Metrics.MaxNonAuthoritativeScopeRows)
+	t.Logf("cursor progress: later page session %q present", later.ID)
+	t.Logf("later-provider presence assertion: %s present", laterSessionID)
+	t.Logf("deferred state: forked-child data version remains stale")
+	t.Logf("rowless proof gate: non-authoritative scope rows=%d",
+		engine.LastReconciliationResult().Metrics.MaxNonAuthoritativeScopeRows)
 }
 
 func TestReconcileUnsupportedSourceMarkersStayPageBounded(t *testing.T) {
@@ -3119,7 +3210,7 @@ func TestTombstoneMissingWatchSourcesScopesSharedPathByAgent(t *testing.T) {
 	for _, id := range []string{"claude-shared", "codex-shared"} {
 		active, err := database.GetSession(t.Context(), id)
 		require.NoError(t, err)
-		assert.Nil(t, active)
+		assert.NotNil(t, active)
 	}
 }
 
@@ -3190,8 +3281,8 @@ func TestTombstoneMissingWatchSourcesCodexReplacementFallback(t *testing.T) {
 		"a surviving same-UUID duplicate is a replacement, not a deletion")
 	gone, err := database.GetSession(t.Context(), "codex:"+solo)
 	require.NoError(t, err)
-	assert.Nil(t, gone,
-		"a missing copy with no survivor must tombstone")
+	assert.NotNil(t, gone,
+		"a missing copy with no survivor must be marked source-missing")
 }
 
 func TestTombstoneMissingWatchSourcesPaginatesLargeArchive(t *testing.T) {
@@ -3325,7 +3416,7 @@ func TestTombstoneMissingWatchSourcesDoesNotInferUnvalidatedVirtualPaths(t *test
 		"provider-neutral reconciliation must not reinterpret '#' as virtual syntax")
 }
 
-func TestReconcileWatchRootsRevivesRecreatedSourceMissingSession(t *testing.T) {
+func TestReconcileWatchRootsRefreshesRecreatedSourceMissingSession(t *testing.T) {
 	fx := newEngineFixture(t)
 	t.Cleanup(fx.engine.Close)
 	path := fx.writeClaudeSession(t, "project", "session.jsonl", "first")
@@ -3343,7 +3434,7 @@ func TestReconcileWatchRootsRevivesRecreatedSourceMissingSession(t *testing.T) {
 	))
 	active, err = fx.db.GetSession(t.Context(), "session")
 	require.NoError(t, err)
-	assert.Nil(t, active, "missing source is hidden after reconciliation")
+	assert.NotNil(t, active, "missing source remains browsable after reconciliation")
 
 	fx.writeClaudeSession(t, "project", "session.jsonl", "recreated")
 	require.NoError(t, fx.engine.ReconcileWatchRoots(
@@ -3351,17 +3442,17 @@ func TestReconcileWatchRootsRevivesRecreatedSourceMissingSession(t *testing.T) {
 	))
 	active, err = fx.db.GetSession(t.Context(), "session")
 	require.NoError(t, err)
-	require.NotNil(t, active, "same source must become visible after recreation")
+	require.NotNil(t, active, "session remains visible after source recreation")
 	require.NotNil(t, active.FirstMessage)
 	assert.Equal(t, "recreated", *active.FirstMessage)
 	messages, err := fx.db.GetAllMessages(t.Context(), "session")
 	require.NoError(t, err)
 	require.Len(t, messages, 1)
 	assert.Equal(t, "recreated", messages[0].Content,
-		"revival must replace message rows left by the deleted source")
+		"source return must replace messages retained while the source was missing")
 }
 
-func TestReconcileWatchRootsRevivesByteIdenticalSourceWithWarmSkipCache(
+func TestReconcileWatchRootsRefreshesByteIdenticalSourceWithWarmSkipCache(
 	t *testing.T,
 ) {
 	fx := newEngineFixture(t)
@@ -3392,7 +3483,7 @@ func TestReconcileWatchRootsRevivesByteIdenticalSourceWithWarmSkipCache(
 	))
 	active, err := fx.db.GetSession(t.Context(), "session")
 	require.NoError(t, err)
-	assert.Nil(t, active, "missing source is hidden after reconciliation")
+	assert.NotNil(t, active, "missing source remains browsable after reconciliation")
 
 	fx.engine.Close()
 	fx.engineWithEmitter(nil)
@@ -3406,7 +3497,7 @@ func TestReconcileWatchRootsRevivesByteIdenticalSourceWithWarmSkipCache(
 	active, err = fx.db.GetSession(t.Context(), "session")
 	require.NoError(t, err)
 	require.NotNil(t, active,
-		"a source-missing tombstone must not retain a cache entry that hides restoration")
+		"source-missing state must not retain a cache entry that hides restoration")
 	require.NotNil(t, active.FirstMessage)
 	assert.Equal(t, "unchanged", *active.FirstMessage)
 }
@@ -3451,8 +3542,8 @@ func TestReconcileWatchRootsPreservesHistoricalRowsUntilExactSourceObserved(
 		"a never-observed historical row must remain in the persistent archive")
 	observed, err = fx.db.GetSession(t.Context(), "observed")
 	require.NoError(t, err)
-	assert.Nil(t, observed,
-		"a source observed by the prior pass becomes deletion-eligible")
+	assert.NotNil(t, observed,
+		"a source observed by the prior pass can be marked source-missing")
 }
 
 func TestReconciliationSourceBaselineUsesStoredPathRewrite(t *testing.T) {
@@ -3478,7 +3569,7 @@ func TestReconciliationSourceBaselineUsesStoredPathRewrite(t *testing.T) {
 		}},
 		nil, nil,
 	))
-	changed, err := database.SoftDeleteSessionSourceOwnership(
+	changed, err := database.MarkSessionSourceMissing(
 		t.Context(), "host", "claude", "session", storedPath,
 	)
 	require.NoError(t, err)
@@ -3534,8 +3625,8 @@ func TestSyncPathsBaselinesPresentSourceBeforeLaterDelete(t *testing.T) {
 	fx.engine.SyncPathsContext(t.Context(), []string{path})
 	active, err = fx.db.GetSession(t.Context(), "incremental")
 	require.NoError(t, err)
-	assert.Nil(t, active,
-		"a later watcher delete may tombstone the exact previously observed path")
+	assert.NotNil(t, active,
+		"a later watcher delete may mark the exact observed path source-missing")
 }
 
 func TestStartupMaintenanceWaitsForForegroundSyncAndSerializesLaterSyncs(
@@ -3623,6 +3714,19 @@ func TestStartupMaintenanceWaitsForForegroundSyncAndSerializesLaterSyncs(
 	}, time.Second, 10*time.Millisecond)
 	close(releaseLaterSync)
 	require.NoError(t, <-laterSyncDone)
+}
+
+func TestDeferredStartupPassDoesNotAcknowledgeReconciliation(t *testing.T) {
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		Machine:                 "local",
+		DeferStartupMaintenance: true,
+	})
+	t.Cleanup(engine.Close)
+
+	engine.RecordStartupReconciled(SyncStats{Deferred: 1}, nil)
+
+	assert.False(t, engine.StartupReconciled())
 }
 
 func TestStartupSyncFallbackRunsWhenForegroundSyncNeverArrives(t *testing.T) {
@@ -3773,6 +3877,43 @@ func TestStartupSyncFallbackUsesSuccessSignalNotMaintenanceRelease(t *testing.T)
 	case <-time.After(time.Second):
 		require.FailNow(t, "successful fallback did not reconcile startup")
 	}
+}
+
+func TestSyncThenRunSuppressesWorkWhenProcessingIsIncomplete(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	cause := errors.New("source listing unavailable")
+	provider := &failingDBBackedProvider{
+		err: cause, failOnCall: 1,
+	}
+	provider.ProviderBase = parser.ProviderBase{
+		Def: parser.AgentDef{Type: parser.AgentCowork, FileBased: true},
+	}
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentCowork: {root}},
+		Machine:   "local",
+		ProviderFactories: []parser.ProviderFactory{
+			failingDBBackedFactory{provider: provider},
+		},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentCowork: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+
+	workCalled := false
+	stats, err := engine.SyncThenRun(
+		t.Context(), false, nil, func(bool) error {
+			workCalled = true
+			return nil
+		},
+	)
+
+	require.NoError(t, err)
+	assert.False(t, stats.ProcessingComplete())
+	assert.Greater(t, stats.providerFailures, 0)
+	assert.False(t, workCalled,
+		"incomplete sync results must not run downstream acknowledgement work")
 }
 
 func TestStartupReconciledCallbackOwnersRetainFailureForLaterSuccess(t *testing.T) {
@@ -4016,44 +4157,38 @@ func (f fakeFileInfo) ModTime() time.Time {
 func (f fakeFileInfo) IsDir() bool { return false }
 func (f fakeFileInfo) Sys() any    { return nil }
 
-func TestHasLegacyKiroCandidates(t *testing.T) {
-	tests := []struct {
-		name  string
-		files []parser.DiscoveredFile
-		want  bool
-	}{
-		{
-			name: "empty",
-			want: false,
-		},
-		{
-			name: "non-kiro files",
-			files: []parser.DiscoveredFile{
-				{Agent: parser.AgentClaude, Path: "/tmp/claude/session.jsonl"},
-			},
-			want: false,
-		},
-		{
-			name: "kiro sqlite database source",
-			files: []parser.DiscoveredFile{
-				{Agent: parser.AgentKiro, Path: "/tmp/kiro/data.sqlite3"},
-			},
-			want: false,
-		},
-		{
-			name: "legacy kiro jsonl",
-			files: []parser.DiscoveredFile{
-				{Agent: parser.AgentKiro, Path: "/tmp/kiro/session.jsonl"},
-			},
-			want: true,
-		},
-	}
+func TestKiroReconciliationRootPreferenceUsesConfiguredOrder(t *testing.T) {
+	first := filepath.Join(t.TempDir(), "first")
+	second := filepath.Join(t.TempDir(), "second")
+	firstPath := filepath.Join(first, "sess.jsonl")
+	secondPath := filepath.Join(second, "sess.jsonl")
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, hasLegacyKiroCandidates(tt.files))
-		})
-	}
+	assert.Equal(t, int64(2), configuredRootPreference(
+		firstPath, []string{first, second},
+	))
+	assert.Equal(t, int64(1), configuredRootPreference(
+		secondPath, []string{first, second},
+	))
+	assert.Equal(t, int64(1), configuredRootPreference(
+		firstPath, []string{second, first},
+	))
+	assert.Equal(t, int64(2), configuredRootPreference(
+		secondPath, []string{second, first},
+	))
+}
+
+func TestKiroReconciliationRootPreferenceUsesSourceAttribution(t *testing.T) {
+	ancestor := filepath.Join(t.TempDir(), "ancestor")
+	descendant := filepath.Join(ancestor, "descendant")
+	path := filepath.Join(descendant, "session.jsonl")
+	source := parser.SourceRef{ConfiguredRoot: descendant}
+
+	assert.Equal(t, int64(1), configuredRootPreferenceForSource(
+		source, path, []string{ancestor, descendant},
+	), "the provider root must outrank an overlapping ancestor")
+	assert.Equal(t, int64(2), configuredRootPreferenceForSource(
+		parser.SourceRef{}, path, []string{ancestor, descendant},
+	), "unknown attribution must retain the path fallback")
 }
 
 func TestFilterEmptyMessages(t *testing.T) {
@@ -6951,7 +7086,7 @@ func TestWriteBatchFailedReplacementKeepsSourceMissingSessionRetryable(t *testin
 			Agent: string(parser.AgentQwenPaw), FilePath: path,
 		}},
 	))
-	changed, err := database.SoftDeleteSessionSourceOwnership(
+	changed, err := database.MarkSessionSourceMissing(
 		t.Context(), "local", string(parser.AgentQwenPaw),
 		"qwenpaw:retry-revival", path,
 	)
@@ -6979,8 +7114,8 @@ func TestWriteBatchFailedReplacementKeepsSourceMissingSessionRetryable(t *testin
 	assert.Equal(t, 1, failed)
 	active, err := database.GetSession(t.Context(), "qwenpaw:retry-revival")
 	require.NoError(t, err)
-	assert.Nil(t, active,
-		"a failed content replacement must not revive the source-missing row")
+	assert.NotNil(t, active,
+		"a failed content replacement must not clear source-missing state")
 	info := fakeSnapshotInfo{
 		fName: filepath.Base(path), fSize: int64(len("new content")), fMtime: 2,
 	}

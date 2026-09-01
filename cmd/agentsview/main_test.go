@@ -1281,7 +1281,7 @@ func TestCollectWatchRootsUsesGeminiProviderMetadataRoot(t *testing.T) {
 
 func TestCollectWatchRootsUsesAntigravityCLIHistoryRoot(t *testing.T) {
 	root := t.TempDir()
-	for _, subdir := range []string{"brain", "conversations", "implicit"} {
+	for _, subdir := range []string{"brain", "cache", "conversations", "implicit"} {
 		require.NoError(t, os.Mkdir(filepath.Join(root, subdir), 0o755))
 	}
 	cfg := config.Config{
@@ -1296,6 +1296,9 @@ func TestCollectWatchRootsUsesAntigravityCLIHistoryRoot(t *testing.T) {
 	historyRoot, ok := findCollectedWatchRoot(roots, root)
 	require.True(t, ok, "antigravity cli history.jsonl root not collected")
 	assert.False(t, historyRoot.recursive)
+	cache, ok := findCollectedWatchRoot(roots, filepath.Join(root, "cache"))
+	require.True(t, ok, "antigravity cli workspace cache root not collected")
+	assert.False(t, cache.recursive)
 	conversations, ok := findCollectedWatchRoot(
 		roots, filepath.Join(root, "conversations"),
 	)
@@ -2854,11 +2857,17 @@ func TestSyncWatchBatch(t *testing.T) {
 	})
 }
 
-type stubRetryRootsError struct{ roots []string }
+type stubRetryRootsError struct {
+	paths    []string
+	roots    []string
+	overflow bool
+}
 
 func (e *stubRetryRootsError) Error() string { return "reconciliation incomplete" }
 
 func (e *stubRetryRootsError) ReconciliationRetryRoots() []string { return e.roots }
+func (e *stubRetryRootsError) ReconciliationRetryPaths() []string { return e.paths }
+func (e *stubRetryRootsError) ReconciliationRetryOverflow() bool  { return e.overflow }
 
 // TestGapReconciliationRetryBatch pins the startup-gap classification: a gap
 // reconciliation error carrying retry roots yields a scoped retry batch, and
@@ -2870,6 +2879,22 @@ func TestGapReconciliationRetryBatch(t *testing.T) {
 	assert.Equal(t, agentsync.WatchBatch{
 		ReconcileRoots: []string{"/b", "/a"},
 	}, scoped)
+
+	typed := gapReconciliationRetryBatch(fmt.Errorf(
+		"gap: %w", &stubRetryRootsError{
+			paths: []string{"/sessions/child.jsonl", "/sessions/child.jsonl"},
+			roots: []string{"/sessions/root"},
+		},
+	))
+	assert.Equal(t, agentsync.WatchBatch{
+		Paths:          []string{"/sessions/child.jsonl"},
+		ReconcileRoots: []string{"/sessions/root"},
+	}, typed)
+
+	overflow := gapReconciliationRetryBatch(fmt.Errorf(
+		"gap: %w", &stubRetryRootsError{paths: []string{"/child"}, overflow: true},
+	))
+	assert.Equal(t, agentsync.WatchBatch{FullSync: true}, overflow)
 
 	full := gapReconciliationRetryBatch(errors.New("plain failure"))
 	assert.Equal(t, agentsync.WatchBatch{FullSync: true}, full)
@@ -3144,8 +3169,8 @@ func TestReconcileRootPathsDefersUnstatableSymlinkTargetScope(t *testing.T) {
 // A watcher overflow forces a full recovery over every configured root. A
 // configured root that is a symlink whose target was removed streams an empty
 // discovery without error, so the recovery must defer that scope instead of
-// tombstoning every baselined session beneath it, while genuine deletions
-// under present roots still tombstone.
+// marking every baselined session beneath it source-missing, while genuine
+// deletions under present roots still update source state.
 func TestSyncWatchBatchFullRecoveryDefersBrokenSymlinkRoot(t *testing.T) {
 	dataDir := t.TempDir()
 	claudeRoot := t.TempDir()
@@ -3221,24 +3246,34 @@ func TestSyncWatchBatchFullRecoveryDefersBrokenSymlinkRoot(t *testing.T) {
 		func() watchRecoveryScope { return probeWatchRecoveryScope(cfg) },
 	))
 
-	survivor, err := database.GetSession(t.Context(), "codex:"+codexUUID)
+	survivor, err := database.GetSessionFull(t.Context(), "codex:"+codexUUID)
 	require.NoError(t, err)
-	assert.NotNil(t, survivor,
-		"sessions under a broken symlink root must not be tombstoned by an unrelated overflow")
+	require.NotNil(t, survivor,
+		"sessions under a broken symlink root must survive an unrelated overflow")
+	assert.Nil(t, survivor.SourceMissingAt,
+		"a deferred broken-symlink root must not change source state")
 	kept, err := database.GetSession(t.Context(), "claude-kept")
 	require.NoError(t, err)
 	assert.NotNil(t, kept)
 	deleted, err := database.GetSession(t.Context(), "claude-deleted")
 	require.NoError(t, err)
-	assert.Nil(t, deleted,
-		"a genuine deletion under a present root must still tombstone")
+	assert.NotNil(t, deleted,
+		"a missing source under a present root must remain browsable")
+	archived, err := database.GetSessionFull(t.Context(), "claude-deleted")
+	require.NoError(t, err)
+	require.NotNil(t, archived)
+	assert.Nil(t, archived.DeletedAt)
+	assert.Nil(t, archived.DeletionCause)
+	assert.NotNil(t, archived.SourceMissingAt,
+		"a genuine deletion under a present root must update source state")
 }
 
 // A watcher overflow forces a full recovery over every configured root. A
 // root whose physical path is unavailable (unmounted volume, deleted provider
 // dir) streams an empty discovery without error, so the recovery must defer
-// that scope instead of tombstoning every baselined session beneath it, while
-// genuine deletions under present roots still tombstone.
+// that scope instead of marking every baselined session beneath it
+// source-missing, while genuine deletions under present roots still update
+// source state.
 func TestSyncWatchBatchFullRecoveryDefersUnavailableRoots(t *testing.T) {
 	dataDir := t.TempDir()
 	claudeRoot := t.TempDir()
@@ -3310,22 +3345,26 @@ func TestSyncWatchBatchFullRecoveryDefersUnavailableRoots(t *testing.T) {
 		func() watchRecoveryScope { return probeWatchRecoveryScope(cfg) },
 	))
 
-	survivor, err := database.GetSession(t.Context(), "codex:"+codexUUID)
+	survivor, err := database.GetSessionFull(t.Context(), "codex:"+codexUUID)
 	require.NoError(t, err)
-	assert.NotNil(t, survivor,
-		"sessions under an unavailable root must not be tombstoned by an unrelated overflow")
+	require.NotNil(t, survivor,
+		"sessions under an unavailable root must survive an unrelated overflow")
+	assert.Nil(t, survivor.SourceMissingAt,
+		"a deferred unavailable root must not change source state")
 	kept, err := database.GetSession(t.Context(), "claude-kept")
 	require.NoError(t, err)
 	assert.NotNil(t, kept)
 	deleted, err := database.GetSession(t.Context(), "claude-deleted")
 	require.NoError(t, err)
-	assert.Nil(t, deleted,
-		"a genuine deletion under a present root must still tombstone")
+	assert.NotNil(t, deleted,
+		"a missing source under a present root must remain browsable")
 	archived, err := database.GetSessionFull(t.Context(), "claude-deleted")
 	require.NoError(t, err)
 	require.NotNil(t, archived)
-	require.NotNil(t, archived.DeletionCause)
-	assert.Equal(t, "source_missing", *archived.DeletionCause)
+	assert.Nil(t, archived.DeletedAt)
+	assert.Nil(t, archived.DeletionCause)
+	assert.NotNil(t, archived.SourceMissingAt,
+		"a genuine deletion under a present root must update source state")
 }
 
 // A configured root can nest inside another configured root of the same

@@ -303,11 +303,9 @@ func stopTimer(t *time.Timer) {
 	}
 }
 
-// resetTimer stops and drains t before rearming it for d, the safe
-// stop-then-reset sequence for a timer whose channel may already hold an
-// unread tick.
+// resetTimer rearms t for d. Go 1.23 and later guarantee that Reset prevents a
+// subsequent receive from observing a stale value from the prior settings.
 func resetTimer(t *time.Timer, d time.Duration) {
-	stopTimer(t)
 	t.Reset(d)
 }
 
@@ -722,8 +720,11 @@ func setupVectorServing(
 		RecallScheduler:      recallScheduler,
 		RecallMutationNotify: recallMutationNotify,
 		Close: func() error {
-			mgr.Wait()
-			recallMgr.Wait()
+			// Shutdown, not Wait: a detached API build may be waiting out
+			// provider rate limits indefinitely and must be canceled for
+			// daemon shutdown to complete.
+			mgr.Shutdown()
+			recallMgr.Shutdown()
 			ixErr := ix.Close()
 			recallErr := recallIX.Close()
 			lockErr := lock.Close()

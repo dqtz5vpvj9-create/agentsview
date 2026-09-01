@@ -9,7 +9,135 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/money"
+	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
+
+func TestPricingResolverUsesHistoricalGenAIPricesBeforeFlatFallback(t *testing.T) {
+	embedded := pricingpkg.EmbeddedGenAIDocument()
+	genAI := EffectivePricingRow{
+		GenAI: embedded.Prices, GenAIVersion: embedded.Version,
+		GenAISource: PricingRowSourceEmbedded,
+	}
+	flat := EffectivePricingRow{
+		ModelPattern: "gpt-5.6-luna",
+		Rates: ModelRates{
+			InputPerMTok: money.MustParseDollars("9"),
+			Source:       PricingRowSourceFetched,
+		},
+	}
+	resolver := NewPricingResolver([]EffectivePricingRow{flat, genAI})
+
+	beforeModel, before := resolver.ResolveAt(
+		"gpt-5.6-luna", "gpt-5.6-luna",
+		time.Date(2026, 7, 29, 23, 59, 59, 0, time.UTC),
+	)
+	afterModel, after := resolver.ResolveAt(
+		"gpt-5.6-luna", "gpt-5.6-luna",
+		time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC),
+	)
+
+	require.True(t, before.OK)
+	require.True(t, after.OK)
+	assert.Equal(t, "gpt-5.6-luna", beforeModel)
+	assert.Equal(t, "gpt-5.6-luna", afterModel)
+	assert.Equal(t, money.MustParseDollars("1"), before.Rates.InputPerMTok)
+	assert.Equal(t, money.MustParseDollars("6"), before.Rates.OutputPerMTok)
+	assert.Equal(t, money.MustParseDollars("0.2"), after.Rates.InputPerMTok)
+	assert.Equal(t, money.MustParseDollars("1.2"), after.Rates.OutputPerMTok)
+
+	_, withoutTimestamp := resolver.Resolve("gpt-5.6-luna", "gpt-5.6-luna")
+	require.True(t, withoutTimestamp.OK)
+	assert.Equal(t, money.MustParseDollars("9"), withoutTimestamp.Rates.InputPerMTok,
+		"usage without an event timestamp falls back to the flat catalog")
+
+	resolver.RecordResolvedComputed("gpt-5.6-luna", beforeModel, before)
+	resolver.RecordResolvedComputed("gpt-5.6-luna", afterModel, after)
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	resolutions := block.Models["gpt-5.6-luna"].Resolutions
+	require.Len(t, resolutions, 2)
+	assert.ElementsMatch(t, []money.Money{
+		money.MustParseDollars("1"),
+		money.MustParseDollars("0.2"),
+	}, []money.Money{
+		resolutions[0].InputCostPerMTok,
+		resolutions[1].InputCostPerMTok,
+	})
+
+	custom := EffectivePricingRow{
+		ModelPattern: "gpt-5.6-luna",
+		Rates: ModelRates{
+			InputPerMTok: money.MustParseDollars("7"),
+			Source:       PricingRowSourceCustom,
+		},
+	}
+	_, customLookup := NewPricingResolver(
+		[]EffectivePricingRow{flat, genAI, custom},
+	).ResolveAt(
+		"gpt-5.6-luna", "gpt-5.6-luna",
+		time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+	)
+	require.True(t, customLookup.OK)
+	assert.Equal(t, money.MustParseDollars("7"), customLookup.Rates.InputPerMTok)
+	assert.Equal(t, PricingRowSourceCustom, customLookup.Rates.Source)
+}
+
+func TestPricingResolverUsesHistoricalGenAIPricesForEffortTierSuffix(t *testing.T) {
+	embedded := pricingpkg.EmbeddedGenAIDocument()
+	resolver := NewPricingResolver([]EffectivePricingRow{
+		{
+			ModelPattern: "gpt-5.6-luna",
+			Rates: ModelRates{
+				InputPerMTok: money.MustParseDollars("9"),
+				Source:       PricingRowSourceFetched,
+			},
+		},
+		{
+			GenAI: embedded.Prices, GenAIVersion: embedded.Version,
+			GenAISource: PricingRowSourceEmbedded,
+		},
+	})
+
+	pricedModel, lookup := resolver.ResolveAt(
+		"gpt-5-6-luna-high", "gpt-5-6-luna-high",
+		time.Date(2026, 7, 29, 23, 59, 59, 0, time.UTC),
+	)
+
+	require.True(t, lookup.OK)
+	assert.Equal(t, "gpt-5-6-luna-high", pricedModel)
+	assert.Equal(t, money.MustParseDollars("1"), lookup.Rates.InputPerMTok)
+	assert.Equal(t, money.MustParseDollars("6"), lookup.Rates.OutputPerMTok)
+}
+
+func TestPricingResolverUsesGenAIOnlyBaseForEffortTierSuffix(t *testing.T) {
+	genAI, err := pricingpkg.ParseGenAIPrices([]byte(`[
+		{
+			"id": "genai-only",
+			"name": "GenAI Only",
+			"api_pattern": "https://example.invalid",
+			"model_match": {"starts_with": "only-model"},
+			"models": [{
+				"id": "only-model",
+				"match": {"equals": "only-model"},
+				"prices": {"input_mtok": 2, "output_mtok": 8}
+			}]
+		}
+	]`))
+	require.NoError(t, err)
+	resolver := NewPricingResolver([]EffectivePricingRow{{
+		GenAI: genAI, GenAISource: PricingRowSourceEmbedded,
+	}})
+
+	pricedModel, lookup := resolver.ResolveAt(
+		"only-model-high", "only-model-high",
+		time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+	)
+
+	assert.Equal(t, "only-model-high", pricedModel)
+	require.True(t, lookup.OK)
+	assert.Equal(t, money.MustParseDollars("2"), lookup.Rates.InputPerMTok)
+	assert.Equal(t, money.MustParseDollars("8"), lookup.Rates.OutputPerMTok)
+}
 
 func TestPricingResolverBuildBlockUsesRecordedLookup(t *testing.T) {
 	updatedAt := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
@@ -29,7 +157,7 @@ func TestPricingResolverBuildBlockUsesRecordedLookup(t *testing.T) {
 	require.True(t, lookup.OK)
 	require.Equal(t, "claude-test", lookup.Pattern)
 	cost, err := lookup.Rates.CostForTokens(
-		1_000_000, 2_000_000, 500_000, 3_000_000, 4_000_000)
+		1_000_000, 2_000_000, 500_000, 3_000_000, 0, 4_000_000)
 	require.NoError(t, err)
 
 	resolver.RecordComputed("claude-test-20260703", lookup)
@@ -102,6 +230,36 @@ func TestPricingResolverResolveUsesCanonicalWithoutExactCustom(t *testing.T) {
 	assert.Equal(t, money.MustParseDollars("2"), lookup.Rates.InputPerMTok)
 }
 
+func TestPricingResolverResolveAtPrefersNormalizedCanonicalCustomOverGenAI(
+	t *testing.T,
+) {
+	embedded := pricingpkg.EmbeddedGenAIDocument()
+	resolver := NewPricingResolver([]EffectivePricingRow{
+		{
+			ModelPattern: "gpt-5-6-luna",
+			Rates: ModelRates{
+				InputPerMTok: money.MustParseDollars("7"),
+				Source:       PricingRowSourceCustom,
+			},
+		},
+		{
+			GenAI: embedded.Prices, GenAIVersion: embedded.Version,
+			GenAISource: PricingRowSourceEmbedded,
+		},
+	})
+
+	pricedModel, lookup := resolver.ResolveAt(
+		"luna-runtime-alias", "gpt-5.6-luna",
+		time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+	)
+
+	assert.Equal(t, "gpt-5.6-luna", pricedModel)
+	require.True(t, lookup.OK)
+	assert.Equal(t, "gpt-5-6-luna", lookup.Pattern)
+	assert.Equal(t, money.MustParseDollars("7"), lookup.Rates.InputPerMTok)
+	assert.Equal(t, PricingRowSourceCustom, lookup.Rates.Source)
+}
+
 func TestPricingResolverBuildBlockKeepsReportedModelResolutions(t *testing.T) {
 	resolver := NewPricingResolver([]EffectivePricingRow{
 		{
@@ -158,7 +316,7 @@ func TestModelRatesCostForTokensTreatsReasoningAsOutputBreakdown(t *testing.T) {
 		OutputPerMTok: money.MustParseDollars("10"),
 	}
 
-	cost, err := rates.CostForTokens(1_000_000, 2_000_000, 500_000, 0, 0)
+	cost, err := rates.CostForTokens(1_000_000, 2_000_000, 500_000, 0, 0, 0)
 	require.NoError(t, err)
 
 	assert.Equal(t, money.MustParseDollars("21"), cost)
@@ -169,7 +327,7 @@ func TestModelRatesCostForTokensBillsReasoningOnlyRowsAsOutput(t *testing.T) {
 		OutputPerMTok: money.MustParseDollars("10"),
 	}
 
-	cost, err := rates.CostForTokens(0, 0, 500_000, 0, 0)
+	cost, err := rates.CostForTokens(0, 0, 500_000, 0, 0, 0)
 	require.NoError(t, err)
 
 	assert.Equal(t, money.MustParseDollars("5"), cost)
@@ -180,7 +338,7 @@ func TestModelRatesCostForTokensReturnsOverflow(t *testing.T) {
 		InputPerMTok: money.Money{Microdollars: math.MaxInt64},
 	}
 
-	_, err := rates.CostForTokens(2_000_000, 0, 0, 0, 0)
+	_, err := rates.CostForTokens(2_000_000, 0, 0, 0, 0, 0)
 
 	require.ErrorIs(t, err, money.ErrOverflow)
 }
@@ -200,9 +358,9 @@ func TestModelRatesCostForTokensPricingBandBoundary(t *testing.T) {
 		}},
 	}
 
-	atBoundary, err := rates.CostForTokens(100_000, 10_000, 0, 50_000, 50_000)
+	atBoundary, err := rates.CostForTokens(100_000, 10_000, 0, 50_000, 0, 50_000)
 	require.NoError(t, err)
-	aboveBoundary, err := rates.CostForTokens(100_001, 10_000, 0, 50_000, 50_000)
+	aboveBoundary, err := rates.CostForTokens(100_001, 10_000, 0, 50_000, 0, 50_000)
 	require.NoError(t, err)
 
 	assert.Equal(t, money.Money{Microdollars: 150_000}, atBoundary)
@@ -232,12 +390,72 @@ func TestModelRatesPricesRequestsBeforeAggregation(t *testing.T) {
 		}},
 	}
 
-	first, err := rates.CostForTokens(150_000, 0, 0, 0, 0)
+	first, err := rates.CostForTokens(150_000, 0, 0, 0, 0, 0)
 	require.NoError(t, err)
-	second, err := rates.CostForTokens(150_000, 0, 0, 0, 0)
+	second, err := rates.CostForTokens(150_000, 0, 0, 0, 0, 0)
 	require.NoError(t, err)
 
 	assert.Equal(t, money.Money{Microdollars: 300_000}, money.MustAdd(first, second))
+}
+
+func TestModelRatesCostForTokens1hCacheWrites(t *testing.T) {
+	rates := ModelRates{
+		InputPerMTok:        money.MustParseDollars("10"),
+		OutputPerMTok:       money.MustParseDollars("50"),
+		CacheWritePerMTok:   money.MustParseDollars("12.50"),
+		CacheWrite1hPerMTok: money.MustParseDollars("20"),
+		CacheReadPerMTok:    money.MustParseDollars("1"),
+	}
+
+	// Issue #1452's first sample request: every cache write is 1h TTL.
+	cost, err := rates.CostForTokens(2, 62, 0, 8989, 8989, 15892)
+	require.NoError(t, err)
+	assert.Equal(t, money.Money{Microdollars: 198_792}, cost)
+
+	// Mixed TTLs bill each portion at its own rate:
+	// 150k x 12.50 + 100k x 20 = 1.875 + 2.0 dollars.
+	mixed, err := rates.CostForTokens(0, 0, 0, 250_000, 100_000, 0)
+	require.NoError(t, err)
+	assert.Equal(t, money.MustParseDollars("3.875"), mixed)
+}
+
+func TestModelRatesCostForTokens1hFallsBackToBaseWriteRate(t *testing.T) {
+	rates := ModelRates{
+		CacheWritePerMTok: money.MustParseDollars("12.50"),
+	}
+
+	cost, err := rates.CostForTokens(0, 0, 0, 1_000_000, 1_000_000, 0)
+	require.NoError(t, err)
+
+	assert.Equal(t, money.MustParseDollars("12.50"), cost,
+		"a model without a 1h rate bills 1h writes at the base write rate")
+}
+
+func TestModelRatesCostForTokensClamps1hToWriteTotal(t *testing.T) {
+	rates := ModelRates{
+		CacheWritePerMTok:   money.MustParseDollars("1"),
+		CacheWrite1hPerMTok: money.MustParseDollars("2"),
+	}
+
+	cost, err := rates.CostForTokens(0, 0, 0, 250_000, 300_000, 0)
+	require.NoError(t, err)
+
+	assert.Equal(t, money.MustParseDollars("0.50"), cost,
+		"the 1h subset never exceeds the flat write total")
+}
+
+func TestModelRatesRatesForTokensCopies1hRateFromBand(t *testing.T) {
+	rates := ModelRates{
+		CacheWrite1hPerMTok: money.MustParseDollars("1"),
+		Bands: []PricingBand{{
+			AboveInputTokens:    200_000,
+			CacheWrite1hPerMTok: money.MustParseDollars("2"),
+		}},
+	}
+
+	selected := rates.RatesForTokens(272_001, 0, 0)
+
+	assert.Equal(t, money.MustParseDollars("2"), selected.CacheWrite1hPerMTok)
 }
 
 func TestModelRatesCostForTokensScopedAggregateUsesBaseRate(t *testing.T) {
@@ -249,7 +467,7 @@ func TestModelRatesCostForTokensScopedAggregateUsesBaseRate(t *testing.T) {
 		}},
 	}
 
-	cost, err := rates.CostForTokensScoped(false, 300_000, 0, 0, 0, 0)
+	cost, err := rates.CostForTokensScoped(false, 300_000, 0, 0, 0, 0, 0)
 	require.NoError(t, err)
 
 	assert.Equal(t, money.Money{Microdollars: 300_000}, cost)
@@ -297,6 +515,79 @@ func TestPricingResolverBuildBlockPricingBandsAndApplicationCounts(t *testing.T)
 			RequestCount:     1,
 		}},
 	}, model.Application)
+}
+
+func TestPricingResolverBuildBlockKeepsDistinct1hCacheWriteRates(t *testing.T) {
+	t.Run("base rates", func(t *testing.T) {
+		resolver := NewPricingResolver(nil)
+		for _, rate := range []string{"6", "8"} {
+			resolver.RecordComputedRequest("claude-test", PricingLookup{
+				Pattern: "claude-test",
+				OK:      true,
+				Rates: ModelRates{
+					CacheWritePerMTok:   money.MustParseDollars("3.75"),
+					CacheWrite1hPerMTok: money.MustParseDollars(rate),
+					Source:              PricingRowSourceFetched,
+				},
+			}, 100, 0, 0)
+		}
+
+		block, err := resolver.BuildBlock()
+		require.NoError(t, err)
+		resolutions := block.Models["claude-test"].Resolutions
+		require.Len(t, resolutions, 2)
+		assert.ElementsMatch(t, []money.Money{
+			money.MustParseDollars("6"),
+			money.MustParseDollars("8"),
+		}, []money.Money{
+			resolutions[0].CacheWrite1hCostPerMTok,
+			resolutions[1].CacheWrite1hCostPerMTok,
+		})
+		for _, resolution := range resolutions {
+			assert.Equal(t, 1, resolution.Application.BaseRequestCount)
+		}
+	})
+
+	t.Run("band rates", func(t *testing.T) {
+		resolver := NewPricingResolver(nil)
+		for _, rate := range []string{"12", "16"} {
+			resolver.RecordComputedRequest("claude-test", PricingLookup{
+				Pattern: "claude-test",
+				OK:      true,
+				Rates: ModelRates{
+					CacheWritePerMTok:   money.MustParseDollars("3.75"),
+					CacheWrite1hPerMTok: money.MustParseDollars("6"),
+					Source:              PricingRowSourceFetched,
+					Bands: []PricingBand{{
+						AboveInputTokens:    200_000,
+						CacheWritePerMTok:   money.MustParseDollars("7.50"),
+						CacheWrite1hPerMTok: money.MustParseDollars(rate),
+					}},
+				},
+			}, 200_001, 0, 0)
+		}
+
+		block, err := resolver.BuildBlock()
+		require.NoError(t, err)
+		resolutions := block.Models["claude-test"].Resolutions
+		require.Len(t, resolutions, 2)
+		gotRates := make([]money.Money, 0, len(resolutions))
+		for _, resolution := range resolutions {
+			require.Len(t, resolution.Bands, 1)
+			gotRates = append(
+				gotRates, resolution.Bands[0].CacheWrite1hPerMTok)
+		}
+		assert.ElementsMatch(t, []money.Money{
+			money.MustParseDollars("12"),
+			money.MustParseDollars("16"),
+		}, gotRates)
+		for _, resolution := range resolutions {
+			assert.Equal(t, []AppliedPricingBand{{
+				AboveInputTokens: 200_000,
+				RequestCount:     1,
+			}}, resolution.Application.Bands)
+		}
+	})
 }
 
 func TestPricingResolverReportedOnlyRowDoesNotCountPricingApplication(t *testing.T) {

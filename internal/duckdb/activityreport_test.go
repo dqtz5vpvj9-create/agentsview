@@ -516,6 +516,46 @@ func TestDuckGetActivityReportDeduplicatesAfterProjectFilter(t *testing.T) {
 		"an excluded duplicate must not suppress included usage")
 }
 
+// TestDuckActivityReportRowStatus1hCacheWrites prices the 1h-TTL subset of
+// a message row's cache writes at the 1h rate through the activity-report
+// path, and splits the cache-savings math the same way (issue #1452's
+// first sample request).
+func TestDuckActivityReportRowStatus1hCacheWrites(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: "claude-fable-5",
+		Rates: export.ModelRates{
+			InputPerMTok:        money.MustParseDollars("10"),
+			OutputPerMTok:       money.MustParseDollars("50"),
+			CacheWritePerMTok:   money.MustParseDollars("12.50"),
+			CacheWrite1hPerMTok: money.MustParseDollars("20"),
+			CacheReadPerMTok:    money.MustParseDollars("1"),
+		},
+	}})
+
+	savings, cost, priced, contributes, err := duckActivityReportRowStatus(
+		duckActivityReportUsageRow{
+			model:     "claude-fable-5",
+			source:    "message",
+			ts:        "2026-08-13T12:00:05Z",
+			inputTok:  2,
+			outputTok: 62,
+			cacheCr:   8989,
+			cacheCr1h: 8989,
+			cacheRd:   15892,
+		},
+		resolver,
+	)
+
+	require.NoError(t, err)
+	assert.True(t, priced)
+	assert.True(t, contributes)
+	// 2x10 + 62x50 + 8989x20 + 15892x1 per MTok = $0.198792, matching
+	// Claude Code's own total_cost_usd for this request.
+	assert.Equal(t, money.Money{Microdollars: 198_792}, cost)
+	// Savings: reads earn (10 - 1) x 15892; 1h writes cost (10 - 20) x 8989.
+	assert.Equal(t, money.Money{Microdollars: 53_138}, savings)
+}
+
 func TestDuckActivityReportRowStatusCanonicalizesKimiAliasByTimestamp(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -556,9 +596,10 @@ func TestDuckActivityReportRowStatusCanonicalizesKimiAliasByTimestamp(t *testing
 
 			_, cost, priced, contributes, err := duckActivityReportRowStatus(
 				duckActivityReportUsageRow{
-					model:    "daimon-kimi-code",
-					ts:       tt.timestamp,
-					inputTok: 1_000_000,
+					model:     "daimon-kimi-code",
+					ts:        tt.timestamp,
+					pricingTS: tt.timestamp,
+					inputTok:  1_000_000,
 				},
 				resolver,
 			)
@@ -598,9 +639,10 @@ func TestDuckActivityReportRowStatusPrefersExactCustomKimiAlias(t *testing.T) {
 
 	_, cost, priced, contributes, err := duckActivityReportRowStatus(
 		duckActivityReportUsageRow{
-			model:    "daimon-kimi-code",
-			ts:       "2026-07-19T00:00:00Z",
-			inputTok: 1_000_000,
+			model:     "daimon-kimi-code",
+			ts:        "2026-07-19T00:00:00Z",
+			pricingTS: "2026-07-19T00:00:00Z",
+			inputTok:  1_000_000,
 		},
 		resolver,
 	)
@@ -615,6 +657,36 @@ func TestDuckActivityReportRowStatusPrefersExactCustomKimiAlias(t *testing.T) {
 	resolutions := block.Models["daimon-kimi-code"].Resolutions
 	require.Len(t, resolutions, 1)
 	assert.Equal(t, "daimon-kimi-code", resolutions[0].PricedModel)
+}
+
+func TestDuckActivityReportRowStatusUsesFlatRateForUntimedUsage(t *testing.T) {
+	embedded := pricingpkg.EmbeddedGenAIDocument()
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{
+		{
+			ModelPattern: "gpt-5.6-luna",
+			Rates: export.ModelRates{
+				InputPerMTok: money.MustParseDollars("9"),
+				Source:       export.PricingRowSourceFetched,
+			},
+		},
+		{
+			GenAI: embedded.Prices, GenAIVersion: embedded.Version,
+			GenAISource: export.PricingRowSourceEmbedded,
+		},
+	})
+
+	_, cost, priced, contributes, err := duckActivityReportRowStatus(
+		duckActivityReportUsageRow{
+			model: "gpt-5.6-luna", ts: "2026-08-01T00:00:00Z",
+			pricingTS: "", inputTok: 1_000,
+		},
+		resolver,
+	)
+
+	require.NoError(t, err)
+	assert.True(t, priced)
+	assert.True(t, contributes)
+	assert.Equal(t, money.MustParseDollars("0.009"), cost)
 }
 
 func TestDuckGetActivityReportPricingBandApplicationCountedOnce(t *testing.T) {

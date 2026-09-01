@@ -28,6 +28,7 @@ const (
 	AgentKiloLegacy     AgentType = "kilo-legacy"
 	AgentOpenHands      AgentType = "openhands"
 	AgentCursor         AgentType = "cursor"
+	AgentCursorIDE      AgentType = "cursor-ide"
 	AgentIflow          AgentType = "iflow"
 	AgentAmp            AgentType = "amp"
 	AgentZencoder       AgentType = "zencoder"
@@ -315,6 +316,28 @@ var Registry = []AgentDef{
 		FileBased:   true,
 	},
 	{
+		// Cursor IDE (the GUI editor) is a distinct product from Cursor Agent
+		// (the CLI, see AgentCursor above): it stores every chat session in
+		// one shared VS Code-style global-state SQLite database
+		// (state.vscdb), fanned out into one session per composer addressed
+		// by a "<db>#<composerID>" virtual path.
+		Type:        AgentCursorIDE,
+		DisplayName: "Cursor IDE",
+		EnvVar:      "CURSOR_IDE_DIR",
+		ConfigKey:   "cursor_ide_dirs",
+		DefaultDirs: cursorIDEDefaultDirs(),
+		IDPrefix:    "cursor-ide:",
+		FileBased:   true,
+		// state.vscdb is VS Code's shared global-state database: besides
+		// Cursor's own chat data, its ItemTable co-locates Cursor's live
+		// auth tokens (observed keys cursorAuth/accessToken and
+		// cursorAuth/refreshToken) plus whatever other installed extensions
+		// have stored there, and composerData blobs carry per-composer sync
+		// encryption keys. Remote sync stays disabled until there is an
+		// allowlisted export schema, matching Omnigent's chat.db precedent.
+		RemoteSyncExcluded: true,
+	},
+	{
 		Type:        AgentAmp,
 		DisplayName: "Amp",
 		EnvVar:      "AMP_DIR",
@@ -595,7 +618,7 @@ var Registry = []AgentDef{
 		EnvVar:      "KIRO_SESSIONS_DIR",
 		ConfigKey:   "kiro_dirs",
 		DefaultDirs: []string{
-			".kiro/sessions/cli",
+			".kiro/sessions",
 			".local/share/kiro-cli",
 		},
 		IDPrefix:  "kiro:",
@@ -875,7 +898,7 @@ var Registry = []AgentDef{
 		DisplayName:    "IcodeMate",
 		EnvVar:         "ICODEMATE_DIR",
 		ConfigKey:      "icodemate_dirs",
-		DefaultDirs:    []string{".local/share/icodemate"},
+		DefaultDirs:    []string{".local/share/icodemate", ".icodemate/cli/projects"},
 		IDPrefix:       "icodemate:",
 		WatchSubdirs:   []string{"storage/session_diff"},
 		FileBased:      true,
@@ -1271,7 +1294,10 @@ type ParsedMessage struct {
 	ToolCalls     []ParsedToolCall
 	ToolResults   []ParsedToolResult
 
-	Model            string
+	Model string
+	// ProviderID identifies the billing provider for this response, such as
+	// Posit Assistant's "positai" managed service or BYO "anthropic".
+	ProviderID       string
 	TokenUsage       jsontext.Value
 	ContextTokens    int
 	OutputTokens     int
@@ -1318,6 +1344,7 @@ type ParsedUsageEvent struct {
 	MessageOrdinal           *int
 	Source                   string
 	Model                    string
+	ProviderID               string
 	InputTokens              int
 	OutputTokens             int
 	CacheCreationInputTokens int

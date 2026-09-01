@@ -49,9 +49,14 @@ type EncoderConfig struct {
 	RequestDimensions bool
 	// Timeout bounds each individual HTTP request.
 	Timeout time.Duration
-	// MaxRetries is the maximum total attempts on 429/5xx/network errors
-	// (4xx fails fast); values <= 0 mean one attempt.
+	// MaxRetries is the maximum total attempts on retryable errors; values
+	// <= 0 mean one attempt. A 429 does not consume this budget when
+	// RetryRateLimits is enabled.
 	MaxRetries int
+	// RetryRateLimits keeps retrying HTTP 429 responses until the request
+	// succeeds or ctx is canceled. Long-running document builds enable this;
+	// latency-sensitive query encoders leave it disabled and use MaxRetries.
+	RetryRateLimits bool
 	// InputPrefix is prepended verbatim to every input text before it is
 	// sent. Callers use distinct encoder instances when query and document
 	// inputs require different task instructions. Empty means no prefix.
@@ -448,13 +453,15 @@ func (ec *encoderClient) encode(ctx context.Context, texts []string) ([][]float3
 		return nil, err
 	}
 
-	attempts := ec.cfg.MaxRetries
-	if attempts <= 0 {
-		attempts = 1
+	maxAttempts := ec.cfg.MaxRetries
+	if maxAttempts <= 0 {
+		maxAttempts = 1
 	}
 
 	var lastErr error
-	for attempt := 1; attempt <= attempts; attempt++ {
+	nonRateLimitAttempts := 0
+	rateLimitAttempts := 0
+	for {
 		vectors, retryable, err := ec.attemptEncode(ctx, reqBody, texts)
 		if err == nil {
 			return vectors, nil
@@ -479,7 +486,20 @@ func (ec *encoderClient) encode(ctx context.Context, texts []string) ([][]float3
 				ec.cfg.Model, err)
 		}
 		lastErr = err
-		if attempt == attempts && ec.cfg.OllamaCPUFallback {
+		if ec.cfg.RetryRateLimits && isRateLimitError(err) {
+			// A 429 is the one error class the provider tells us exactly how
+			// to handle: it clears with time and doesn't indicate the request
+			// itself is broken. Retry it forever (until ctx is canceled)
+			// rather than spending the limited MaxRetries budget on it, so a
+			// large build doesn't abort permanently on a transient quota.
+			rateLimitAttempts++
+			if err := sleepBackoff(ctx, rateLimitAttempts, err); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		nonRateLimitAttempts++
+		if nonRateLimitAttempts == maxAttempts && ec.cfg.OllamaCPUFallback {
 			if _, ok := errors.AsType[*InvalidEmbeddingError](err); ok {
 				merged, fallbackErr := ec.ollamaCPUFallback(ctx, texts, vectors)
 				if fallbackErr == nil {
@@ -491,14 +511,22 @@ func (ec *encoderClient) encode(ctx context.Context, texts []string) ([][]float3
 				)
 			}
 		}
-		if !retryable || attempt == attempts {
+		if !retryable || nonRateLimitAttempts == maxAttempts {
 			return nil, lastErr
 		}
-		if err := sleepBackoff(ctx, attempt, err); err != nil {
+		if err := sleepBackoff(ctx, nonRateLimitAttempts, err); err != nil {
 			return nil, err
 		}
 	}
-	return nil, lastErr
+}
+
+// isRateLimitError reports whether err is an HTTP 429 (Too Many Requests)
+// response from the embeddings endpoint.
+func isRateLimitError(err error) bool {
+	if statusErr, ok := errors.AsType[*HTTPStatusError](err); ok {
+		return statusErr.Status == http.StatusTooManyRequests
+	}
+	return false
 }
 
 func (ec *encoderClient) ollamaCPUFallback(

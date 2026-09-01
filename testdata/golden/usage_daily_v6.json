@@ -1,5 +1,5 @@
 {
-  "schema_version": 5,
+  "schema_version": 6,
   "pricing": {
     "source": "fetched",
     "table_version": "2026-07-03T12:00:00Z",
@@ -27,6 +27,9 @@
             },
             "cache_write_cost_per_mtok": {
               "microdollars": 3000000
+            },
+            "cache_write_1h_cost_per_mtok": {
+              "microdollars": 0
             },
             "cache_read_cost_per_mtok": {
               "microdollars": 500000
@@ -56,6 +59,9 @@
             "cache_write_cost_per_mtok": {
               "microdollars": 2000000
             },
+            "cache_write_1h_cost_per_mtok": {
+              "microdollars": 0
+            },
             "cache_read_cost_per_mtok": {
               "microdollars": 250000
             },
@@ -72,16 +78,6 @@
     }
   },
   "projects": {
-    "pl1:sha256:a998e358fa5132eaf9ac2cb16ee752c99400d52800c8e5c43eb8905909a05106": {
-      "display_label": "path-project",
-      "resolution": "resolved",
-      "identity": {
-        "key": "p1:sha256:1e23584a9752e07e023270241de74c8b1c4fc7a0e37ec6ea8d20aa6633c4e42b",
-        "kind": "machine_root",
-        "root_key": "r1:sha256:405f2a95d1b7adce695b5c173059e33aba2e6ec8ed135575f53505e5619e3ef7",
-        "repository_key": "repo1:sha256:2bef70455df841d4b0f6418478f5911e758fe795817e67670d8fb6995938debe"
-      }
-    },
     "pl1:sha256:333e5f19bc8ed34f56fa89e51a9307bbc972d173498993ed02e564d32162196f": {
       "display_label": "remote-project",
       "resolution": "resolved",
@@ -95,6 +91,16 @@
     "pl1:sha256:ba5a8fb68c3e3f1454c428f19fdfd2dff9b2c40ae6dc2fef3a19a7c761bd72a1": {
       "display_label": "unknown-project",
       "resolution": "unknown"
+    },
+    "pl1:sha256:a998e358fa5132eaf9ac2cb16ee752c99400d52800c8e5c43eb8905909a05106": {
+      "display_label": "path-project",
+      "resolution": "resolved",
+      "identity": {
+        "key": "p1:sha256:1e23584a9752e07e023270241de74c8b1c4fc7a0e37ec6ea8d20aa6633c4e42b",
+        "kind": "machine_root",
+        "root_key": "r1:sha256:405f2a95d1b7adce695b5c173059e33aba2e6ec8ed135575f53505e5619e3ef7",
+        "repository_key": "repo1:sha256:2bef70455df841d4b0f6418478f5911e758fe795817e67670d8fb6995938debe"
+      }
     }
   },
   "daily": [
@@ -122,43 +128,9 @@
           }
         }
       ],
-      "projectBreakdowns": [
-        {
-          "project_key": "pl1:sha256:ba5a8fb68c3e3f1454c428f19fdfd2dff9b2c40ae6dc2fef3a19a7c761bd72a1",
-          "project": "unknown-project",
-          "inputTokens": 300,
-          "outputTokens": 60,
-          "cacheCreationTokens": 0,
-          "cacheReadTokens": 0,
-          "cost": {
-            "microdollars": 4200
-          }
-        }
-      ],
-      "agentBreakdowns": [
-        {
-          "agent": "cursor",
-          "inputTokens": 300,
-          "outputTokens": 60,
-          "cacheCreationTokens": 0,
-          "cacheReadTokens": 0,
-          "cost": {
-            "microdollars": 4200
-          }
-        }
-      ],
-      "machineBreakdowns": [
-        {
-          "machineName": "golden-host",
-          "inputTokens": 300,
-          "outputTokens": 60,
-          "cacheCreationTokens": 0,
-          "cacheReadTokens": 0,
-          "cost": {
-            "microdollars": 4200
-          }
-        }
-      ]
+      "projectBreakdowns": [],
+      "agentBreakdowns": [],
+      "machineBreakdowns": []
     },
     {
       "date": "2026-07-02",
@@ -184,43 +156,9 @@
           }
         }
       ],
-      "projectBreakdowns": [
-        {
-          "project_key": "pl1:sha256:333e5f19bc8ed34f56fa89e51a9307bbc972d173498993ed02e564d32162196f",
-          "project": "remote-project",
-          "inputTokens": 800,
-          "outputTokens": 160,
-          "cacheCreationTokens": 0,
-          "cacheReadTokens": 0,
-          "cost": {
-            "microdollars": 2880
-          }
-        }
-      ],
-      "agentBreakdowns": [
-        {
-          "agent": "codex",
-          "inputTokens": 800,
-          "outputTokens": 160,
-          "cacheCreationTokens": 0,
-          "cacheReadTokens": 0,
-          "cost": {
-            "microdollars": 2880
-          }
-        }
-      ],
-      "machineBreakdowns": [
-        {
-          "machineName": "golden-host",
-          "inputTokens": 800,
-          "outputTokens": 160,
-          "cacheCreationTokens": 0,
-          "cacheReadTokens": 0,
-          "cost": {
-            "microdollars": 2880
-          }
-        }
-      ]
+      "projectBreakdowns": [],
+      "agentBreakdowns": [],
+      "machineBreakdowns": []
     },
     {
       "date": "2026-07-03",
@@ -257,64 +195,9 @@
           }
         }
       ],
-      "projectBreakdowns": [
-        {
-          "project_key": "pl1:sha256:a998e358fa5132eaf9ac2cb16ee752c99400d52800c8e5c43eb8905909a05106",
-          "project": "path-project",
-          "inputTokens": 300,
-          "outputTokens": 60,
-          "cacheCreationTokens": 0,
-          "cacheReadTokens": 0,
-          "cost": {
-            "microdollars": 12500
-          }
-        },
-        {
-          "project_key": "pl1:sha256:333e5f19bc8ed34f56fa89e51a9307bbc972d173498993ed02e564d32162196f",
-          "project": "remote-project",
-          "inputTokens": 1200,
-          "outputTokens": 240,
-          "cacheCreationTokens": 80,
-          "cacheReadTokens": 400,
-          "cost": {
-            "microdollars": 4760
-          }
-        }
-      ],
-      "agentBreakdowns": [
-        {
-          "agent": "claude",
-          "inputTokens": 300,
-          "outputTokens": 60,
-          "cacheCreationTokens": 0,
-          "cacheReadTokens": 0,
-          "cost": {
-            "microdollars": 12500
-          }
-        },
-        {
-          "agent": "codex",
-          "inputTokens": 1200,
-          "outputTokens": 240,
-          "cacheCreationTokens": 80,
-          "cacheReadTokens": 400,
-          "cost": {
-            "microdollars": 4760
-          }
-        }
-      ],
-      "machineBreakdowns": [
-        {
-          "machineName": "golden-host",
-          "inputTokens": 1500,
-          "outputTokens": 300,
-          "cacheCreationTokens": 80,
-          "cacheReadTokens": 400,
-          "cost": {
-            "microdollars": 17260
-          }
-        }
-      ]
+      "projectBreakdowns": [],
+      "agentBreakdowns": [],
+      "machineBreakdowns": []
     }
   ],
   "totals": {
@@ -332,9 +215,9 @@
   "sessionCounts": {
     "total": 4,
     "byProject": {
-      "pl1:sha256:a998e358fa5132eaf9ac2cb16ee752c99400d52800c8e5c43eb8905909a05106": 1,
       "pl1:sha256:ba5a8fb68c3e3f1454c428f19fdfd2dff9b2c40ae6dc2fef3a19a7c761bd72a1": 1,
-      "pl1:sha256:333e5f19bc8ed34f56fa89e51a9307bbc972d173498993ed02e564d32162196f": 2
+      "pl1:sha256:333e5f19bc8ed34f56fa89e51a9307bbc972d173498993ed02e564d32162196f": 2,
+      "pl1:sha256:a998e358fa5132eaf9ac2cb16ee752c99400d52800c8e5c43eb8905909a05106": 1
     },
     "byAgent": {
       "cursor": 1,

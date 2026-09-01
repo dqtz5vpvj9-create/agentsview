@@ -16,32 +16,37 @@ const MaxPlausibleTokens = 2_000_000
 
 // MessageInput is the session-independent message shape used for extraction.
 type MessageInput struct {
-	Ordinal                            int
-	Role, Timestamp, Model, TokenUsage string
-	ClaudeMessageID, ClaudeRequestID   string
-	SourceUUID                         string
+	Ordinal                                        int
+	Role, Timestamp, Model, ProviderID, TokenUsage string
+	ClaudeMessageID, ClaudeRequestID               string
+	SourceUUID                                     string
 }
 
 // EventInput is the session-independent usage-event shape used for extraction.
 type EventInput struct {
-	MessageOrdinal            *int
-	Source, Timestamp, Model  string
-	CostSource, DedupKey      string
-	InputTokens, OutputTokens int64
-	ReasoningTokens           int64
-	CacheCreationTokens       int64
-	CacheReadTokens           int64
-	ReportedCostMicrodollars  *int64
+	MessageOrdinal                       *int
+	Source, Timestamp, Model, ProviderID string
+	CostSource, DedupKey                 string
+	InputTokens, OutputTokens            int64
+	ReasoningTokens                      int64
+	CacheCreationTokens                  int64
+	CacheReadTokens                      int64
+	ReportedCostMicrodollars             *int64
 }
 
 // ParsedTokenUsage is the sanitized token and billable tool-use payload.
+// CacheCreation1hTokens is the 1-hour-TTL subset of CacheCreationTokens,
+// taken from Anthropic's nested cache_creation breakdown; the flat
+// cache_creation_input_tokens counter stays authoritative, so the subset
+// never exceeds it.
 type ParsedTokenUsage struct {
-	InputTokens         int64
-	OutputTokens        int64
-	ReasoningTokens     int64
-	CacheCreationTokens int64
-	CacheReadTokens     int64
-	WebSearchRequests   int64
+	InputTokens           int64
+	OutputTokens          int64
+	ReasoningTokens       int64
+	CacheCreationTokens   int64
+	CacheCreation1hTokens int64
+	CacheReadTokens       int64
+	WebSearchRequests     int64
 }
 
 // Fact is one normalized, unpriced usage or activity row.
@@ -53,10 +58,12 @@ type Fact struct {
 	RawTimestamp             string
 	UsesSessionStart         bool
 	Model                    string
+	ProviderID               string
 	InputTokens              int64
 	OutputTokens             int64
 	ReasoningTokens          int64
 	CacheCreationTokens      int64
+	CacheCreation1hTokens    int64
 	CacheReadTokens          int64
 	WebSearchRequests        int64
 	ReportedCostMicrodollars *int64
@@ -84,17 +91,18 @@ func FromMessage(in MessageInput) (Fact, bool) {
 	return Fact{
 		Source: "message", MessageOrdinal: &ordinal,
 		TimestampMillis: millis, TimestampNanos: nanos, RawTimestamp: raw,
-		UsesSessionStart: fallback, Model: in.Model,
+		UsesSessionStart: fallback, Model: in.Model, ProviderID: in.ProviderID,
 		InputTokens: parsed.InputTokens, OutputTokens: parsed.OutputTokens,
-		ReasoningTokens:     parsed.ReasoningTokens,
-		CacheCreationTokens: parsed.CacheCreationTokens,
-		CacheReadTokens:     parsed.CacheReadTokens,
-		WebSearchRequests:   parsed.WebSearchRequests,
-		RequestScoped:       true,
-		ClaudeMessageID:     in.ClaudeMessageID,
-		ClaudeRequestID:     in.ClaudeRequestID,
-		SourceUUID:          in.SourceUUID,
-		TokenEligible:       tokenEligible, ActivityEligible: activityEligible,
+		ReasoningTokens:       parsed.ReasoningTokens,
+		CacheCreationTokens:   parsed.CacheCreationTokens,
+		CacheCreation1hTokens: parsed.CacheCreation1hTokens,
+		CacheReadTokens:       parsed.CacheReadTokens,
+		WebSearchRequests:     parsed.WebSearchRequests,
+		RequestScoped:         true,
+		ClaudeMessageID:       in.ClaudeMessageID,
+		ClaudeRequestID:       in.ClaudeRequestID,
+		SourceUUID:            in.SourceUUID,
+		TokenEligible:         tokenEligible, ActivityEligible: activityEligible,
 	}, true
 }
 
@@ -112,7 +120,7 @@ func FromEvent(in EventInput) (Fact, bool) {
 	return Fact{
 		Source: in.Source, MessageOrdinal: in.MessageOrdinal,
 		TimestampMillis: millis, TimestampNanos: nanos, RawTimestamp: raw,
-		UsesSessionStart: fallback, Model: in.Model,
+		UsesSessionStart: fallback, Model: in.Model, ProviderID: in.ProviderID,
 		InputTokens:  clamp(in.InputTokens),
 		OutputTokens: clamp(in.OutputTokens),
 		// Existing usage-event consumers normalize the four request counters
@@ -122,7 +130,7 @@ func FromEvent(in EventInput) (Fact, bool) {
 		CacheReadTokens:          clamp(in.CacheReadTokens),
 		ReportedCostMicrodollars: in.ReportedCostMicrodollars,
 		CostSource:               in.CostSource,
-		RequestScoped:            in.MessageOrdinal != nil || sourceIsRequestScoped(in.Source),
+		RequestScoped:            in.MessageOrdinal != nil || SourceIsRequestScoped(in.Source),
 		UsageDedupKey:            in.DedupKey,
 		TokenEligible:            eligible, ActivityEligible: eligible,
 	}, true
@@ -204,6 +212,19 @@ func ParseTokenUsage(tokenJSON string) ParsedTokenUsage {
 			continue
 		}
 		i = skipJSONSpace(tokenJSON, i+1)
+		if key == "cache_creation" {
+			valueNext, valid := skipJSONValue(tokenJSON, i)
+			if !valid {
+				break
+			}
+			value, ok := objectInt(
+				tokenJSON[i:valueNext], "ephemeral_1h_input_tokens")
+			if ok && value > 0 {
+				result.CacheCreation1hTokens = clampTokens(value)
+			}
+			i = valueNext
+			continue
+		}
 		if isTokenCounterKey(key) {
 			value, valueNext, valid := parseTokenInt(tokenJSON, i)
 			if valid {
@@ -234,6 +255,9 @@ func ParseTokenUsage(tokenJSON string) ParsedTokenUsage {
 		}
 		i = valueNext
 	}
+	if result.CacheCreation1hTokens > result.CacheCreationTokens {
+		result.CacheCreation1hTokens = result.CacheCreationTokens
+	}
 	result.WebSearchRequests = parseWebSearchRequests(tokenJSON)
 	return result
 }
@@ -261,9 +285,15 @@ func floorTokens(value int64) int64 {
 	return value
 }
 
-func sourceIsRequestScoped(source string) bool {
+// SourceIsRequestScoped reports whether a usage source represents one
+// provider request even when the provider cannot attach it to a message.
+// Posit Assistant sidecar events ("posit-assistant-" + kind, e.g.
+// posit-assistant-keepalive, posit-assistant-classifier) each record one
+// provider request, so the whole prefix is request-scoped.
+func SourceIsRequestScoped(source string) bool {
 	return source == "message" || source == "goose-request" ||
-		source == "deepseek-harness"
+		source == "deepseek-harness" ||
+		strings.HasPrefix(source, "posit-assistant-")
 }
 
 func isTokenCounterKey(key string) bool {

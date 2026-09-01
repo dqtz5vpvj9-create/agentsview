@@ -80,7 +80,12 @@ runs:
           build_cmd+=(--target "$AGENTSVIEW_TARGET_TRIPLE")
         fi
         build_cmd+=(--config '{"bundle":{"createUpdaterArtifacts":false}}')
-        "${build_cmd[@]}"
+
+        if ! "${build_cmd[@]}"; then
+          echo "::warning::Desktop bundle failed; retrying once"
+          sleep 10
+          "${build_cmd[@]}"
+        fi
         if [ "$BUNDLE" = "appimage" ]; then
           bash scripts/repair-appimage-diricon.sh \
             "../${ARTIFACT_DIR}"/*.AppImage

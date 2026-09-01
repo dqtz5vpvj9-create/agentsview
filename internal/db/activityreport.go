@@ -239,6 +239,7 @@ func (db *DB) GetSessionUsageRows(
 			WebSearchRequests: usageRowWebSearchRequests(
 				o.scan.usageSource, o.scan.tokenJSON),
 			Agent:           o.scan.agent,
+			ProviderID:      o.scan.providerID,
 			ClaudeMessageID: o.scan.claudeMessageID,
 			ClaudeRequestID: o.scan.claudeRequestID,
 			SourceUUID:      o.scan.sourceUUID,
@@ -329,6 +330,7 @@ func (db *DB) GetSessionUsageRows(
 			Priced:          priced,
 			Contributes:     contributes,
 			Agent:           r.agent,
+			ProviderID:      r.providerID,
 			ClaudeMessageID: r.claudeMessageID,
 			ClaudeRequestID: r.claudeRequestID,
 			SourceUUID:      r.sourceUUID,
@@ -1073,6 +1075,7 @@ func (db *DB) loadActivityReportUsageCandidatesFrom(
 					MessageOrdinal:  ord,
 					UsageSource:     r.usageSource,
 					Agent:           r.agent,
+					ProviderID:      r.providerID,
 					ClaudeMessageID: r.claudeMessageID,
 					ClaudeRequestID: r.claudeRequestID,
 					SourceUUID:      r.sourceUUID,
@@ -1323,13 +1326,16 @@ func sqliteActivityReportRowStatus(
 func sqliteActivityReportRowStatusWithWebSearchRequests(
 	r dailyUsageScanRow, webSearches int, pricing *export.PricingResolver,
 ) (cost money.Money, priced, contributes bool, err error) {
-	pricedModel, lookup := pricing.Resolve(
-		r.model, usageLookupModel(r.model, r.ts))
-	var inTok, outTok, crTok, rdTok int
+	pricedModel, lookup := pricing.ResolveAt(
+		r.model, usageLookupModel(r.model, r.pricingTS),
+		usagePricingTimestamp(r.pricingTS),
+	)
+	var inTok, outTok, crTok, cr1hTok, rdTok int
 	reasoningTok := r.reasoningTokens
 	if r.usageSource == "message" {
 		inTok, outTok, crTok, rdTok, reasoningTok =
 			clampedUsageTokenCountersWithReasoning(r.tokenJSON)
+		cr1hTok = clampedCacheCreation1hTokens(r.tokenJSON)
 	} else {
 		inTok, outTok, crTok, rdTok = usageEventRowTokens(
 			r.usageSource,
@@ -1353,10 +1359,16 @@ func sqliteActivityReportRowStatusWithWebSearchRequests(
 		}
 		return fee, false, true, nil
 	}
+	pricedModel, lookup, err = pricing.ResolveBilledAt(
+		r.providerID, r.model, usageLookupModel(r.model, r.pricingTS),
+		usagePricingTimestamp(r.pricingTS))
+	if err != nil {
+		return money.Money{}, false, false, err
+	}
 	requestScoped := usageRowIsRequestScoped(r.usageSource, r.messageOrdinal)
 	cost, err = lookup.Rates.CostForTokensScoped(
 		requestScoped,
-		inTok, outTok, reasoningTok, crTok, rdTok)
+		inTok, outTok, reasoningTok, crTok, cr1hTok, rdTok)
 	if err != nil {
 		return money.Money{}, false, false,
 			fmt.Errorf("pricing activity usage for model %q: %w", r.model, err)

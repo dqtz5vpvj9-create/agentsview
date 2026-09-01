@@ -229,13 +229,40 @@ func TestNewVectorEncoderWiresOllamaCPUFallback(t *testing.T) {
 				OllamaCPUFallback: true,
 			},
 		},
-	}, "local", "")
+	}, "local", "", false)
 	require.NoError(t, err)
 
 	out, err := enc(context.Background(), []string{"alpha"})
 	require.NoError(t, err)
 	assert.Equal(t, [][]float32{{1, 2, 3}}, out)
 	assert.Equal(t, int32(1), cpuCalls.Load())
+}
+
+func TestVectorDocumentEncoderSetWiresBuildTokenBudget(t *testing.T) {
+	encoders, err := vectorDocumentEncoderSet(config.VectorEmbeddingsConfig{
+		Model:              "voyage-4-large",
+		Dimension:          1024,
+		ModelContextTokens: 32000,
+		DefaultServer:      "voyage",
+		Servers: map[string]config.VectorEmbeddingsServerConfig{
+			"voyage": {
+				Endpoint:       "https://api.example.com/v1",
+				BatchSize:      4,
+				MaxBatchTokens: 120000,
+				Concurrency:    2,
+				Timeout:        "30s",
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	settings := encoders.ByName["voyage"].Settings
+	assert.Equal(t, vector.EncodeSettings{
+		BatchSize:          4,
+		ModelContextTokens: 32000,
+		MaxBatchTokens:     120000,
+		Concurrency:        2,
+	}, settings)
 }
 
 func TestRecallVectorGenerationExtendsExtractionFingerprint(t *testing.T) {

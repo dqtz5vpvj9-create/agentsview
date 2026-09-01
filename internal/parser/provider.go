@@ -68,17 +68,12 @@ type ProviderConfig struct {
 	// path (Aider) use it to seed those IDs from the canonical remote path
 	// rather than the changing temp path. Most providers ignore it.
 	PathRewriter func(string) string
-	// SQLiteContainerUnchangedSinceTrust reports that the shared SQLite
-	// container at dbPath is byte-identical to the last pass that verified
-	// every one of its sessions, as captured before this discovery began.
-	// Providers that fan such a container out to per-session sources may
-	// answer discovery for it with the bounded watermark-only listing: the
-	// caller's container gate will skip every member before fingerprinting,
-	// so computing the full child digest would be archive-sized work for
-	// values nothing reads. Nil (the default, and every non-discovery
-	// construction) means no container is trusted and listings stay
-	// full-fidelity.
-	SQLiteContainerUnchangedSinceTrust func(dbPath string) bool
+	// SQLiteContainerListsWatermarkOnly authorizes a shared SQLite container
+	// at dbPath to use its complete-membership, session/project-watermark
+	// listing for this discovery pass. The caller's container gate decides
+	// when that listing is safe; nil (the default, and every non-discovery
+	// construction) means listings stay full-fidelity.
+	SQLiteContainerListsWatermarkOnly func(dbPath string) bool
 }
 
 // Clone returns an independent config snapshot.
@@ -175,6 +170,34 @@ type ReconciliationSourceResolver interface {
 	SourceForReconciliation(
 		context.Context, string, string,
 	) (SourceRef, bool, error)
+}
+
+// ReconciliationSourceStateResolver is the fast source resolver for candidates
+// that carry provider-owned discovery state. It may use that state to avoid
+// reopening a shared container while still resolving storage shadows.
+type ReconciliationSourceStateResolver interface {
+	SourceForReconciliationWithState(
+		context.Context, string, string, ReconciliationSourceState,
+	) (SourceRef, bool, error)
+}
+
+// ReconciliationSourceState is a bounded provider-owned payload carried with
+// a streamed reconciliation candidate. It preserves discovery metadata across
+// the temporary sync spool without retaining provider sources in memory.
+type ReconciliationSourceState struct {
+	Version uint8
+	Payload []byte
+}
+
+// ReconciliationSourceStateProvider serializes and reapplies the bounded
+// discovery state needed after a candidate crosses the reconciliation spool.
+// A provider may ignore state when source resolution promotes a candidate to a
+// different representation, such as a storage shadow.
+type ReconciliationSourceStateProvider interface {
+	ReconciliationSourceState(SourceRef) (ReconciliationSourceState, bool)
+	ApplyReconciliationSourceState(
+		*SourceRef, ReconciliationSourceState,
+	) error
 }
 
 // ReconciliationSourceRank is compared lexicographically after configured-root
@@ -929,6 +952,9 @@ type ParseRequest struct {
 	Fingerprint SourceFingerprint
 	Machine     string
 	ForceParse  bool
+	// StoredPathResolver maps a canonical remote companion path back to the
+	// materialized file used by this parse.
+	StoredPathResolver func(string) (string, bool)
 }
 
 // ParseOutcome is the full-parse provider output. It is meaningful only when
@@ -1107,6 +1133,8 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newCortexProviderFactory(def)
 	case AgentCursor:
 		return newCursorProviderFactory(def)
+	case AgentCursorIDE:
+		return newCursorIDEProviderFactory(def)
 	case AgentChatGPT:
 		return newImportOnlyProviderFactory(def)
 	case AgentDeepSeekTUI:

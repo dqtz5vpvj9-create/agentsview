@@ -417,7 +417,9 @@ SELECT
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
 	COALESCE(NULLIF(m.timestamp, ''), s.started_at, '') AS ts,
+	COALESCE(m.timestamp, '') AS pricing_ts,
 	m.model,
+	m.provider_id,
 	m.token_usage,
 	0 AS input_tokens,
 	0 AS output_tokens,
@@ -454,7 +456,9 @@ SELECT
 	ue.message_ordinal,
 	ue.source AS usage_source,
 	COALESCE(ue.occurred_at, s.started_at, '') AS ts,
+	COALESCE(ue.occurred_at, '') AS pricing_ts,
 	ue.model,
+	ue.provider_id,
 	'' AS token_usage,
 	ue.input_tokens,
 	ue.output_tokens,
@@ -500,7 +504,9 @@ SELECT
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
 	COALESCE(NULLIF(m.timestamp, ''), s.started_at, '') AS ts,
+	COALESCE(m.timestamp, '') AS pricing_ts,
 	m.model,
+	m.provider_id,
 	m.token_usage,
 	0 AS input_tokens,
 	0 AS output_tokens,
@@ -530,7 +536,9 @@ SELECT
 	ue.message_ordinal,
 	ue.source AS usage_source,
 	COALESCE(ue.occurred_at, s.started_at, '') AS ts,
+	COALESCE(ue.occurred_at, '') AS pricing_ts,
 	ue.model,
+	ue.provider_id,
 	'' AS token_usage,
 	ue.input_tokens,
 	ue.output_tokens,
@@ -559,7 +567,9 @@ SELECT
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
 	COALESCE(NULLIF(m.timestamp, ''), s.started_at, '') AS ts,
+	COALESCE(m.timestamp, '') AS pricing_ts,
 	m.model,
+	m.provider_id,
 	m.token_usage,
 	0 AS input_tokens,
 	0 AS output_tokens,
@@ -588,7 +598,9 @@ SELECT
 	ue.message_ordinal,
 	ue.source AS usage_source,
 	COALESCE(ue.occurred_at, s.started_at, '') AS ts,
+	COALESCE(ue.occurred_at, '') AS pricing_ts,
 	ue.model,
+	ue.provider_id,
 	'' AS token_usage,
 	ue.input_tokens,
 	ue.output_tokens,
@@ -634,6 +646,7 @@ message_timestamp_rows AS MATERIALIZED (
 		m.ordinal,
 		NULLIF(m.timestamp, '') AS timestamp,
 		m.model,
+		m.provider_id,
 		m.token_usage,
 		m.claude_message_id,
 		m.claude_request_id,
@@ -649,6 +662,7 @@ usage_event_timestamp_rows AS MATERIALIZED (
 		ue.source,
 		ue.occurred_at,
 		ue.model,
+		ue.provider_id,
 		ue.input_tokens,
 			ue.output_tokens,
 			ue.cache_creation_input_tokens,
@@ -696,7 +710,9 @@ type usageScanRow struct {
 	messageOrdinal           sql.NullInt64
 	usageSource              string
 	ts                       string
+	pricingTS                string
 	model                    string
+	providerID               string
 	tokenJSON                string
 	inputTokens              int
 	outputTokens             int
@@ -726,7 +742,9 @@ type dailyUsageScanRow struct {
 	messageOrdinal           sql.NullInt64
 	usageSource              string
 	ts                       string
+	pricingTS                string
 	model                    string
+	providerID               string
 	tokenJSON                string
 	webSearchRequests        sql.NullInt64
 	inputTokens              int
@@ -759,7 +777,9 @@ SELECT
 	u.message_ordinal,
 	u.usage_source,
 	u.ts,
+	u.pricing_ts,
 	u.model,
+	u.provider_id,
 	u.token_usage,
 	u.input_tokens,
 	u.output_tokens,
@@ -859,7 +879,9 @@ SELECT
 	u.message_ordinal,
 	u.usage_source,
 	u.ts,
+	u.pricing_ts,
 	u.model,
+	u.provider_id,
 	u.token_usage,
 	` + cols.webSearch + ` AS web_search_requests,
 	u.input_tokens,
@@ -1048,7 +1070,9 @@ SELECT
 	NULL AS message_ordinal,
 	'cursor' AS usage_source,
 	cu.occurred_at AS ts,
+	cu.occurred_at AS pricing_ts,
 	cu.model,
+	'' AS provider_id,
 	'' AS token_usage,
 	cu.input_tokens,
 	cu.output_tokens,
@@ -1391,7 +1415,9 @@ func scanUsageRow(rows *sql.Rows) (usageScanRow, error) {
 		&r.messageOrdinal,
 		&r.usageSource,
 		&r.ts,
+		&r.pricingTS,
 		&r.model,
+		&r.providerID,
 		&r.tokenJSON,
 		&r.inputTokens,
 		&r.outputTokens,
@@ -1431,7 +1457,9 @@ func scanDailyUsageRowWithMachine(
 		&r.messageOrdinal,
 		&r.usageSource,
 		&r.ts,
+		&r.pricingTS,
 		&r.model,
+		&r.providerID,
 		&r.tokenJSON,
 		&r.webSearchRequests,
 		&r.inputTokens,
@@ -1474,6 +1502,14 @@ func parseUsageTokenCountersWithReasoning(
 
 func parseUsageWebSearchRequests(tokenJSON string) int {
 	return int(usagefacts.ParseTokenUsage(tokenJSON).WebSearchRequests)
+}
+
+// clampedCacheCreation1hTokens returns the clamped 1h-TTL subset of a
+// message row's cache-write tokens. Usage events never carry the nested
+// breakdown, so event rows always price at the base write rate.
+func clampedCacheCreation1hTokens(tokenJSON string) int {
+	return int(usagefacts.ClampPlausibleTokens(
+		usagefacts.ParseTokenUsage(tokenJSON).CacheCreation1hTokens))
 }
 
 // usageRowWebSearchRequests returns how many billed Anthropic server-side
@@ -1559,6 +1595,11 @@ func usageLookupModel(model, ts string) string {
 	return model
 }
 
+func usagePricingTimestamp(ts string) time.Time {
+	parsed, _ := time.Parse(time.RFC3339Nano, ts)
+	return parsed
+}
+
 func dailyUsageAmounts(
 	r dailyUsageScanRow, pricing *export.PricingResolver,
 ) (
@@ -1575,15 +1616,25 @@ func dailyUsageAmounts(
 	cacheCrTok = int(fact.CacheCreationTokens)
 	cacheRdTok = int(fact.CacheReadTokens)
 	priced, err := priceUsageFact(usagePriceInput{
-		Fact: fact, Timestamp: r.ts, ReportedModel: r.model,
+		Fact: fact, Timestamp: r.pricingTS, ReportedModel: r.model,
+		ProviderID: r.providerID,
 	}, pricing)
 	if err != nil {
 		return 0, 0, 0, 0, money.Money{}, money.Money{}, err
 	}
-	_, lookup := pricing.Resolve(r.model, usageLookupModel(r.model, r.ts))
+	_, lookup := pricing.ResolveAt(
+		r.model, usageLookupModel(r.model, r.pricingTS),
+		usagePricingTimestamp(r.pricingTS),
+	)
 	if priced.Reported > 0 {
 		pricing.RecordResolvedReported(r.model, priced.PricedModel, lookup)
 	} else {
+		_, lookup, err = pricing.ResolveBilledAt(
+			r.providerID, r.model, usageLookupModel(r.model, r.pricingTS),
+			usagePricingTimestamp(r.pricingTS))
+		if err != nil {
+			return 0, 0, 0, 0, money.Money{}, money.Money{}, err
+		}
 		recordComputedUsagePricing(
 			pricing, r.model, priced.PricedModel, lookup, fact.RequestScoped,
 			inputTok, cacheCrTok, cacheRdTok,
@@ -1607,7 +1658,8 @@ func dailyUsageFact(r dailyUsageScanRow) (usagefacts.Fact, bool) {
 	if r.usageSource == "message" {
 		return usagefacts.FromMessage(usagefacts.MessageInput{
 			Ordinal: int(r.messageOrdinal.Int64), Role: "assistant",
-			Timestamp: r.ts, Model: r.model, TokenUsage: r.tokenJSON,
+			Timestamp: r.pricingTS, Model: r.model, ProviderID: r.providerID,
+			TokenUsage:      r.tokenJSON,
 			ClaudeMessageID: r.claudeMessageID,
 			ClaudeRequestID: r.claudeRequestID,
 			SourceUUID:      r.sourceUUID,
@@ -1625,7 +1677,7 @@ func dailyUsageFact(r dailyUsageScanRow) (usagefacts.Fact, bool) {
 	}
 	return usagefacts.FromEvent(usagefacts.EventInput{
 		MessageOrdinal: ordinal, Source: r.usageSource,
-		Timestamp: r.ts, Model: r.model,
+		Timestamp: r.pricingTS, Model: r.model, ProviderID: r.providerID,
 		CostSource: r.costSource, DedupKey: r.usageDedupKey,
 		InputTokens:              int64(r.inputTokens),
 		OutputTokens:             int64(r.outputTokens),
@@ -1644,10 +1696,10 @@ func usageRowIsRequestScoped(
 
 // UsageSourceIsRequestScoped reports whether a usage source represents one
 // provider request even when the provider cannot attach it to a message.
+// The policy lives in usagefacts so fact construction and row scanning
+// cannot drift apart.
 func UsageSourceIsRequestScoped(source string) bool {
-	return source == "message" ||
-		source == "goose-request" ||
-		source == "deepseek-harness"
+	return usagefacts.SourceIsRequestScoped(source)
 }
 
 func recordComputedUsagePricing(
@@ -1927,6 +1979,9 @@ func (db *DB) loadPricingMapFrom(
 			CacheWritePerMTok: money.Money{
 				Microdollars: cp.CacheCreationMicrodollarsPerMTok,
 			},
+			CacheWrite1hPerMTok: money.Money{
+				Microdollars: cp.CacheCreation1hMicrodollarsPerMTok,
+			},
 			CacheReadPerMTok: money.Money{
 				Microdollars: cp.CacheReadMicrodollarsPerMTok,
 			},
@@ -1938,8 +1993,49 @@ func (db *DB) loadPricingMapFrom(
 		rates.Bands = append([]export.PricingBand(nil), rates.Bands...)
 		out[model] = rates
 	}
+	genAI, err := genAIEffectivePricingRow(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	rows := pricingMapRows(out)
+	return append(rows, genAI), nil
+}
 
-	return pricingMapRows(out), nil
+func genAIEffectivePricingRow(
+	ctx context.Context, q sessionExportQuerier,
+) (export.EffectivePricingRow, error) {
+	stored, err := getGenAIPricingFrom(ctx, q)
+	if err != nil {
+		return export.EffectivePricingRow{}, err
+	}
+	if stored == nil {
+		embedded := pricingpkg.EmbeddedGenAIDocument()
+		return export.EffectivePricingRow{
+			GenAI: embedded.Prices, GenAIVersion: embedded.Version,
+			GenAISource: export.PricingRowSourceEmbedded,
+		}, nil
+	}
+	document, err := pricingpkg.ParseGenAIDocument(
+		stored.Data, stored.Version, stored.SourceRef,
+	)
+	if err != nil {
+		return export.EffectivePricingRow{}, fmt.Errorf(
+			"parsing stored GenAI pricing document: %w", err,
+		)
+	}
+	var updatedAt *time.Time
+	if parsed, parseErr := time.Parse(time.RFC3339Nano, stored.UpdatedAt); parseErr == nil {
+		utc := parsed.UTC()
+		updatedAt = &utc
+	}
+	source := export.PricingRowSourceFetched
+	if stored.Source == GenAIPricingSourceEmbedded {
+		source = export.PricingRowSourceEmbedded
+	}
+	return export.EffectivePricingRow{
+		GenAI: document.Prices, GenAIVersion: document.Version,
+		GenAISource: source, GenAIUpdatedAt: updatedAt,
+	}, nil
 }
 
 func customPricingSource() export.PricingRowSource {
@@ -1951,12 +2047,13 @@ func fallbackRateMap() map[string]export.ModelRates {
 	out := make(map[string]export.ModelRates, len(fallback))
 	for _, p := range fallback {
 		rates := export.ModelRates{
-			InputPerMTok:      p.InputPerMTok,
-			OutputPerMTok:     p.OutputPerMTok,
-			CacheWritePerMTok: p.CacheCreationPerMTok,
-			CacheReadPerMTok:  p.CacheReadPerMTok,
-			Source:            export.PricingRowSourceEmbedded,
-			Bands:             catalogPricingBands(p.Bands),
+			InputPerMTok:        p.InputPerMTok,
+			OutputPerMTok:       p.OutputPerMTok,
+			CacheWritePerMTok:   p.CacheCreationPerMTok,
+			CacheWrite1hPerMTok: p.CacheCreation1hPerMTok,
+			CacheReadPerMTok:    p.CacheReadPerMTok,
+			Source:              export.PricingRowSourceEmbedded,
+			Bands:               catalogPricingBands(p.Bands),
 		}
 		out[p.ModelPattern] = rates
 	}
@@ -1972,12 +2069,13 @@ func modelPricingRates(p ModelPricing) export.ModelRates {
 		}
 	}
 	return export.ModelRates{
-		InputPerMTok:      p.InputPerMTok,
-		OutputPerMTok:     p.OutputPerMTok,
-		CacheWritePerMTok: p.CacheCreationPerMTok,
-		CacheReadPerMTok:  p.CacheReadPerMTok,
-		UpdatedAt:         updatedAt,
-		Bands:             storedPricingBands(p.Bands),
+		InputPerMTok:        p.InputPerMTok,
+		OutputPerMTok:       p.OutputPerMTok,
+		CacheWritePerMTok:   p.CacheCreationPerMTok,
+		CacheWrite1hPerMTok: p.CacheCreation1hPerMTok,
+		CacheReadPerMTok:    p.CacheReadPerMTok,
+		UpdatedAt:           updatedAt,
+		Bands:               storedPricingBands(p.Bands),
 	}
 }
 
@@ -1985,11 +2083,12 @@ func catalogPricingBands(bands []pricingpkg.PricingBand) []export.PricingBand {
 	out := make([]export.PricingBand, len(bands))
 	for i, band := range bands {
 		out[i] = export.PricingBand{
-			AboveInputTokens:  band.AboveInputTokens,
-			InputPerMTok:      band.InputPerMTok,
-			OutputPerMTok:     band.OutputPerMTok,
-			CacheWritePerMTok: band.CacheCreationPerMTok,
-			CacheReadPerMTok:  band.CacheReadPerMTok,
+			AboveInputTokens:    band.AboveInputTokens,
+			InputPerMTok:        band.InputPerMTok,
+			OutputPerMTok:       band.OutputPerMTok,
+			CacheWritePerMTok:   band.CacheCreationPerMTok,
+			CacheWrite1hPerMTok: band.CacheCreation1hPerMTok,
+			CacheReadPerMTok:    band.CacheReadPerMTok,
 		}
 	}
 	return out
@@ -2004,12 +2103,13 @@ func storedPricingBands(bands []PricingBand) []export.PricingBand {
 			updatedAt = &t
 		}
 		out[i] = export.PricingBand{
-			AboveInputTokens:  band.AboveInputTokens,
-			InputPerMTok:      band.InputPerMTok,
-			OutputPerMTok:     band.OutputPerMTok,
-			CacheWritePerMTok: band.CacheCreationPerMTok,
-			CacheReadPerMTok:  band.CacheReadPerMTok,
-			UpdatedAt:         updatedAt,
+			AboveInputTokens:    band.AboveInputTokens,
+			InputPerMTok:        band.InputPerMTok,
+			OutputPerMTok:       band.OutputPerMTok,
+			CacheWritePerMTok:   band.CacheCreationPerMTok,
+			CacheWrite1hPerMTok: band.CacheCreation1hPerMTok,
+			CacheReadPerMTok:    band.CacheReadPerMTok,
+			UpdatedAt:           updatedAt,
 		}
 	}
 	return out
@@ -2022,6 +2122,7 @@ func modelPricingSource(
 		rates.InputPerMTok == p.InputPerMTok &&
 		rates.OutputPerMTok == p.OutputPerMTok &&
 		rates.CacheWritePerMTok == p.CacheCreationPerMTok &&
+		rates.CacheWrite1hPerMTok == p.CacheCreation1hPerMTok &&
 		rates.CacheReadPerMTok == p.CacheReadPerMTok &&
 		exportPricingBandsEqual(rates.Bands, storedPricingBands(p.Bands)) {
 		return export.PricingRowSourceEmbedded
@@ -2038,6 +2139,7 @@ func exportPricingBandsEqual(a, b []export.PricingBand) bool {
 			a[i].InputPerMTok != b[i].InputPerMTok ||
 			a[i].OutputPerMTok != b[i].OutputPerMTok ||
 			a[i].CacheWritePerMTok != b[i].CacheWritePerMTok ||
+			a[i].CacheWrite1hPerMTok != b[i].CacheWrite1hPerMTok ||
 			a[i].CacheReadPerMTok != b[i].CacheReadPerMTok {
 			return false
 		}
@@ -2065,7 +2167,11 @@ func paddedUTCBound(ts string, hours int) string {
 	if err != nil {
 		return ts
 	}
-	return t.Add(time.Duration(hours) * time.Hour).Format(time.RFC3339)
+	padded := t.Add(time.Duration(hours) * time.Hour)
+	if padded.Year() < 1 {
+		padded = time.Date(1, time.January, 1, 0, 0, 0, 0, time.UTC)
+	}
+	return padded.Format(time.RFC3339)
 }
 
 // getDailyUsageLegacy is the wide-row test oracle for the facts-backed path.
@@ -2185,6 +2291,7 @@ func (db *DB) getDailyUsageLegacy(
 		key := usageCostAllocationKey{
 			date: date, project: r.project,
 			agent: r.agent, machine: r.machine, model: r.model,
+			providerID: r.providerID,
 		}
 		b, ok := accum[key]
 		if !ok {
@@ -2983,19 +3090,22 @@ func sessionRowCost(
 func sessionRowCostWithWebSearchRequests(
 	r usageScanRow, webSearches int, pricing *export.PricingResolver,
 ) (cost money.Money, priced, contributes bool, err error) {
-	var inTok, outTok, crTok, rdTok int
+	var inTok, outTok, crTok, cr1hTok, rdTok int
 	reasoningTok := r.reasoningTokens
 	if r.usageSource == "message" {
 		inTok, outTok, crTok, rdTok, reasoningTok =
 			clampedUsageTokenCountersWithReasoning(r.tokenJSON)
+		cr1hTok = clampedCacheCreation1hTokens(r.tokenJSON)
 	} else {
 		inTok, outTok, crTok, rdTok = usageEventRowTokens(
 			r.usageSource,
 			r.inputTokens, r.outputTokens,
 			r.cacheCreationInputTokens, r.cacheReadInputTokens)
 	}
-	pricedModel, lookup := pricing.Resolve(
-		r.model, usageLookupModel(r.model, r.ts))
+	pricedModel, lookup := pricing.ResolveAt(
+		r.model, usageLookupModel(r.model, r.pricingTS),
+		usagePricingTimestamp(r.pricingTS),
+	)
 	if r.cost.Valid {
 		pricing.RecordResolvedReported(r.model, pricedModel, lookup)
 		return money.Money{Microdollars: r.cost.Int64}, true, true, nil
@@ -3013,10 +3123,16 @@ func sessionRowCostWithWebSearchRequests(
 		}
 		return fee, false, true, nil
 	}
+	pricedModel, lookup, err = pricing.ResolveBilledAt(
+		r.providerID, r.model, usageLookupModel(r.model, r.pricingTS),
+		usagePricingTimestamp(r.pricingTS))
+	if err != nil {
+		return money.Money{}, false, false, err
+	}
 	requestScoped := usageRowIsRequestScoped(r.usageSource, r.messageOrdinal)
 	cost, err = lookup.Rates.CostForTokensScoped(
 		requestScoped,
-		inTok, outTok, reasoningTok, crTok, rdTok)
+		inTok, outTok, reasoningTok, crTok, cr1hTok, rdTok)
 	if err != nil {
 		return money.Money{}, false, false,
 			fmt.Errorf("pricing session usage for model %q: %w", r.model, err)

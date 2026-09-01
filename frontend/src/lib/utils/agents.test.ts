@@ -24,6 +24,7 @@ describe("KNOWN_AGENTS", () => {
       "kilo-legacy",
       "openhands",
       "cursor",
+      "cursor-ide",
       "amp",
       "zencoder",
       "zed",

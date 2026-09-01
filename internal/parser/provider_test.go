@@ -150,6 +150,7 @@ func TestProviderRegistryMirrorsAgentRegistry(t *testing.T) {
 
 func TestStoredSourceHintCapabilitiesMatchConsumers(t *testing.T) {
 	wantSupported := map[AgentType]bool{
+		AgentCursorIDE: true,
 		AgentDevin:     true,
 		AgentForge:     true,
 		AgentKiro:      true,

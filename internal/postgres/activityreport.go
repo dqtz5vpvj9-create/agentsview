@@ -223,6 +223,7 @@ func (s *Store) GetSessionUsageRows(
 			WebSearchRequests: pgUsageRowWebSearchRequests(
 				o.scan.usageSource, o.scan.tokenJSON),
 			Agent:           o.scan.agent,
+			ProviderID:      o.scan.providerID,
 			ClaudeMessageID: o.scan.claudeMessageID,
 			ClaudeRequestID: o.scan.claudeRequestID,
 			SourceUUID:      o.scan.sourceUUID,
@@ -318,6 +319,7 @@ func (s *Store) GetSessionUsageRows(
 			Priced:          priced,
 			Contributes:     contributes,
 			Agent:           r.agent,
+			ProviderID:      r.providerID,
 			ClaudeMessageID: r.claudeMessageID,
 			ClaudeRequestID: r.claudeRequestID,
 			SourceUUID:      r.sourceUUID,
@@ -796,6 +798,7 @@ func (s *Store) activityReportUsage(
 					Model:           r.model,
 					Timestamp:       startedAtString(r.ts),
 					Agent:           r.agent,
+					ProviderID:      r.providerID,
 					ClaudeMessageID: r.claudeMessageID,
 					ClaudeRequestID: r.claudeRequestID,
 					SourceUUID:      r.sourceUUID,
@@ -943,9 +946,13 @@ func pgActivityReportRowStatus(
 func pgActivityReportRowStatusWithWebSearchRequests(
 	r pgDailyUsageScanRow, webSearches int, pricing *export.PricingResolver,
 ) (cost money.Money, priced, contributes bool, err error) {
-	pricedModel, lookup := pricing.Resolve(
-		r.model, pgUsageLookupModel(r.model, r.ts))
+	pricedModel, lookup := pricing.ResolveAt(
+		r.model, pgUsageLookupModel(r.model, r.pricingTS),
+		pgUsagePricingTimestamp(r.pricingTS),
+	)
 	inTok, outTok, crTok, rdTok, reasoningTok := pgDailyUsageRowTokens(r)
+	cr1hTok := pgUsageRowCacheCreation1hTokens(
+		r.usageSource, r.tokenJSON, crTok)
 	if r.cost.Valid {
 		pricing.RecordResolvedReported(r.model, pricedModel, lookup)
 		return money.Money{Microdollars: r.cost.Int64}, true, true, nil
@@ -962,10 +969,16 @@ func pgActivityReportRowStatusWithWebSearchRequests(
 		}
 		return fee, false, true, nil
 	}
+	pricedModel, lookup, err = pricing.ResolveBilledAt(
+		r.providerID, r.model, pgUsageLookupModel(r.model, r.pricingTS),
+		pgUsagePricingTimestamp(r.pricingTS))
+	if err != nil {
+		return money.Money{}, false, false, err
+	}
 	requestScoped := pgUsageRowIsRequestScoped(r.usageSource, r.messageOrdinal)
 	cost, err = lookup.Rates.CostForTokensScoped(
 		requestScoped,
-		inTok, outTok, reasoningTok, crTok, rdTok)
+		inTok, outTok, reasoningTok, crTok, cr1hTok, rdTok)
 	if err != nil {
 		return money.Money{}, false, false,
 			fmt.Errorf("pricing pg activity usage for model %q: %w", r.model, err)

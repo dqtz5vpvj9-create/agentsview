@@ -32,6 +32,42 @@ behavior, failure codes, and a complete GitHub Actions job.
 
 ______________________________________________________________________
 
+### `agentsview raw-sync`
+
+Capture supported local provider sources and upload their raw generations to
+hosted custody:
+
+```bash
+export AGENTSVIEW_RAW_SYNC_URL=https://agents.example.com
+export AGENTSVIEW_RAW_SYNC_DEVICE_ID=device-id
+export AGENTSVIEW_RAW_SYNC_CREDENTIAL=device-credential
+agentsview raw-sync watch
+agentsview raw-sync status
+```
+
+`raw-sync watch` runs an initial bounded audit, watches for filesystem changes,
+and retries interrupted uploads from its durable local checkpoint. The device
+credential is accepted only through `AGENTSVIEW_RAW_SYNC_CREDENTIAL`, never as a
+command-line flag. `--server` and `--device-id` override their corresponding
+environment variables.
+
+| Flag                    | Default      | Description                                      |
+| ----------------------- | ------------ | ------------------------------------------------ |
+| `--server`              | environment  | Raw-sync server URL                              |
+| `--device-id`           | environment  | Provisioned device ID                            |
+| `--allow-insecure-http` | `false`      | Allow HTTP for a loopback server only            |
+| `--debounce`            | `2s`         | Coalescing window for filesystem changes         |
+| `--interval`            | `15m`        | Interval between bounded provider audits         |
+| `--audit-limit`         | `128`        | Maximum source work in each provider audit       |
+
+`raw-sync status` reads the checkpoint without creating one and prints
+path-free JSON containing capture, queue, retry, failure, and coverage state.
+S3 roots are not captured. This remains an in-development raw-custody path:
+device enrollment and server-side session derivation are not yet available.
+See [Hosted Raw Sync](/hosted-raw-sync/) for the current boundary.
+
+______________________________________________________________________
+
 ### `agentsview daemon`
 
 Manage the detached writable SQLite server:
@@ -147,8 +183,10 @@ agentsview serve restart
 agentsview serve stop
 ```
 
-The parent command starts a detached `agentsview serve` process, waits briefly
-for it to publish its runtime record, and prints the URL, PID, and log path.
+The parent command starts a detached `agentsview serve` process and waits for it
+to publish its runtime record. The five-second readiness window measures startup
+inactivity, so continuing startup progress can keep the parent waiting longer.
+It then prints the URL, PID, and log path.
 Background server output is written to `~/.agentsview/serve.log`. `serve status`
 reports the preferred managed process, URL, version, uptime, and read-only mode
 when available. `serve stop` retains its broad lifecycle scope: it gracefully
@@ -244,12 +282,13 @@ directories on the remote machine, transfers the source session data locally,
 and indexes it into your local archive. SSH remote sync is deprecated and
 receives only critical fixes; use configured HTTP remote sync for new setups.
 
-Local sync can also read configured Claude and Codex roots from S3-compatible
-object storage. Add `s3://` entries to `claude_project_dirs` or
-`codex_sessions_dirs` in `~/.agentsview/config.toml`, then run `agentsview sync`
-normally. This is not SSH remote sync: object storage is treated as a read-only
-session source, using object size and `LastModified` metadata to skip unchanged
-sessions and downloading only objects that need parsing. See
+Local sync can also read configured Claude, Codex, and Cursor roots from
+S3-compatible object storage. Add `s3://` entries to `claude_project_dirs`,
+`codex_sessions_dirs`, or `cursor_project_dirs` in `~/.agentsview/config.toml`,
+then run `agentsview sync` normally. This is not SSH remote sync: object
+storage is treated as a read-only session source, using object size and
+`LastModified` metadata to skip unchanged sessions and downloading only objects
+that need parsing. See
 [Configuration — S3-Compatible Session Sources](/configuration/#s3-compatible-session-sources).
 
 #### Configured Remote Hosts
@@ -1000,7 +1039,7 @@ agentsview export sessions --all --format ndjson --project agentsview
 The JSON top level has `schema_version`, `database_id`, `cursor`, `pricing`,
 `projects`, and `sessions`. NDJSON writes the same metadata as the first line,
 then one session row per following line. Current builds emit
-`schema_version: 5`; see [Session Export](/session-export/#versioning) for the
+`schema_version: 6`; see [Session Export](/session-export/#versioning) for the
 v1 and transitional 0.38 release history. The default and maximum page size is
 `db.MaxSessionLimit`, currently 500.
 

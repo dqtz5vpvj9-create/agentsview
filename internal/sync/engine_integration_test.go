@@ -820,7 +820,6 @@ func TestSyncEngineOpenCodeSQLiteSameMtimeContentChangeUsesFingerprint(
 	require.NotNil(t, before.LocalModifiedAt,
 		"local_modified_at before rewrite")
 
-	time.Sleep(20 * time.Millisecond)
 	// The session row's own time_updated deliberately stays at
 	// 1779012030000. Production OpenCode stamps time_updated on every child
 	// row it writes, so the replacement children carry a newer one; that is
@@ -833,7 +832,9 @@ func TestSyncEngineOpenCodeSQLiteSameMtimeContentChangeUsesFingerprint(
 		1779012600000,
 	)
 
-	stats = env.engine.SyncAll(context.Background(), nil)
+	// A fresh engine has no recent verification watermark, so this pass is due
+	// for full-digest discovery without waiting for the interval.
+	stats = newOpenCodeTestEngine(t, env).SyncAll(context.Background(), nil)
 	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
 	assert.Equal(t, 1, stats.Synced,
 		"same-mtime SQLite fingerprint changes must be rewritten")
@@ -927,7 +928,6 @@ func TestSyncEngineOpenCodeSQLiteStatIdenticalContentChangeStillReemits(
 	before, err := os.Stat(dbPath)
 	require.NoError(t, err, "stat opencode.db")
 
-	time.Sleep(20 * time.Millisecond)
 	// Same-length replacement content keeps the SQLite file size stable, and
 	// the mtime is restored below, so only SQLite's internal change counter
 	// betrays the rewrite.
@@ -942,7 +942,9 @@ func TestSyncEngineOpenCodeSQLiteStatIdenticalContentChangeStillReemits(
 		"fixture must keep the container size stable for this test")
 	setFileMtime(t, dbPath, before.ModTime().UnixNano())
 
-	stats = env.engine.SyncAll(context.Background(), nil)
+	// A fresh engine has no recent verification watermark, so this pass is due
+	// for full-digest discovery without waiting for the interval.
+	stats = newOpenCodeTestEngine(t, env).SyncAll(context.Background(), nil)
 	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
 	assert.Equal(t, 1, stats.Synced,
 		"stat-identical content change must still be re-emitted")
@@ -1703,6 +1705,82 @@ func TestSyncEngineKiroSQLiteCurrentStoreShadowsLegacy(t *testing.T) {
 	require.Contains(t, *sess.FilePath, "data.sqlite3#overlap-session", "legacy event replaced sqlite-backed session: %+v", sess)
 }
 
+func TestSyncEngineKiroFullParseReplacesMessages(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentKiro)
+	rawID := "sess_0123456789abcdef"
+	path := filepath.Join(env.kiroDir, "workspace", rawID, "messages.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(strings.Join([]string{
+		`{"payload":{"type":"user","content":"first"}}`,
+		`{"payload":{"type":"assistant","content":"second"}}`,
+	}, "\n")+"\n"), 0o644))
+	env.engine.SyncPaths([]string{path})
+	assertSessionMessageCount(t, env.db, "kiro:"+rawID, 2)
+	require.NoError(t, os.WriteFile(path, []byte(
+		`{"payload":{"type":"user","content":"rewritten"}}`+"\n",
+	), 0o644))
+	future := time.Now().Add(time.Minute)
+	require.NoError(t, os.Chtimes(path, future, future))
+	env.engine.SyncPaths([]string{path})
+	assertSessionMessageCount(t, env.db, "kiro:"+rawID, 1)
+}
+
+func TestSyncEngineKiroSameStatMetadataRewriteIsDetected(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentKiro)
+	rawID := "sess_0123456789abcdef"
+	path := filepath.Join(env.kiroDir, "workspace", rawID, "messages.jsonl")
+	sidecar := filepath.Join(filepath.Dir(path), "session.json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(
+		`{"payload":{"type":"user","content":"hello"}}`+"\n",
+	), 0o644))
+	require.NoError(t, os.WriteFile(sidecar, []byte(`{"title":"A"}`), 0o644))
+	stamp := time.Unix(1_700_000_000, 0)
+	require.NoError(t, os.Chtimes(path, stamp, stamp))
+	require.NoError(t, os.Chtimes(sidecar, stamp, stamp))
+
+	initial := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, initial.Aborted)
+	before, err := env.db.GetSessionFull(context.Background(), "kiro:"+rawID)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.NotNil(t, before.SessionName)
+	assert.Equal(t, "A", *before.SessionName)
+
+	require.NoError(t, os.WriteFile(sidecar, []byte(`{"title":"B"}`), 0o644))
+	require.NoError(t, os.Chtimes(sidecar, stamp, stamp))
+	updated := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, updated.Aborted)
+	after, err := env.db.GetSessionFull(context.Background(), "kiro:"+rawID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.SessionName)
+	assert.Equal(t, "B", *after.SessionName)
+}
+
+func TestSyncEngineKiroEmptyCurrentRewritePreservesArchive(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentKiro)
+	rawID := "sess_0123456789abcdef"
+	path := filepath.Join(env.kiroDir, "workspace", rawID, "messages.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(
+		`{"payload":{"type":"user","content":"keep this"}}`+"\n",
+	), 0o644))
+	env.engine.SyncPaths([]string{path})
+
+	require.NoError(t, os.WriteFile(path, []byte(
+		`{"payload":{"type":"session_metadata","content":"not a message"}}`+"\n",
+	), 0o644))
+	future := time.Now().Add(time.Minute)
+	require.NoError(t, os.Chtimes(path, future, future))
+	env.engine.SyncPaths([]string{path})
+
+	active, err := env.db.GetSession(context.Background(), "kiro:"+rawID)
+	require.NoError(t, err)
+	assert.NotNil(t, active, "an empty current rewrite must preserve the archive")
+	assertMessageContent(t, env.db, "kiro:"+rawID, "keep this")
+}
+
 func TestSyncRootsSinceKiroLegacyShadowedBySQLiteOutsideScope(t *testing.T) {
 	legacyRoot := t.TempDir()
 	sqliteRoot := t.TempDir()
@@ -1725,6 +1803,239 @@ func TestSyncRootsSinceKiroLegacyShadowedBySQLiteOutsideScope(t *testing.T) {
 		context.Background(), []string{legacyRoot}, time.Time{}, nil,
 	)
 	assert.Equal(t, 0, stats.TotalSessions, "total sessions")
+}
+
+func TestSyncEngineKiroPartialSQLitePreservesShadowedAndMarksRemovedSourceMissing(
+	t *testing.T,
+) {
+	winnerRoot := t.TempDir()
+	partialRoot := t.TempDir()
+	env := setupSingleAgentTestEnvWithDirs(
+		t, parser.AgentKiro, []string{winnerRoot, partialRoot},
+	)
+	winner := createKiroSQLiteDB(t, winnerRoot)
+	partial := createKiroSQLiteDB(t, partialRoot)
+	fixture := readKiroSQLiteFixture(t, "overlap_payload.json")
+	winner.addSession(t, "/home/user/code/winner", "shadowed", fixture, 1779015600000, 1779015610000)
+	partial.addSession(t, "/home/user/code/partial", "shadowed", fixture, 1779015600000, 1779015610000)
+	partial.addSession(t, "/home/user/code/partial", "removed", fixture, 1779015600000, 1779015610000)
+
+	initial := env.engine.SyncAll(context.Background(), nil)
+	require.Zero(t, initial.Failed)
+	activeShadowed, err := env.db.GetSession(context.Background(), "kiro:shadowed")
+	require.NoError(t, err)
+	require.NotNil(t, activeShadowed)
+	activeRemoved, err := env.db.GetSession(context.Background(), "kiro:removed")
+	require.NoError(t, err)
+	require.NotNil(t, activeRemoved)
+
+	_, err = partial.db.Exec(
+		`DELETE FROM conversations_v2 WHERE conversation_id = ?`, "removed",
+	)
+	require.NoError(t, err)
+	env.engine.SyncPaths([]string{partial.path})
+
+	activeRemoved, err = env.db.GetSession(context.Background(), "kiro:removed")
+	require.NoError(t, err)
+	assert.NotNil(t, activeRemoved,
+		"a removed member must remain browsable")
+	archivedRemoved, err := env.db.GetSessionFull(
+		context.Background(), "kiro:removed",
+	)
+	require.NoError(t, err)
+	assertSourceMissingState(t, archivedRemoved)
+	activeShadowed, err = env.db.GetSession(context.Background(), "kiro:shadowed")
+	require.NoError(t, err)
+	assert.NotNil(t, activeShadowed)
+}
+
+func TestSyncRootsSinceKiroPreservesOutOfScopeWinnerAfterSQLiteRemoval(
+	t *testing.T,
+) {
+	winnerRoot := t.TempDir()
+	partialRoot := t.TempDir()
+	env := setupSingleAgentTestEnvWithDirs(
+		t, parser.AgentKiro, []string{winnerRoot, partialRoot},
+	)
+	rawID := "sess_0123456789abcdef"
+	partial := createKiroSQLiteDB(t, partialRoot)
+	partial.addSession(
+		t, "/home/user/code/partial", rawID,
+		readKiroSQLiteFixture(t, "overlap_payload.json"),
+		1779015600000, 1779015610000,
+	)
+	current := filepath.Join(winnerRoot, "workspace", rawID, "messages.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(current), 0o755))
+	require.NoError(t, os.WriteFile(
+		current,
+		[]byte(`{"payload":{"type":"user","content":"current"}}`+"\n"),
+		0o644,
+	))
+
+	initial := env.engine.SyncAll(context.Background(), nil)
+	require.Zero(t, initial.Failed)
+	active, err := env.db.GetSession(context.Background(), "kiro:"+rawID)
+	require.NoError(t, err)
+	require.NotNil(t, active)
+
+	_, err = partial.db.Exec(
+		`DELETE FROM conversations_v2 WHERE conversation_id = ?`, rawID,
+	)
+	require.NoError(t, err)
+	env.engine.SyncRootsSince(
+		context.Background(), []string{partialRoot}, time.Time{}, nil,
+	)
+
+	active, err = env.db.GetSession(context.Background(), "kiro:"+rawID)
+	require.NoError(t, err)
+	assert.NotNil(t, active,
+		"an out-of-scope current winner must preserve a removed DB member")
+}
+
+func TestSyncRootsSinceKiroArbitratesAcrossConfiguredRootsBeforeProcessing(
+	t *testing.T,
+) {
+	winnerRoot := t.TempDir()
+	partialRoot := t.TempDir()
+	env := setupSingleAgentTestEnvWithDirs(
+		t, parser.AgentKiro, []string{winnerRoot, partialRoot},
+	)
+	rawID := "sess_0123456789abcdef"
+	for root, content := range map[string]string{
+		winnerRoot:  "configured winner",
+		partialRoot: "scoped loser",
+	} {
+		path := filepath.Join(root, "workspace", rawID, "messages.jsonl")
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(
+			fmt.Sprintf(`{"payload":{"type":"user","content":%q}}`, content)+"\n",
+		), 0o644))
+	}
+
+	initial := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, initial.Aborted)
+	assertMessageContent(t, env.db, "kiro:"+rawID, "configured winner")
+
+	stats := env.engine.SyncRootsSince(
+		context.Background(), []string{partialRoot}, time.Time{}, nil,
+	)
+	require.False(t, stats.Aborted)
+	assertMessageContent(t, env.db, "kiro:"+rawID, "configured winner")
+}
+
+func TestSyncRootsSinceKiroMarksRemovedAllShadowedMemberSourceMissing(
+	t *testing.T,
+) {
+	winnerRoot := t.TempDir()
+	partialRoot := t.TempDir()
+	env := setupSingleAgentTestEnvWithDirs(
+		t, parser.AgentKiro, []string{winnerRoot, partialRoot},
+	)
+	winner := createKiroSQLiteDB(t, winnerRoot)
+	partial := createKiroSQLiteDB(t, partialRoot)
+	fixture := readKiroSQLiteFixture(t, "overlap_payload.json")
+	winner.addSession(t, "/home/user/code/winner", "shadowed", fixture, 1779015600000, 1779015610000)
+	partial.addSession(t, "/home/user/code/partial", "shadowed", fixture, 1779015600000, 1779015610000)
+	partial.addSession(t, "/home/user/code/partial", "removed", fixture, 1779015600000, 1779015610000)
+
+	initial := env.engine.SyncAll(context.Background(), nil)
+	require.Zero(t, initial.Failed)
+	removed, err := env.db.GetSession(context.Background(), "kiro:removed")
+	require.NoError(t, err)
+	require.NotNil(t, removed)
+
+	_, err = partial.db.Exec(
+		`DELETE FROM conversations_v2 WHERE conversation_id = ?`, "removed",
+	)
+	require.NoError(t, err)
+	stats := env.engine.SyncRootsSince(
+		context.Background(), []string{partialRoot}, time.Time{}, nil,
+	)
+	require.False(t, stats.Aborted)
+
+	active, err := env.db.GetSession(context.Background(), "kiro:removed")
+	require.NoError(t, err)
+	assert.NotNil(t, active,
+		"a removed member must remain browsable even when all remaining DB rows are shadowed")
+	archived, err := env.db.GetSessionFull(
+		context.Background(), "kiro:removed",
+	)
+	require.NoError(t, err)
+	assertSourceMissingState(t, archived)
+}
+
+func TestSyncRootsSinceKiroOverlappingRootsKeepInScopeWinner(t *testing.T) {
+	parent := t.TempDir()
+	child := filepath.Join(parent, "nest")
+	require.NoError(t, os.MkdirAll(child, 0o755))
+	env := setupSingleAgentTestEnvWithDirs(
+		t, parser.AgentKiro, []string{parent, child},
+	)
+	rawID := "sess_0123456789abcdef"
+	path := filepath.Join(child, rawID, "messages.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(
+		`{"payload":{"type":"user","content":"scoped"}}`+"\n",
+	), 0o644))
+
+	stats := env.engine.SyncRootsSince(
+		context.Background(), []string{child}, time.Time{}, nil,
+	)
+	require.False(t, stats.Aborted)
+
+	active, err := env.db.GetSession(context.Background(), "kiro:"+rawID)
+	require.NoError(t, err)
+	assert.NotNil(t, active,
+		"a physically in-scope winner attributed to an overlapping ancestor root must stay admitted")
+}
+
+func TestReconcileWatchRootsKiroDiscoveryFailureDoesNotAbortOtherAgents(
+	t *testing.T,
+) {
+	env := setupFocusedTestEnv(t, parser.AgentKiro, parser.AgentClaude)
+	rawID := "sess_0123456789abcdef"
+	kiroPath := filepath.Join(env.kiroDir, "workspace", rawID, "messages.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(kiroPath), 0o755))
+	require.NoError(t, os.WriteFile(kiroPath, []byte(
+		`{"payload":{"type":"user","content":"keep"}}`+"\n",
+	), 0o644))
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "Hello").
+		String()
+	claudePath := env.writeClaudeSession(
+		t, "claude-project", "claude-session.jsonl", content,
+	)
+	initial := env.engine.SyncAll(t.Context(), nil)
+	require.Zero(t, initial.Failed)
+	kiroBefore, err := env.db.GetSession(t.Context(), "kiro:"+rawID)
+	require.NoError(t, err)
+	require.NotNil(t, kiroBefore)
+	claudeBefore, err := env.db.GetSession(t.Context(), "claude-session")
+	require.NoError(t, err)
+	require.NotNil(t, claudeBefore)
+
+	require.NoError(t, os.Remove(claudePath))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(env.kiroDir, "broken.jsonl"), []byte("{}\n"), 0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(env.kiroDir, "broken.json"), []byte("{"), 0o644,
+	))
+
+	err = env.engine.ReconcileWatchRoots(t.Context(), nil, true)
+	require.Error(t, err, "the failed Kiro scope must stay queued for retry")
+
+	claudeMissing, err := env.db.GetSession(t.Context(), "claude-session")
+	require.NoError(t, err)
+	assert.NotNil(t, claudeMissing,
+		"a missing Claude source must remain browsable")
+	claudeArchived, err := env.db.GetSessionFull(t.Context(), "claude-session")
+	require.NoError(t, err)
+	assertSourceMissingState(t, claudeArchived)
+	kiroKept, err := env.db.GetSession(t.Context(), "kiro:"+rawID)
+	require.NoError(t, err)
+	assert.NotNil(t, kiroKept,
+		"Kiro sessions must be preserved when Kiro discovery fails")
 }
 
 func TestSyncEngineKiroLegacyOnlySyncPath(t *testing.T) {
@@ -1912,7 +2223,7 @@ func TestReconcileWatchRootsTombstonesSessionsBelowDeletedRoot(t *testing.T) {
 
 	gone, err := env.db.GetSession(t.Context(), "deleted-root-session")
 	require.NoError(t, err)
-	assert.Nil(t, gone,
+	assert.NotNil(t, gone,
 		"authoritative watch-root reconciliation must tombstone stored descendants")
 }
 
@@ -1942,7 +2253,7 @@ func TestReconcileWatchRootsFullNilTombstonesEveryConfiguredLocalRoot(t *testing
 			for i := 1; i < total; i++ {
 				gone, err := env.db.GetSession(t.Context(), fmt.Sprintf("full-%03d", i))
 				require.NoError(t, err)
-				assert.Nil(t, gone, "full reconciliation must tombstone missing source %d", i)
+				assert.NotNil(t, gone, "full reconciliation keeps missing source %d browsable", i)
 			}
 		})
 	}
@@ -2287,10 +2598,7 @@ func TestReconcileWatchRootsOpenCodeHybridUnreadableSQLiteWithholdsTombstones(
 	))
 	prior, getErr = env.db.GetSessionFull(t.Context(), "opencode:"+priorID)
 	require.NoError(t, getErr)
-	require.NotNil(t, prior)
-	require.NotNil(t, prior.DeletionCause)
-	assert.Equal(t, "source_missing", *prior.DeletionCause,
-		"a successful retry may tombstone the now-authoritatively missing SQLite source")
+	assertSourceMissingState(t, prior)
 }
 
 func TestReconcileWatchRootsOpenCodeHybridCardinalityAndIdleGate(t *testing.T) {
@@ -2539,7 +2847,11 @@ func TestColdArchiveChangedPathAndReconciliationAreCardinalityBounded(t *testing
 			))
 			deletedSession, err := env.db.GetSession(t.Context(), "changed-session")
 			require.NoError(t, err)
-			deleted := deletedSession == nil
+			require.NotNil(t, deletedSession)
+			full, err := env.db.GetSessionFull(t.Context(), "changed-session")
+			require.NoError(t, err)
+			assertSourceMissingState(t, full)
+			deleted := full.SourceMissingAt != nil
 			assert.True(t, deleted,
 				"authoritative reconciliation must tombstone the deleted source")
 
@@ -2602,7 +2914,7 @@ func TestReconcileWatchRootsKiroPreservesOnlySQLiteSourcesWithHashPaths(t *testi
 		"a vanished Kiro SQLite store must preserve its archived members")
 	legacySession, err := env.db.GetSession(t.Context(), "kiro:"+legacyID)
 	require.NoError(t, err)
-	assert.Nil(t, legacySession,
+	assert.NotNil(t, legacySession,
 		"an ordinary Kiro JSONL source must tombstone even when its root and filename contain #")
 }
 
@@ -2652,7 +2964,7 @@ func TestReconcileWatchRootsKiroSQLiteBasenameJSONLRemainsLegacy(t *testing.T) {
 	for _, id := range legacyIDs {
 		stored, err := env.db.GetSession(t.Context(), "kiro:"+id)
 		require.NoError(t, err)
-		assert.Nil(t, stored, "deleted legacy source %s must tombstone", id)
+		assert.NotNil(t, stored, "deleted legacy source %s remains browsable", id)
 	}
 }
 
@@ -2682,11 +2994,10 @@ func TestWatcherPathDeletionTombstonesPersistentArchiveSource(t *testing.T) {
 
 	active, err := env.db.GetSession(t.Context(), "watcher-delete")
 	require.NoError(t, err)
-	assert.Nil(t, active, "watcher deletion must hide the missing source")
+	assert.NotNil(t, active, "watcher deletion must preserve the missing source")
 	archived, err := env.db.GetSessionFull(t.Context(), "watcher-delete")
 	require.NoError(t, err)
-	require.NotNil(t, archived, "watcher deletion must retain the archive row")
-	assert.NotNil(t, archived.DeletedAt)
+	assertSourceMissingState(t, archived)
 }
 
 func TestSyncEngineWorktreesShareProject(t *testing.T) {
@@ -3726,12 +4037,7 @@ func TestResyncAllTombstonesOmittedStaleClaudeFork(t *testing.T) {
 
 	stale, err := env.db.GetSessionFull(t.Context(), staleID)
 	require.NoError(t, err)
-	require.NotNil(t, stale,
-		"the archived fork must remain available as a revivable tombstone")
-	require.NotNil(t, stale.DeletedAt,
-		"the complete rebuild parse must retire the omitted stale fork")
-	require.NotNil(t, stale.DeletionCause)
-	assert.Equal(t, "source_missing", *stale.DeletionCause)
+	assertSourceMissingState(t, stale)
 	messages, err := env.db.GetAllMessages(t.Context(), staleID)
 	require.NoError(t, err)
 	require.Len(t, messages, 1)
@@ -3784,12 +4090,7 @@ func TestResyncContributorTombstonesOmittedStaleClaudeFork(t *testing.T) {
 
 	stale, err := env.db.GetSessionFull(t.Context(), staleID)
 	require.NoError(t, err)
-	require.NotNil(t, stale,
-		"the archived contributor fork must remain a revivable tombstone")
-	require.NotNil(t, stale.DeletedAt,
-		"the contributor rebuild parse must retire the omitted stale fork")
-	require.NotNil(t, stale.DeletionCause)
-	assert.Equal(t, "source_missing", *stale.DeletionCause)
+	assertSourceMissingState(t, stale)
 }
 
 func TestResyncContributorExclusionIsNotRestoredAsOrphan(t *testing.T) {
@@ -4384,7 +4685,9 @@ func TestSyncEngineCodexSubagentLineage(t *testing.T) {
 }
 
 func TestSyncEngineProgress(t *testing.T) {
-	env := setupFocusedTestEnv(t, parser.AgentClaude, parser.AgentPiebald)
+	env := setupFocusedTestEnv(
+		t, parser.AgentClaude, parser.AgentForge, parser.AgentPiebald,
+	)
 
 	msg := testjsonl.NewSessionBuilder().
 		AddClaudeUser(tsZero, "msg").
@@ -4401,6 +4704,14 @@ func TestSyncEngineProgress(t *testing.T) {
 	}
 	piebald := createPiebaldDB(t, env.piebaldDir)
 	piebald.addChat(t, 42, "Piebald", "Prompt.", "Answer.", "2026-05-01T10:05:00Z")
+	forge := createForgeDB(t, env.forgeDir)
+	forge.addConversation(
+		t, "progress-forge", "Forge Progress",
+		forgeTestContext("Forge prompt.", "Forge answer."),
+		"2026-05-02 09:58:15.741021507",
+		"2026-05-02 10:00:16.848497543",
+		`{"input_tokens":100,"output_tokens":10,"cached_input_tokens":20}`,
+	)
 
 	var progressCalls int
 	var firstTotal int
@@ -4426,9 +4737,9 @@ func TestSyncEngineProgress(t *testing.T) {
 	assert.NotZero(t, progressCalls, "expected progress callbacks")
 	assert.Equal(t, 3, firstTotal,
 		"the initial total contains file sources before streamed DB discovery")
-	assert.Equal(t, 4, last.SessionsDone, "last progress = %d/%d, want 4/4", last.SessionsDone, last.SessionsTotal)
-	assert.Equal(t, 4, last.SessionsTotal, "last progress = %d/%d, want 4/4", last.SessionsDone, last.SessionsTotal)
-	requireProgressDoneOnce(t, events, 4)
+	assert.Equal(t, 5, last.SessionsDone, "last progress = %d/%d, want 5/5", last.SessionsDone, last.SessionsTotal)
+	assert.Equal(t, 5, last.SessionsTotal, "last progress = %d/%d, want 5/5", last.SessionsDone, last.SessionsTotal)
+	requireProgressDoneOnce(t, events, 5)
 	require.NotEmpty(t, seenCurrent.Phase, "expected progress to be observed")
 	_, ok := env.engine.CurrentProgress()
 	assert.False(t, ok, "CurrentProgress should be cleared after sync")
@@ -4449,9 +4760,9 @@ func TestSyncEngineProgress(t *testing.T) {
 	assert.NotZero(t, progressCalls, "expected progress callbacks on second sync")
 	assert.Equal(t, 3, firstTotal,
 		"the initial total contains file sources before streamed DB discovery")
-	assert.Equal(t, 4, last.SessionsDone, "second last progress = %d/%d, want 4/4", last.SessionsDone, last.SessionsTotal)
-	assert.Equal(t, 4, last.SessionsTotal, "second last progress = %d/%d, want 4/4", last.SessionsDone, last.SessionsTotal)
-	requireProgressDoneOnce(t, events, 4)
+	assert.Equal(t, 5, last.SessionsDone, "second last progress = %d/%d, want 5/5", last.SessionsDone, last.SessionsTotal)
+	assert.Equal(t, 5, last.SessionsTotal, "second last progress = %d/%d, want 5/5", last.SessionsDone, last.SessionsTotal)
+	requireProgressDoneOnce(t, events, 5)
 
 	env.engine.SyncPaths([]string{firstClaudePath})
 	_, ok = env.engine.CurrentProgress()
@@ -4462,6 +4773,33 @@ func TestSyncEngineProgress(t *testing.T) {
 		resyncEvents = append(resyncEvents, p)
 	})
 	require.False(t, stats.Aborted, "resync aborted: %+v", stats.Warnings)
+	var finalizingDetails []string
+	finalizingStarted := false
+	for _, event := range resyncEvents {
+		if finalizingStarted {
+			assert.NotEqual(t, sync.PhaseSyncing, event.Phase,
+				"bulk provider progress must not replace finalization status")
+		}
+		if event.Phase != sync.PhaseFinalizing {
+			continue
+		}
+		finalizingStarted = true
+		assert.True(t, event.Resync)
+		assert.Zero(t, event.SessionsTotal)
+		assert.Zero(t, event.SessionsDone)
+		assert.Zero(t, event.MessagesIndexed)
+		finalizingDetails = append(finalizingDetails, event.Detail)
+	}
+	assert.Equal(t, []string{
+		"Finalizing sync: committing session writes",
+		"Finalizing sync: saving session source state",
+		"Finalizing sync: linking file-backed subagent sessions",
+		"Finalizing sync: repairing subagent relationships",
+		"Finalizing sync: releasing parsed-session memory",
+		"Finalizing sync: checking database-backed sessions",
+		"Finalizing sync: linking all subagent sessions",
+		"Finalizing sync: saving the skip cache",
+	}, finalizingDetails)
 
 	if env.db.HasFTS() {
 		var fts sync.Progress
@@ -5393,6 +5731,65 @@ func TestSyncPathsGeminiJSONL(t *testing.T) {
 		},
 	)
 	assertSessionMessageCount(t, env.db, "gemini:"+sessionID, 2)
+}
+
+func TestReconcileGeminiMissingSessionIDDoesNotBlockHealthySources(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentGemini)
+	hash := "abcdef1234567890"
+	damagedPath := env.writeGeminiSession(
+		t,
+		filepath.Join(
+			"tmp", hash, "chats",
+			"session-missing-id.jsonl",
+		),
+		strings.Join([]string{
+			`{"sessionId":"reconcile-damaged","projectHash":"` + hash + `","startTime":"` + tsEarly + `","lastUpdated":"` + tsEarlyS5 + `","kind":"main"}`,
+			`{"id":"m1","timestamp":"` + tsEarly + `","type":"user","content":[{"text":"archived prompt"}]}`,
+		}, "\n"),
+	)
+	initial := env.engine.SyncAll(t.Context(), nil)
+	require.Zero(t, initial.Failed)
+	assertSessionMessageCount(t, env.db, "gemini:reconcile-damaged", 1)
+
+	require.NoError(t, os.WriteFile(
+		damagedPath,
+		[]byte(strings.Join([]string{
+			`{"id":"m1","timestamp":"` + tsEarly + `","type":"user","content":[{"text":"orphaned prompt"}]}`,
+			`{"id":"m2","timestamp":"` + tsEarlyS5 + `","type":"gemini","content":"orphaned reply"}`,
+		}, "\n")),
+		0o600,
+	))
+	validPath := env.writeGeminiSession(
+		t,
+		filepath.Join(
+			"tmp", hash, "chats",
+			"session-valid.jsonl",
+		),
+		strings.Join([]string{
+			`{"sessionId":"reconcile-valid","projectHash":"` + hash + `","startTime":"` + tsEarly + `","lastUpdated":"` + tsEarlyS5 + `","kind":"main"}`,
+			`{"id":"m1","timestamp":"` + tsEarly + `","type":"user","content":[{"text":"healthy prompt"}]}`,
+		}, "\n"),
+	)
+
+	reconcile := func() {
+		t.Helper()
+		err := env.engine.ReconcileWatchRoots(
+			t.Context(), []string{env.geminiDir}, false,
+		)
+		require.NoError(t, err)
+		result := env.engine.LastReconciliationResult()
+		assert.True(t, result.Complete)
+		assert.Zero(t, result.ProviderFailures)
+	}
+
+	reconcile()
+	assertSessionMessageCount(t, env.db, "gemini:reconcile-valid", 1)
+	assertSessionMessageCount(t, env.db, "gemini:reconcile-damaged", 1)
+
+	reconcile()
+	assertSessionMessageCount(t, env.db, "gemini:reconcile-damaged", 1)
+	assert.FileExists(t, damagedPath)
+	assert.FileExists(t, validPath)
 }
 
 func TestSyncPathsGeminiProjectMetadataEventRefreshesProject(t *testing.T) {
@@ -6363,7 +6760,7 @@ func TestReconcileWatchRootsCodexPreservesLiveDuplicateOfRemovedArchivedCopy(
 	))
 	tombstoned, err := env.db.GetSession(t.Context(), "codex:"+uuid)
 	require.NoError(t, err)
-	assert.Nil(t, tombstoned,
+	assert.NotNil(t, tombstoned,
 		"deleting the last on-disk copy must still tombstone the session")
 }
 
@@ -6436,7 +6833,7 @@ func TestReconcileWatchRootsCodexReplacementIndexBuildsOncePerPass(
 			for i := 1; i < 3; i++ {
 				gone, err := env.db.GetSession(t.Context(), "codex:"+uuidFor(i))
 				require.NoError(t, err)
-				assert.Nil(t, gone,
+				assert.NotNil(t, gone,
 					"sessions with no surviving copy must tombstone")
 			}
 			result := env.engine.LastReconciliationResult()
@@ -16227,10 +16624,10 @@ func TestRestartedEngineCodexIndexRenameNotMaskedByStatDigest(t *testing.T) {
 // transcript (e.g. a fork branch an older parser split out) makes the
 // path map to multiple DB sessions, so GetSessionForIncremental declines
 // and every append full-parses the whole file, forever — re-parsing can
-// never re-emit the stale ID. A complete full parse must tombstone such
-// rows as source-missing so the incremental path recovers; a later parse
-// that re-emits the ID revives the row.
-func TestSyncAllTombstonesStaleClaudeForkRow(t *testing.T) {
+// never re-emit the stale ID. A complete full parse must mark such rows
+// source-missing so the incremental path recovers. A later parse that re-emits
+// the ID clears that source state.
+func TestSyncAllMarksStaleClaudeForkSourceMissing(t *testing.T) {
 	env := setupTestEnv(t)
 	content := testjsonl.NewSessionBuilder().
 		AddClaudeUser(tsEarly, "hello there", "/workspace/api").
@@ -16281,14 +16678,13 @@ func TestSyncAllTombstonesStaleClaudeForkRow(t *testing.T) {
 	))
 	require.Equal(t, 1, env.engine.SyncAll(t.Context(), nil).Synced)
 
-	var deletedAt, cause sql.NullString
+	var deletedAt, sourceMissingAt sql.NullString
 	require.NoError(t, env.db.Reader().QueryRow(
-		`SELECT deleted_at, deletion_cause FROM sessions WHERE id = ?`,
+		`SELECT deleted_at, source_missing_at FROM sessions WHERE id = ?`,
 		staleID,
-	).Scan(&deletedAt, &cause), "query stale fork row")
-	assert.True(t, deletedAt.Valid,
-		"stale fork row should be tombstoned as source-missing")
-	assert.Equal(t, "source_missing", cause.String)
+	).Scan(&deletedAt, &sourceMissingAt), "query stale fork row")
+	assert.False(t, deletedAt.Valid)
+	assert.True(t, sourceMissingAt.Valid)
 
 	// With the transcript mapping to a single active session again, the
 	// next append stays on the incremental path instead of re-parsing
@@ -16348,11 +16744,7 @@ func TestSyncAllRetriesStaleClaudeForkCleanupAfterEstablishingBaseline(
 	require.Zero(t, second.Failed)
 	stale, err = env.db.GetSessionFull(t.Context(), staleID)
 	require.NoError(t, err)
-	require.NotNil(t, stale)
-	require.NotNil(t, stale.DeletedAt,
-		"the second pass must retry and tombstone the stale fork")
-	require.NotNil(t, stale.DeletionCause)
-	assert.Equal(t, "source_missing", *stale.DeletionCause)
+	assertSourceMissingState(t, stale)
 }
 
 func TestSyncAllTombstonesStaleClaudeForkAfterZeroResultParse(t *testing.T) {
@@ -16395,14 +16787,13 @@ func TestSyncAllTombstonesStaleClaudeForkAfterZeroResultParse(t *testing.T) {
 	assert.Equal(t, 1, stats.Synced,
 		"the original session should sync while the replay is excluded")
 
-	var deletedAt, cause sql.NullString
+	var deletedAt, sourceMissingAt sql.NullString
 	require.NoError(t, env.db.Reader().QueryRow(
-		`SELECT deleted_at, deletion_cause FROM sessions WHERE id = ?`,
+		`SELECT deleted_at, source_missing_at FROM sessions WHERE id = ?`,
 		legacyForkID,
-	).Scan(&deletedAt, &cause), "query legacy fork row")
-	assert.True(t, deletedAt.Valid,
-		"legacy fork should be tombstoned after a complete zero-result parse")
-	assert.Equal(t, "source_missing", cause.String)
+	).Scan(&deletedAt, &sourceMissingAt), "query legacy fork row")
+	assert.False(t, deletedAt.Valid)
+	assert.True(t, sourceMissingAt.Valid)
 
 	steady := env.engine.SyncAll(t.Context(), nil)
 	require.Zero(t, steady.Failed)
@@ -16483,9 +16874,7 @@ func TestFullSyncEntryPointsEmitForZeroResultClaudeForkTombstone(t *testing.T) {
 				"a member-only tombstone must notify connected clients")
 			stale, err := env.db.GetSessionFull(t.Context(), staleID)
 			require.NoError(t, err)
-			require.NotNil(t, stale)
-			require.NotNil(t, stale.DeletionCause)
-			assert.Equal(t, "source_missing", *stale.DeletionCause)
+			assertSourceMissingState(t, stale)
 		})
 	}
 }

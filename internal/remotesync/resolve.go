@@ -2,6 +2,7 @@ package remotesync
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,7 +13,15 @@ import (
 	"go.kenn.io/agentsview/internal/parser"
 )
 
-func ResolveTargets(cfg config.Config) TargetSet {
+// ResolveTargets resolves the advertised target set for every
+// configured agent. A resolution error (an unreadable root, a failed
+// provider discovery) fails the whole resolution rather than silently
+// narrowing the target set: an agent that vanishes from the response
+// looks identical to an uninstalled agent, so the client would evict
+// its entire mirror subtree and re-transfer everything once the error
+// clears. Failing closed matches how manifest walks already treat
+// read errors under dir-scoped roots.
+func ResolveTargets(cfg config.Config) (TargetSet, error) {
 	dirs := make(map[parser.AgentType][]string)
 	files := make(map[parser.AgentType][]string)
 	providerExtraFiles := make(map[parser.AgentType][]string)
@@ -50,7 +59,10 @@ func ResolveTargets(cfg config.Config) TargetSet {
 				continue
 			}
 			if def.Type == parser.AgentAider {
-				targets := resolveAiderTargets(dir)
+				targets, err := resolveAiderTargets(dir)
+				if err != nil {
+					return TargetSet{}, err
+				}
 				if len(targets) > 0 {
 					dirs[def.Type] = append(dirs[def.Type], targets...)
 				}
@@ -65,7 +77,10 @@ func ResolveTargets(cfg config.Config) TargetSet {
 				continue
 			}
 			if def.Type == parser.AgentRooCode {
-				root, targetFiles := resolveRooCodeTarget(dir)
+				root, targetFiles, err := resolveRooCodeTarget(dir)
+				if err != nil {
+					return TargetSet{}, err
+				}
 				if root != "" && len(targetFiles) > 0 {
 					dirs[def.Type] = append(dirs[def.Type], root)
 					files[def.Type] = append(files[def.Type], targetFiles...)
@@ -73,7 +88,10 @@ func ResolveTargets(cfg config.Config) TargetSet {
 				continue
 			}
 			if def.Type == parser.AgentKiloLegacy {
-				root, targetFiles := resolveKiloLegacyTarget(dir)
+				root, targetFiles, err := resolveKiloLegacyTarget(dir)
+				if err != nil {
+					return TargetSet{}, err
+				}
 				if root != "" && len(targetFiles) > 0 {
 					dirs[def.Type] = append(dirs[def.Type], root)
 					files[def.Type] = append(files[def.Type], targetFiles...)
@@ -84,6 +102,31 @@ func ResolveTargets(cfg config.Config) TargetSet {
 				target := resolvePoolsideTarget(dir)
 				if target != "" {
 					dirs[def.Type] = append(dirs[def.Type], target)
+				}
+				continue
+			}
+			if emptyFileScopeAgent(def.Type) {
+				root, targetFiles, err := resolveEditorTarget(def.Type, dir)
+				if err != nil {
+					return TargetSet{}, err
+				}
+				if root != "" {
+					dirs[def.Type] = append(dirs[def.Type], root)
+					if _, exists := files[def.Type]; !exists {
+						files[def.Type] = []string{}
+					}
+					files[def.Type] = append(files[def.Type], targetFiles...)
+				}
+				continue
+			}
+			if def.Type == parser.AgentZed {
+				root, targetFiles, err := resolveZedTarget(dir)
+				if err != nil {
+					return TargetSet{}, err
+				}
+				if root != "" {
+					dirs[def.Type] = append(dirs[def.Type], root)
+					files[def.Type] = append(files[def.Type], targetFiles...)
 				}
 				continue
 			}
@@ -106,7 +149,92 @@ func ResolveTargets(cfg config.Config) TargetSet {
 	return filterForbiddenTargets(TargetSet{
 		Dirs: dirs, Files: files, ProviderExtraFiles: providerExtraFiles,
 		ForbiddenRoots: forbiddenRoots,
+	}), nil
+}
+
+// resolveEditorTarget asks the parser for the exact session files it would
+// consume, then adds only the workspace manifest needed to preserve project
+// attribution. The configured editor root remains the authorization boundary.
+func resolveEditorTarget(agent parser.AgentType, root string) (string, []string, error) {
+	root = filepath.Clean(root)
+	ok, err := curatedRoot(root)
+	if err != nil || !ok {
+		return "", nil, err
+	}
+	provider, ok := parser.NewProvider(agent, parser.ProviderConfig{Roots: []string{root}})
+	if !ok {
+		return "", nil, nil
+	}
+	sources, err := discoverProviderSources(provider)
+	if err != nil {
+		return "", nil, fmt.Errorf("discover %s remote sync targets under %q: %w",
+			agent, root, err)
+	}
+	seen := make(map[string]struct{})
+	var files []string
+	for _, source := range sources {
+		path := providerDiscoveredPath(source)
+		if path == "" {
+			continue
+		}
+		regular, err := regularCuratedFile(root, path)
+		if err != nil {
+			return "", nil, err
+		}
+		if !regular {
+			continue
+		}
+		if _, exists := seen[path]; !exists {
+			seen[path] = struct{}{}
+			files = append(files, path)
+		}
+		if agent != parser.AgentVSCodeCopilot {
+			continue
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil || filepath.IsAbs(rel) {
+			continue
+		}
+		parts := strings.Split(filepath.ToSlash(rel), "/")
+		if len(parts) != 4 || parts[0] != "workspaceStorage" ||
+			parts[2] != "chatSessions" {
+			continue
+		}
+		workspace := filepath.Join(root, "workspaceStorage", parts[1], "workspace.json")
+		regular, err = regularCuratedFile(root, workspace)
+		if err != nil {
+			return "", nil, err
+		}
+		if regular {
+			if _, exists := seen[workspace]; !exists {
+				seen[workspace] = struct{}{}
+				files = append(files, workspace)
+			}
+		}
+	}
+	sort.Strings(files)
+	return root, files, nil
+}
+
+// discoverProviderSources prefers the streaming discovery path the
+// sync engine uses. Unlike some batch Discover implementations, which
+// convert traversal failures into an authoritative empty enumeration,
+// DiscoverEach propagates them, so an unreadable root cannot resolve
+// to an empty curated target and evict the client's mirror.
+func discoverProviderSources(provider parser.Provider) ([]parser.SourceRef, error) {
+	streamer, ok := provider.(parser.StreamingDiscoverer)
+	if !ok {
+		return provider.Discover(context.Background())
+	}
+	var sources []parser.SourceRef
+	err := streamer.DiscoverEach(context.Background(), func(source parser.SourceRef) error {
+		sources = append(sources, source)
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return sources, nil
 }
 
 func isLocalRemoteSyncSource(
@@ -130,9 +258,9 @@ func filterForbiddenTargets(t TargetSet) TargetSet {
 		return t
 	}
 	forbidden := newForbiddenRootMatcher(t.ForbiddenRoots)
-	fileScoped := make(map[parser.AgentType]bool, len(t.Files))
+	fileScopedAgents := make(map[parser.AgentType]struct{}, len(t.Files))
 	for agent := range t.Files {
-		fileScoped[agent] = true
+		fileScopedAgents[agent] = struct{}{}
 	}
 	for agent, dirs := range t.Dirs {
 		kept := withoutForbidden(dirs, forbidden)
@@ -145,7 +273,11 @@ func filterForbiddenTargets(t TargetSet) TargetSet {
 	for agent, files := range t.Files {
 		kept := withoutForbidden(files, forbidden)
 		if len(kept) == 0 {
-			delete(t.Files, agent)
+			if _, hasDirs := t.Dirs[agent]; hasDirs && emptyFileScopeAgent(agent) {
+				t.Files[agent] = []string{}
+			} else {
+				delete(t.Files, agent)
+			}
 			continue
 		}
 		t.Files[agent] = kept
@@ -153,10 +285,14 @@ func filterForbiddenTargets(t TargetSet) TargetSet {
 	// A file-scoped agent's root is only safe to advertise alongside its
 	// curated file list; if filtering removed either half, drop both so the
 	// agent cannot degrade to a raw directory target.
-	for agent := range fileScoped {
-		_, hasDirs := t.Dirs[agent]
+	for agent := range fileScopedAgents {
 		_, hasFiles := t.Files[agent]
-		if hasDirs != hasFiles {
+		if !hasFiles || !t.isFileScoped(agent) {
+			delete(t.Dirs, agent)
+			delete(t.Files, agent)
+			continue
+		}
+		if _, hasDirs := t.Dirs[agent]; !hasDirs {
 			delete(t.Dirs, agent)
 			delete(t.Files, agent)
 		}
@@ -301,19 +437,23 @@ func resolveAgentHasOnDiskSource(def parser.AgentDef) bool {
 	}
 }
 
-func resolveAiderTargets(root string) []string {
+func resolveAiderTargets(root string) ([]string, error) {
 	if isAiderUnsafeRoot(root) {
-		return nil
+		return nil, nil
 	}
 	provider, ok := parser.NewProvider(parser.AgentAider, parser.ProviderConfig{
 		Roots: []string{root},
 	})
 	if !ok {
-		return nil
+		return nil, nil
 	}
+	// Aider stays on batch Discover: its streaming enumeration yields
+	// different source references than the batch path this resolver's
+	// history-file filter matches.
 	sources, err := provider.Discover(context.Background())
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("discover aider remote sync targets under %q: %w",
+			root, err)
 	}
 	out := make([]string, 0, len(sources))
 	for _, source := range sources {
@@ -322,7 +462,7 @@ func resolveAiderTargets(root string) []string {
 			out = append(out, path)
 		}
 	}
-	return out
+	return out, nil
 }
 
 func resolveWindsurfTarget(root string) (string, []string) {
@@ -345,37 +485,50 @@ func resolveWindsurfTarget(root string) (string, []string) {
 // caches, and checkpoints — none of which may be archived. Only the
 // discovered tasks/<id>/history_item.json files and their
 // ui_messages.json siblings are exported.
-func resolveRooCodeTarget(root string) (string, []string) {
+func resolveRooCodeTarget(root string) (string, []string, error) {
 	targetRoot := filepath.Clean(root)
-	if info, err := os.Stat(targetRoot); err != nil || !info.IsDir() {
-		return "", nil
+	ok, err := statCuratedDir(targetRoot)
+	if err != nil || !ok {
+		return "", nil, err
 	}
 	provider, ok := parser.NewProvider(parser.AgentRooCode, parser.ProviderConfig{
 		Roots: []string{targetRoot},
 	})
 	if !ok {
-		return "", nil
+		return "", nil, nil
 	}
-	sources, err := provider.Discover(context.Background())
+	sources, err := discoverProviderSources(provider)
 	if err != nil {
-		return "", nil
+		return "", nil, fmt.Errorf("discover roocode remote sync targets under %q: %w",
+			targetRoot, err)
 	}
 	var files []string
 	for _, source := range sources {
 		historyPath := providerDiscoveredPath(source)
-		if historyPath == "" || !regularRemoteSyncFile(historyPath) {
+		if historyPath == "" {
+			continue
+		}
+		regular, err := statRegularRemoteSyncFile(historyPath)
+		if err != nil {
+			return "", nil, err
+		}
+		if !regular {
 			continue
 		}
 		files = append(files, historyPath)
 		msgPath := filepath.Join(filepath.Dir(historyPath), "ui_messages.json")
-		if regularRemoteSyncFile(msgPath) {
+		regular, err = statRegularRemoteSyncFile(msgPath)
+		if err != nil {
+			return "", nil, err
+		}
+		if regular {
 			files = append(files, msgPath)
 		}
 	}
 	if len(files) == 0 {
-		return "", nil
+		return "", nil, nil
 	}
-	return targetRoot, files
+	return targetRoot, files, nil
 }
 
 // resolveKiloLegacyTarget resolves a Kilo Legacy globalStorage root to
@@ -383,25 +536,34 @@ func resolveRooCodeTarget(root string) (string, []string) {
 // api_conversation_history.json). This avoids recursively transferring
 // the entire globalStorage directory, which can contain MCP settings,
 // API credentials, caches, and other unrelated data.
-func resolveKiloLegacyTarget(root string) (string, []string) {
+func resolveKiloLegacyTarget(root string) (string, []string, error) {
 	targetRoot := filepath.Clean(root)
-	if info, err := os.Stat(targetRoot); err != nil || !info.IsDir() {
-		return "", nil
+	ok, err := statCuratedDir(targetRoot)
+	if err != nil || !ok {
+		return "", nil, err
 	}
 	provider, ok := parser.NewProvider(parser.AgentKiloLegacy, parser.ProviderConfig{
 		Roots: []string{targetRoot},
 	})
 	if !ok {
-		return "", nil
+		return "", nil, nil
 	}
-	sources, err := provider.Discover(context.Background())
+	sources, err := discoverProviderSources(provider)
 	if err != nil {
-		return "", nil
+		return "", nil, fmt.Errorf("discover kilo legacy remote sync targets under %q: %w",
+			targetRoot, err)
 	}
 	var files []string
 	for _, source := range sources {
 		metadataPath := providerDiscoveredPath(source)
-		if metadataPath == "" || !regularRemoteSyncFile(metadataPath) {
+		if metadataPath == "" {
+			continue
+		}
+		regular, err := statRegularRemoteSyncFile(metadataPath)
+		if err != nil {
+			return "", nil, err
+		}
+		if !regular {
 			continue
 		}
 		files = append(files, metadataPath)
@@ -411,15 +573,105 @@ func resolveKiloLegacyTarget(root string) (string, []string) {
 			"api_conversation_history.json",
 		} {
 			sibPath := filepath.Join(taskDir, name)
-			if regularRemoteSyncFile(sibPath) {
+			regular, err := statRegularRemoteSyncFile(sibPath)
+			if err != nil {
+				return "", nil, err
+			}
+			if regular {
 				files = append(files, sibPath)
 			}
 		}
 	}
 	if len(files) == 0 {
-		return "", nil
+		return "", nil, nil
 	}
-	return targetRoot, files
+	return targetRoot, files, nil
+}
+
+// curatedRoot reports whether root is a plain directory that may
+// anchor a curated target. A missing or non-directory root is a
+// legitimately absent target; any other stat failure propagates so an
+// unreadable root cannot masquerade as an uninstalled agent.
+func curatedRoot(root string) (bool, error) {
+	info, err := os.Lstat(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat remote sync root %q: %w", root, err)
+	}
+	return info.IsDir() && info.Mode()&os.ModeSymlink == 0, nil
+}
+
+// statCuratedDir is curatedRoot for resolvers that historically follow
+// symlinked roots (RooCode, Kilo Legacy): same error contract, but the
+// symlink target's type decides.
+func statCuratedDir(root string) (bool, error) {
+	info, err := os.Stat(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat remote sync root %q: %w", root, err)
+	}
+	return info.IsDir(), nil
+}
+
+func regularCuratedFile(root, path string) (bool, error) {
+	path = filepath.Clean(path)
+	rel, err := filepath.Rel(root, path)
+	if err != nil || !filepath.IsLocal(rel) || symlinkEscapesRoot(root, path) {
+		return false, nil
+	}
+	return statRegularRemoteSyncFile(path)
+}
+
+// statRegularRemoteSyncFile applies the curated-resolver error
+// contract to one selected file: a missing file is an omitted target,
+// while any other stat failure propagates so it cannot silently
+// shrink the curated set and evict the client's mirror copies.
+func statRegularRemoteSyncFile(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat remote sync target %q: %w", path, err)
+	}
+	return info.Mode().IsRegular(), nil
+}
+
+func resolveZedTarget(root string) (string, []string, error) {
+	root = filepath.Clean(root)
+	ok, err := curatedRoot(root)
+	if err != nil || !ok {
+		return "", nil, err
+	}
+	dbPath := filepath.Join(root, parser.ZedThreadsDBRelPath)
+	ok, err = curatedFileOrMissing(root, dbPath)
+	if err != nil || !ok {
+		return "", nil, err
+	}
+	return root, []string{dbPath}, nil
+}
+
+// curatedFileOrMissing retains a selected leaf through a deletion race so the
+// manifest can omit it and the mirror can evict its stale copy. A stat
+// failure other than absence propagates like curatedRoot's.
+func curatedFileOrMissing(root, path string) (bool, error) {
+	path = filepath.Clean(path)
+	rel, err := filepath.Rel(root, path)
+	if err != nil || !filepath.IsLocal(rel) || symlinkEscapesRoot(root, path) {
+		return false, nil
+	}
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("stat remote sync target %q: %w", path, err)
+	}
+	return info.Mode().IsRegular(), nil
 }
 
 // resolvePoolsideTarget narrows a Poolside application-data root to
@@ -516,10 +768,18 @@ func SelectAllowedTargets(allowed TargetSet, requested TargetSet) (TargetSet, bo
 	forbidden := newForbiddenRootMatcher(selected.ForbiddenRoots)
 	for agent, dirs := range requested.Dirs {
 		allowedDirs := allowed.Dirs[agent]
-		if _, fileScoped := allowed.Files[agent]; fileScoped {
-			requestedFiles, ok := requested.Files[agent]
-			if !ok || len(requestedFiles) == 0 {
-				return TargetSet{}, false
+		fileScoped := allowed.isFileScoped(agent)
+		if fileScoped {
+			// A request that names the directory without any curated
+			// files would select an empty manifest and evict the
+			// client's mirror even while sessions exist. Accept it
+			// only when the fresh curated scope is itself empty.
+			if requestedFiles, ok := requested.Files[agent]; !ok || len(requestedFiles) == 0 {
+				emptyScope := emptyFileScopeAgent(agent) &&
+					len(allowed.Files[agent]) == 0
+				if !emptyScope {
+					return TargetSet{}, false
+				}
 			}
 		}
 		for _, dir := range dirs {
@@ -532,26 +792,27 @@ func SelectAllowedTargets(allowed TargetSet, requested TargetSet) (TargetSet, bo
 			}
 			selected.Dirs[agent] = append(selected.Dirs[agent], selectedDir)
 		}
+		if fileScoped {
+			if selected.Files == nil {
+				selected.Files = make(map[parser.AgentType][]string)
+			}
+			if _, ok := selected.Files[agent]; !ok {
+				selected.Files[agent] = []string{}
+			}
+		}
 	}
 	for agent, files := range requested.Files {
-		allowedFiles, ok := allowed.Files[agent]
-		if !ok {
-			return TargetSet{}, false
-		}
+		allowedFiles := allowed.Files[agent]
 		for _, file := range files {
 			selectedFile, ok := selectAllowedString(allowedFiles, file)
 			if !ok {
-				// Targets are re-resolved for every request, so a
-				// session file deleted between the client's target
-				// fetch and this request is no longer in the fresh
-				// resolution. Failing the whole request would abort
-				// the sync over a routine deletion race; the archive
-				// writers tolerate missing files, so authorize
-				// session-shaped paths under a still-allowed root.
-				if !verbatimSessionFileUnderAllowedRoot(allowed, agent, file) {
+				if !authorizedStaleCuratedFile(allowed, forbidden, agent, file, files) {
 					return TargetSet{}, false
 				}
-				selectedFile = file
+				// A stale curated reference is authorized but omitted, so
+				// the manifest built from the selection agrees the file is
+				// gone and the client mirror evicts its copy.
+				continue
 			}
 			if selected.Files == nil {
 				selected.Files = make(map[parser.AgentType][]string)
@@ -644,17 +905,21 @@ func kiloLegacySessionFileShape(rel string) bool {
 	return false
 }
 
-// verbatimSessionFileUnderAllowedRoot authorizes a session-shaped file
-// under a verbatim file-scoped agent's still-allowed root when the
-// file itself is absent from the fresh per-request resolution — the
-// deletion race between a client's target fetch and its next request.
-// The strict shape keeps everything else under the root
-// (settings/mcp_settings.json, checkpoints, caches) unreachable, and
-// the symlink walk rejects components that would escape the root.
-func verbatimSessionFileUnderAllowedRoot(
-	allowed TargetSet, agent parser.AgentType, file string,
+// authorizedStaleCuratedFile reports whether a curated file request
+// that missed the fresh per-request resolution is still authorized
+// under a verbatim or snapshot file-scoped agent's allowed root — the
+// deletion race between a client's target fetch and its next request,
+// or a discovery preference flip (Cursor and VS Code prefer one
+// transcript extension over its sibling). An authorized stale file is
+// always omitted from the selection, never streamed: the strict shape
+// keeps everything else under the root (settings/mcp_settings.json,
+// checkpoints, caches) unreachable, and the symlink walk rejects
+// components that would escape the root.
+func authorizedStaleCuratedFile(
+	allowed TargetSet, forbidden forbiddenRootMatcher, agent parser.AgentType,
+	file string, requestedFiles []string,
 ) bool {
-	if !verbatimFileScopedAgent(agent) {
+	if !verbatimFileScopedAgent(agent) && !snapshotFileScopedAgent(agent) {
 		return false
 	}
 	if !isAbsRemotePath(file) {
@@ -664,6 +929,9 @@ func verbatimSessionFileUnderAllowedRoot(
 		return false
 	}
 	for _, dir := range allowed.Dirs[agent] {
+		if forbidden.within(dir) {
+			continue
+		}
 		if remotePathDialect(file) != remotePathDialect(dir) {
 			continue
 		}
@@ -671,11 +939,89 @@ func verbatimSessionFileUnderAllowedRoot(
 		if !ok || rel == "" {
 			continue
 		}
-		if !sessionFileShape(agent, rel) {
+		if agent == parser.AgentVSCodeCopilot && isVSCodeWorkspaceMetadata(rel) {
+			if !vscodeWorkspaceMetadataTiedToAllowedSession(
+				allowed, dir, file, requestedFiles,
+			) {
+				continue
+			}
+		} else if !sessionFileShape(agent, rel) {
 			continue
 		}
 		if symlinkEscapesRoot(dir, file) {
 			return false
+		}
+		if forbidden.within(file) {
+			return false
+		}
+		info, err := os.Lstat(file)
+		if os.IsNotExist(err) {
+			return true
+		}
+		if err != nil || !info.Mode().IsRegular() {
+			return false
+		}
+		if agent == parser.AgentVSCodeCopilot && isVSCodeWorkspaceMetadata(rel) &&
+			vscodeWorkspaceChatVanished(allowed, forbidden, dir, rel, requestedFiles) {
+			return true
+		}
+		return hasPreferredCuratedSibling(dir, allowed.Files[agent], rel)
+	}
+	return false
+}
+
+func hasPreferredCuratedSibling(root string, allowedFiles []string, rel string) bool {
+	separator := strings.LastIndexByte(rel, '/')
+	dir, name := rel[:separator+1], rel[separator+1:]
+	stem := strings.TrimSuffix(name, filepath.Ext(name))
+	for _, file := range allowedFiles {
+		candidate, ok := remoteArchiveRel(root, file)
+		if !ok {
+			continue
+		}
+		candidateSeparator := strings.LastIndexByte(candidate, '/')
+		candidateDir := candidate[:candidateSeparator+1]
+		candidateName := candidate[candidateSeparator+1:]
+		if candidateDir == dir &&
+			strings.TrimSuffix(candidateName, filepath.Ext(candidateName)) == stem &&
+			filepath.Ext(candidateName) != filepath.Ext(name) {
+			return true
+		}
+	}
+	return false
+}
+
+func vscodeWorkspaceChatVanished(
+	allowed TargetSet, forbidden forbiddenRootMatcher, root, rel string,
+	requestedFiles []string,
+) bool {
+	parts := strings.Split(rel, "/")
+	for _, file := range requestedFiles {
+		chatRel, ok := remoteArchiveRel(root, file)
+		if !ok {
+			continue
+		}
+		chatParts := strings.Split(chatRel, "/")
+		if len(chatParts) != 4 || chatParts[0] != "workspaceStorage" ||
+			chatParts[1] != parts[1] || chatParts[2] != "chatSessions" ||
+			!vscodeChatSessionFileShape(chatParts[3]) {
+			continue
+		}
+		if !isAbsRemotePath(file) || remotePathDialect(file) != remotePathDialect(root) {
+			continue
+		}
+		if _, err := safeRemotePathArchiveName(file); err != nil ||
+			symlinkEscapesRoot(root, file) || forbidden.within(file) {
+			continue
+		}
+		if _, err := os.Lstat(file); !os.IsNotExist(err) {
+			continue
+		}
+		for _, allowedFile := range allowed.Files[parser.AgentVSCodeCopilot] {
+			allowedRel, ok := remoteArchiveRel(root, allowedFile)
+			if ok && strings.HasPrefix(allowedRel, "workspaceStorage/"+parts[1]+"/chatSessions/") {
+				return false
+			}
 		}
 		return true
 	}
@@ -688,9 +1034,70 @@ func sessionFileShape(agent parser.AgentType, rel string) bool {
 	switch agent {
 	case parser.AgentKiloLegacy:
 		return kiloLegacySessionFileShape(rel)
+	case parser.AgentCursor:
+		_, ok := parser.ParseCursorTranscriptRelPath(rel)
+		return ok
+	case parser.AgentVSCodeCopilot:
+		parts := strings.Split(rel, "/")
+		if len(parts) == 4 && parts[0] == "workspaceStorage" &&
+			parts[2] == "chatSessions" {
+			return parser.IsValidSessionID(strings.TrimSuffix(parts[3], filepath.Ext(parts[3]))) &&
+				(filepath.Ext(parts[3]) == ".json" || filepath.Ext(parts[3]) == ".jsonl")
+		}
+		if len(parts) == 3 && parts[0] == "globalStorage" &&
+			(parts[1] == "emptyWindowChatSessions" || parts[1] == "transferredChatSessions") {
+			return parser.IsValidSessionID(strings.TrimSuffix(parts[2], filepath.Ext(parts[2]))) &&
+				(filepath.Ext(parts[2]) == ".json" || filepath.Ext(parts[2]) == ".jsonl")
+		}
+		return false
+	case parser.AgentZed:
+		return filepath.ToSlash(filepath.Clean(rel)) == parser.ZedThreadsDBRelPath
 	default:
 		return rooCodeSessionFileShape(rel)
 	}
+}
+
+func vscodeWorkspaceMetadataTiedToAllowedSession(
+	allowed TargetSet, root, file string, requestedFiles []string,
+) bool {
+	rel, ok := remoteArchiveRel(root, file)
+	if !ok {
+		return false
+	}
+	parts := strings.Split(rel, "/")
+	if !isVSCodeWorkspaceMetadata(rel) {
+		return false
+	}
+	selectedFiles := slices.Concat(
+		allowed.Files[parser.AgentVSCodeCopilot], requestedFiles,
+	)
+	for _, selected := range selectedFiles {
+		selectedRel, ok := remoteArchiveRel(root, selected)
+		if !ok {
+			continue
+		}
+		selectedParts := strings.Split(selectedRel, "/")
+		if len(selectedParts) != 4 || selectedParts[0] != "workspaceStorage" ||
+			selectedParts[1] != parts[1] || selectedParts[2] != "chatSessions" {
+			continue
+		}
+		if vscodeChatSessionFileShape(selectedParts[3]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isVSCodeWorkspaceMetadata(rel string) bool {
+	parts := strings.Split(rel, "/")
+	return len(parts) == 3 && parts[0] == "workspaceStorage" &&
+		parts[1] != "" && parts[2] == "workspace.json"
+}
+
+func vscodeChatSessionFileShape(name string) bool {
+	ext := filepath.Ext(name)
+	return (ext == ".json" || ext == ".jsonl") &&
+		parser.IsValidSessionID(strings.TrimSuffix(name, ext))
 }
 
 func isAiderUnsafeRoot(dir string) bool {
@@ -719,11 +1126,13 @@ func SelectAllowedFiles(allowed TargetSet, files []string) ([]string, bool) {
 	forbidden := newForbiddenRootMatcher(allowed.ForbiddenRoots)
 	selected := make([]string, 0, len(files))
 	for _, file := range files {
-		canonical, ok := selectAllowedFile(allowed, forbidden, file)
+		canonical, ok := selectAllowedFile(allowed, forbidden, file, files)
 		if !ok {
 			return nil, false
 		}
-		selected = append(selected, canonical)
+		if canonical != "" {
+			selected = append(selected, canonical)
+		}
 	}
 	return selected, true
 }
@@ -734,29 +1143,31 @@ func SelectAllowedFiles(allowed TargetSet, files []string) ([]string, bool) {
 // on an unmatched client-supplied path: on Windows a raw request naming
 // \\attacker\share would otherwise force an outbound SMB connection.
 // Every accept path below is either a server-derived string or anchored
-// under a trusted allowed root before the matcher sees it.
+// under a trusted allowed root before the matcher sees it. An empty
+// canonical result with ok=true means the request is authorized but the
+// file is omitted from the delta (a stale curated reference).
 func selectAllowedFile(
 	allowed TargetSet, forbidden forbiddenRootMatcher, file string,
+	requestedFiles []string,
 ) (string, bool) {
 	if canonical, ok := selectAllowedString(allowed.AllExtraFiles(), file); ok {
 		return canonical, !forbidden.within(canonical)
 	}
 	for agent, files := range allowed.Files {
-		if !verbatimFileScopedAgent(agent) {
+		if !verbatimFileScopedAgent(agent) && !snapshotFileScopedAgent(agent) {
 			continue
 		}
-		// Verbatim file-scoped agents (RooCode) delta-stream exactly
+		// Verbatim and snapshot file-scoped agents delta-stream exactly
 		// their curated files; the exact-match requirement keeps
 		// settings and caches under their directory unreachable. A
 		// session-shaped file missing from the fresh resolution is
-		// still authorized (deletion race); WriteArchiveFiles then
-		// skips it because its delta roots come from the same fresh
-		// resolution.
+		// still authorized (deletion race) but omitted, so the delta
+		// archive and manifest agree that the file no longer exists.
 		if canonical, ok := selectAllowedString(files, file); ok {
 			return canonical, !forbidden.within(canonical)
 		}
-		if verbatimSessionFileUnderAllowedRoot(allowed, agent, file) {
-			return file, !forbidden.within(file)
+		if authorizedStaleCuratedFile(allowed, forbidden, agent, file, requestedFiles) {
+			return "", true
 		}
 	}
 	if !isAbsRemotePath(file) {
@@ -766,7 +1177,8 @@ func selectAllowedFile(
 		return "", false
 	}
 	for agent, dirs := range allowed.Dirs {
-		if _, fileScoped := allowed.Files[agent]; fileScoped {
+		if allowed.isFileScoped(agent) ||
+			verbatimFileScopedAgent(agent) || snapshotFileScopedAgent(agent) {
 			// File-scoped agents export a curated file list, not a raw
 			// directory walk. Accepting a delta request by directory
 			// prefix would stream a raw file (an unsanitized

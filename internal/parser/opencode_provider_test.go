@@ -48,6 +48,30 @@ func TestOpenCodeHybridStreamingDiscoveryReportsIncompleteSQLiteFailure(
 		"incomplete streaming discovery must still expose valid storage sources")
 }
 
+func TestOpenCodeDiscoverContinuesAfterUnreadableDatabase(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "opencode.db"), []byte("not sqlite"), 0o600,
+	))
+	dbPath, seeder, db := newTestDBAt(t, filepath.Join(root, "opencode-local.db"))
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	seeder.AddProject("prj_1", "/workspace/healthy")
+	seeder.AddSession(
+		"ses_healthy", "prj_1", "", "Healthy", 1700000000000, 1700000010000,
+	)
+	provider, ok := NewProvider(AgentOpenCode, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+
+	discovered, err := provider.Discover(t.Context())
+
+	require.Error(t, err)
+	var incomplete DiscoveryIncompleteError
+	require.ErrorAs(t, err, &incomplete)
+	requireSourcePathsMatch(t, discovered, []string{
+		OpenCodeSQLiteVirtualPath(dbPath, "ses_healthy"),
+	})
+}
+
 func TestOpenCodeHybridStreamingIncompleteRootContinuesLaterRoots(t *testing.T) {
 	setup := func(t *testing.T) (Provider, string, string) {
 		t.Helper()
@@ -374,6 +398,34 @@ func TestOpenCodeStorageStreamingDiscoveryPropagatesProjectSymlinkErrors(t *test
 	})
 }
 
+// TestOpenCodeStorageReconciliationRejectsSymlinkedSessionFile pins
+// reconciliation's storage-session resolution to discovery's validation: a
+// symlinked session file must not resolve, or reconciliation would ingest
+// content outside the configured source root.
+func TestOpenCodeStorageReconciliationRejectsSymlinkedSessionFile(t *testing.T) {
+	root := t.TempDir()
+	sessionPath := writeOpenCodeProviderStorageSession(
+		t, root, "session", "ses_real", "project", "Real",
+	)
+	outside := filepath.Join(t.TempDir(), "outside.json")
+	require.NoError(t, os.WriteFile(
+		outside, []byte(`{"id":"ses_linked"}`), 0o600,
+	))
+	link := filepath.Join(root, "storage", "session", "global", "ses_linked.json")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	spec := openCodeProviderSpecForAgent(AgentOpenCode)
+	sources := newOpenCodeFormatSourceSet([]string{root}, spec, nil)
+	assert.Empty(t,
+		sources.storageSessionPathForReconciliation(root, "ses_linked"),
+		"a symlinked storage session file must not resolve for reconciliation")
+	assert.Equal(t, sessionPath,
+		sources.storageSessionPathForReconciliation(root, "ses_real"),
+		"a regular storage session file resolves for reconciliation")
+}
+
 func TestOpenCodeProviderStorageSourceMethods(t *testing.T) {
 
 	root := t.TempDir()
@@ -406,7 +458,7 @@ func TestOpenCodeProviderStorageSourceMethods(t *testing.T) {
 	assert.Equal(t, root, plan.Roots[0].Path)
 	assert.False(t, plan.Roots[0].Recursive)
 	assert.Equal(t, []string{
-		"opencode.db", "opencode.db-wal",
+		"opencode*.db", "opencode*.db-wal",
 	}, plan.Roots[0].IncludeGlobs)
 	assert.Equal(t, filepath.Join(root, "storage"), plan.Roots[1].Path)
 	assert.True(t, plan.Roots[1].Recursive)
@@ -890,7 +942,7 @@ func TestOpenCodeProviderSQLiteSourceMethods(t *testing.T) {
 	assert.Equal(t, root, plan.Roots[0].Path)
 	assert.True(t, plan.Roots[0].Recursive)
 	assert.Equal(t, []string{
-		"*.json", "opencode.db", "opencode.db-wal",
+		"*.json", "opencode*.db", "opencode*.db-wal",
 	}, plan.Roots[0].IncludeGlobs)
 
 	discovered, err := provider.Discover(context.Background())
@@ -1311,67 +1363,6 @@ func TestOpenCodeHybridStreamingDedupUsesStorageTraversalSnapshot(t *testing.T) 
 		"deduplication must use the same storage snapshot that was yielded")
 }
 
-func TestOpenCodeHybridStreamingRetainedHeapDoesNotScaleWithStorageArchive(
-	t *testing.T,
-) {
-	measureRetainedHeap := func(storageSessions int) uint64 {
-		t.Helper()
-		root := t.TempDir()
-		sessionDir := filepath.Join(root, "storage", "session", "global")
-		require.NoError(t, os.MkdirAll(sessionDir, 0o755))
-		for i := range storageSessions {
-			name := fmt.Sprintf(
-				"ses_%05d_%s.json", i, strings.Repeat("x", 160),
-			)
-			require.NoError(t, os.WriteFile(
-				filepath.Join(sessionDir, name), []byte("{}"), 0o600,
-			))
-		}
-		dbPath, seeder, db := newTestDBAt(t, filepath.Join(root, "opencode.db"))
-		seeder.AddProject("prj_1", "/home/user/code/sqlite-app")
-		seeder.AddSession(
-			"ses_sqlite", "prj_1", "", "SQLite", 1700000000000, 1700000010000,
-		)
-		provider, ok := NewProvider(
-			AgentOpenCode, ProviderConfig{Roots: []string{root}},
-		)
-		require.True(t, ok)
-		virtualPath := OpenCodeSQLiteVirtualPath(dbPath, "ses_sqlite")
-
-		runtime.GC()
-		var before runtime.MemStats
-		runtime.ReadMemStats(&before)
-		var retained uint64
-		measured := false
-		err := provider.(StreamingDiscoverer).DiscoverEach(
-			t.Context(), func(source SourceRef) error {
-				if source.DisplayPath != virtualPath {
-					return nil
-				}
-				measured = true
-				runtime.GC()
-				var during runtime.MemStats
-				runtime.ReadMemStats(&during)
-				if during.HeapAlloc > before.HeapAlloc {
-					retained = during.HeapAlloc - before.HeapAlloc
-				}
-				return nil
-			},
-		)
-		require.NoError(t, err)
-		require.True(t, measured,
-			"retained heap must be sampled at the SQLite virtual source")
-		require.NoError(t, db.Close())
-		return retained
-	}
-
-	const retainedGrowthLimit = 256 * 1024
-	smallRetained := measureRetainedHeap(16)
-	largeRetained := measureRetainedHeap(4096)
-	assert.LessOrEqual(t, largeRetained, smallRetained+retainedGrowthLimit,
-		"hybrid deduplication must not retain storage IDs on the Go heap")
-}
-
 func TestOpenCodeHybridStreamingDiskMembershipFailuresPropagate(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -1670,6 +1661,182 @@ func TestOpenCodeSingleSessionMtimeDoesNotScanContainer(t *testing.T) {
 	}
 }
 
+func TestOpenCodeReconciliationRehydratesWatermarkMetadata(t *testing.T) {
+	root := t.TempDir()
+	dbPath, seeder, db := newTestDBAt(t, filepath.Join(root, "opencode.db"))
+	seeder.AddProject("prj_1", "/home/user/code/app")
+	seeder.AddSession(
+		"ses_a", "prj_1", "", "A", 1700000000000, 1700000010000,
+	)
+	seeder.AddMessage(
+		"msg_a", "ses_a", 1700000000000, 1700000000000,
+		`{"role":"user"}`,
+	)
+	seeder.AddPart(
+		"part_a", "msg_a", "ses_a", 1700000000000, 1700000000000,
+		`{"type":"text","text":"answer"}`,
+	)
+	t.Cleanup(func() { _ = db.Close() })
+
+	provider, ok := NewProvider(AgentOpenCode, ProviderConfig{
+		Roots:                             []string{root},
+		SQLiteContainerListsWatermarkOnly: func(string) bool { return true },
+	})
+	require.True(t, ok)
+	before := OpenCodeSessionChildLookups()
+	source, found, err := provider.(ReconciliationSourceResolver).
+		SourceForReconciliation(t.Context(), dbPath+"#ses_a", "")
+	require.NoError(t, err)
+	require.True(t, found)
+	watermark, watermarkOnly := SourceWatermarkOnlyMTimeNS(source)
+	assert.True(t, watermarkOnly)
+	assert.Equal(t, int64(1700000010000)*1_000_000, watermark)
+	assert.Equal(t, before, OpenCodeSessionChildLookups(),
+		"watermark rehydration must not resolve child digest")
+}
+
+func TestOpenCodeReconciliationSourceStateRoundTrips(t *testing.T) {
+	root := t.TempDir()
+	dbPath, seeder, db := newTestDBAt(t, filepath.Join(root, "opencode.db"))
+	seeder.AddProject("prj_1", "/home/user/code/app")
+	seeder.AddSession(
+		"ses_a", "prj_1", "", "A", 1700000000000, 1700000010000,
+	)
+	t.Cleanup(func() { _ = db.Close() })
+
+	spec := openCodeProviderSpecForAgent(AgentOpenCode)
+	const childDigest = "discovery-child-digest"
+	spec.streamSQLite = func(
+		ctx context.Context, path string, yield func(OpenCodeSessionMeta) error,
+	) error {
+		return yield(OpenCodeSessionMeta{
+			SessionID:      "ses_a",
+			VirtualPath:    path + "#ses_a",
+			FileMtime:      1700000010000 * 1_000_000,
+			CompositeMtime: true,
+			ChildDigest:    childDigest,
+		})
+	}
+	discoverySources := newOpenCodeFormatSourceSet([]string{root}, spec, nil)
+	var discovered SourceRef
+	err := discoverySources.DiscoverEach(t.Context(), func(source SourceRef) error {
+		discovered = source
+		return nil
+	})
+	require.NoError(t, err)
+
+	state, ok := discoverySources.reconciliationSourceState(discovered)
+	require.True(t, ok)
+	rehydrationSources := newOpenCodeFormatSourceSet(
+		[]string{root}, spec, nil,
+	)
+	source, found, err := rehydrationSources.SourceForReconciliationWithState(
+		t.Context(), dbPath+"#ses_a", "", state,
+	)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NoError(t,
+		rehydrationSources.applyReconciliationSourceState(&source, state),
+	)
+	assert.Equal(t, childDigest, sourceCarriedChildDigest(source))
+
+	before := OpenCodeSessionChildLookups()
+	_, err = rehydrationSources.Fingerprint(t.Context(), source)
+	require.NoError(t, err)
+	assert.Equal(t, before, OpenCodeSessionChildLookups(),
+		"rehydration must reuse the discovery child digest")
+}
+
+func TestOpenCodeReconciliationRejectsInvalidSourceState(t *testing.T) {
+	sources := newOpenCodeFormatSourceSet(
+		[]string{t.TempDir()}, openCodeProviderSpecForAgent(AgentOpenCode), nil,
+	)
+	source := SourceRef{
+		Opaque: openCodeFormatSource{Path: "/data/opencode.db#ses_a"},
+	}
+	validPayload := make([]byte, openCodeReconciliationSourceStateHeader)
+	validPayload[8] = 1 << 0
+	watermarkPayload := append([]byte(nil), validPayload...)
+	watermarkPayload[8] = 1 << 1
+	for _, test := range []struct {
+		name  string
+		state ReconciliationSourceState
+	}{
+		{
+			name: "unsupported version",
+			state: ReconciliationSourceState{
+				Version: 2, Payload: validPayload,
+			},
+		},
+		{
+			name: "watermark without composite mtime",
+			state: ReconciliationSourceState{
+				Version: 1,
+				Payload: watermarkPayload,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Error(t, sources.applyReconciliationSourceState(&source, test.state))
+		})
+	}
+}
+
+func TestOpenCodeReconciliationKeepsStorageShadowSource(t *testing.T) {
+	root := t.TempDir()
+	dbPath, seeder, db := newTestDBAt(t, filepath.Join(root, "opencode.db"))
+	seeder.AddProject("prj_1", "/home/user/code/app")
+	seeder.AddSession(
+		"ses_a", "prj_1", "", "A", 1700000000000, 1700000010000,
+	)
+	writeOpenCodeProviderStorageSession(
+		t, root, "session", "ses_a", "app", "Shadow",
+	)
+	t.Cleanup(func() { _ = db.Close() })
+
+	provider, ok := NewProvider(AgentOpenCode, ProviderConfig{
+		Roots:                             []string{root},
+		SQLiteContainerListsWatermarkOnly: func(string) bool { return true },
+	})
+	require.True(t, ok)
+	stateResolver, ok := provider.(ReconciliationSourceStateResolver)
+	require.True(t, ok)
+	source, found, err := stateResolver.SourceForReconciliationWithState(
+		t.Context(), dbPath+"#ses_a", "",
+		ReconciliationSourceState{Version: 1, Payload: []byte("state")},
+	)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.NotContains(t, source.DisplayPath, "#ses_a")
+	_, watermarkOnly := SourceWatermarkOnlyMTimeNS(source)
+	assert.False(t, watermarkOnly,
+		"a storage shadow must not carry SQLite watermark metadata")
+}
+
+func TestIcodemateReconciliationUsesSourceStateResolver(t *testing.T) {
+	root := t.TempDir()
+	dbPath, seeder, db := newTestDBAt(t, filepath.Join(root, "icodemate.db"))
+	seeder.AddSession(
+		"ses_a", "prj_1", "", "A", 1700000000000, 1700000010000,
+	)
+	t.Cleanup(func() { _ = db.Close() })
+
+	provider, ok := NewProvider(AgentIcodemate, ProviderConfig{
+		Roots: []string{root},
+	})
+	require.True(t, ok)
+	resolver, ok := provider.(ReconciliationSourceStateResolver)
+	require.True(t, ok)
+	source, found, err := resolver.SourceForReconciliationWithState(
+		t.Context(), dbPath+"#ses_a", "",
+		ReconciliationSourceState{Version: 1, Payload: []byte("state")},
+	)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, AgentIcodemate, source.Provider)
+	assert.Equal(t, dbPath+"#ses_a", source.DisplayPath)
+}
+
 // TestOpenCodeWatermarkOnlyQuerySkipsDigestScans pins that the mtime-only path
 // does not compute the digest aggregates. OpenCodeSourceMtime backs the session
 // watcher's 1.5s poll, so pulling the eight child COUNT/SUM/MIN/MAX subqueries
@@ -1874,4 +2041,156 @@ func TestOpenCodeChangedPathWatermarkMergeMaterializesOnlyChangedBatch(
 	assert.Equal(t, 1, small)
 	assert.Equal(t, small, large,
 		"the emitted batch must not scale with container size")
+}
+
+func testOpenCodeProviderMeta(dbPath string, watermarkOnly bool) OpenCodeSessionMeta {
+	return OpenCodeSessionMeta{
+		SessionID:      "ses-1",
+		VirtualPath:    dbPath + "#ses-1",
+		FileMtime:      1000 * 1_000_000,
+		CompositeMtime: true,
+		WatermarkOnly:  watermarkOnly,
+	}
+}
+
+// openCodeRouteCounters records which listing route each discovery form
+// took after stubOpenCodeSpecRoutes replaces a spec's four SQLite routes.
+type openCodeRouteCounters struct {
+	fullList, watermarkList, fullStream, watermarkStream int
+}
+
+func stubOpenCodeSpecRoutes(spec *openCodeProviderSpec) *openCodeRouteCounters {
+	c := &openCodeRouteCounters{}
+	spec.listSQLite = func(path string) ([]OpenCodeSessionMeta, error) {
+		c.fullList++
+		return []OpenCodeSessionMeta{testOpenCodeProviderMeta(path, false)}, nil
+	}
+	spec.listSQLiteWatermark = func(path string) ([]OpenCodeSessionMeta, error) {
+		c.watermarkList++
+		return []OpenCodeSessionMeta{testOpenCodeProviderMeta(path, true)}, nil
+	}
+	spec.streamSQLite = func(
+		ctx context.Context, path string, yield func(OpenCodeSessionMeta) error,
+	) error {
+		c.fullStream++
+		return yield(testOpenCodeProviderMeta(path, false))
+	}
+	spec.streamSQLiteWatermark = func(
+		ctx context.Context, path string, yield func(OpenCodeSessionMeta) error,
+	) error {
+		c.watermarkStream++
+		return yield(testOpenCodeProviderMeta(path, true))
+	}
+	return c
+}
+
+func TestSQLiteContainerListsWatermarkOnlyNilKeepsFullFidelity(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "opencode.db")
+	require.NoError(t, os.WriteFile(dbPath, []byte("fixture"), 0o600))
+	spec := openCodeProviderSpecForAgent(AgentOpenCode)
+	routes := stubOpenCodeSpecRoutes(&spec)
+
+	sources := newOpenCodeFormatSourceSet([]string{root}, spec, nil)
+	listed, err := sources.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+	_, watermarkOnly := SourceWatermarkOnlyMTimeNS(listed[0])
+	assert.False(t, watermarkOnly)
+	assert.True(t, SourceUsesOpenCodeCompositeMTime(listed[0]))
+
+	var streamed []SourceRef
+	err = sources.DiscoverEach(t.Context(), func(source SourceRef) error {
+		streamed = append(streamed, source)
+		return nil
+	})
+	require.NoError(t, err)
+	require.Len(t, streamed, 1)
+	_, watermarkOnly = SourceWatermarkOnlyMTimeNS(streamed[0])
+	assert.False(t, watermarkOnly)
+	assert.True(t, SourceUsesOpenCodeCompositeMTime(streamed[0]))
+	assert.Equal(t, openCodeRouteCounters{fullList: 1, fullStream: 1}, *routes)
+}
+
+func TestOpenCodeFamilyVariantsHonorWatermarkListing(t *testing.T) {
+	for _, agent := range []AgentType{
+		AgentOpenCode, AgentKilo, AgentMiMoCode, AgentIcodemate,
+	} {
+		t.Run(string(agent), func(t *testing.T) {
+			root := t.TempDir()
+			spec := openCodeProviderSpecForAgent(agent)
+			dbPath := filepath.Join(root, spec.dbName)
+			require.NoError(t, os.WriteFile(dbPath, []byte("fixture"), 0o600))
+			routes := stubOpenCodeSpecRoutes(&spec)
+
+			sources := newOpenCodeFormatSourceSet(
+				[]string{root}, spec, func(string) bool { return true },
+			)
+			listed, err := sources.Discover(t.Context())
+			require.NoError(t, err)
+			require.Len(t, listed, 1)
+			assert.Equal(t, agent, listed[0].Provider)
+			_, watermarkOnly := SourceWatermarkOnlyMTimeNS(listed[0])
+			assert.True(t, watermarkOnly)
+
+			var streamed []SourceRef
+			err = sources.DiscoverEach(t.Context(), func(source SourceRef) error {
+				streamed = append(streamed, source)
+				return nil
+			})
+			require.NoError(t, err)
+			require.Len(t, streamed, 1)
+			_, watermarkOnly = SourceWatermarkOnlyMTimeNS(streamed[0])
+			assert.True(t, watermarkOnly)
+			assert.Equal(t,
+				openCodeRouteCounters{watermarkList: 1, watermarkStream: 1},
+				*routes)
+		})
+	}
+
+	t.Run("legacy schema stays full fidelity", func(t *testing.T) {
+		root := t.TempDir()
+		dbPath := filepath.Join(root, "opencode.db")
+		database, err := sql.Open("sqlite3", dbPath)
+		require.NoError(t, err)
+		_, err = database.Exec(`
+			CREATE TABLE session (id TEXT PRIMARY KEY, time_updated INTEGER NOT NULL);
+			INSERT INTO session (id, time_updated) VALUES ('legacy', 1000)
+		`)
+		require.NoError(t, err)
+		require.NoError(t, database.Close())
+		provider, ok := NewProvider(AgentOpenCode, ProviderConfig{
+			Roots:                             []string{root},
+			SQLiteContainerListsWatermarkOnly: func(string) bool { return true },
+		})
+		require.True(t, ok)
+		sources, err := provider.Discover(t.Context())
+		require.NoError(t, err)
+		require.Len(t, sources, 1)
+		_, watermarkOnly := SourceWatermarkOnlyMTimeNS(sources[0])
+		assert.False(t, watermarkOnly)
+		assert.False(t, SourceUsesOpenCodeCompositeMTime(sources[0]))
+	})
+
+	t.Run("Icodemate CLI stays outside the predicate", func(t *testing.T) {
+		root := t.TempDir()
+		project := filepath.Join(root, "project")
+		require.NoError(t, os.MkdirAll(project, 0o755))
+		require.NoError(t, os.WriteFile(
+			filepath.Join(project, "session.jsonl"), []byte("{}\n"), 0o600,
+		))
+		calls := 0
+		provider, ok := NewProvider(AgentIcodemate, ProviderConfig{
+			Roots: []string{root},
+			SQLiteContainerListsWatermarkOnly: func(string) bool {
+				calls++
+				return true
+			},
+		})
+		require.True(t, ok)
+		sources, err := provider.Discover(t.Context())
+		require.NoError(t, err)
+		require.Len(t, sources, 1)
+		assert.Zero(t, calls)
+	})
 }

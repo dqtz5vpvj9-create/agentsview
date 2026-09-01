@@ -1251,6 +1251,72 @@ func TestEncoderRetries429ThenSucceeds(t *testing.T) {
 	assert.Equal(t, int32(2), attempts.Load())
 }
 
+func TestEncoderRetryRateLimitsSurvivesMoreRateLimitsThanMaxRetries(t *testing.T) {
+	// Reproduces #1353: embeddings build must not abort permanently on a
+	// 429 that clears with time. 5 consecutive 429s exceed MaxRetries: 1,
+	// so without RetryRateLimits this would fail on the second attempt.
+	var attempts atomic.Int32
+	const rateLimitedResponses = 5
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := attempts.Add(1)
+		if n <= rateLimitedResponses {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("rate limited"))
+			return
+		}
+		writeJSON(t, w, http.StatusOK, embeddingsResponse{
+			Data: []embeddingDatum{{Index: 0, Embedding: []float32{1, 2, 3}}},
+		})
+	}))
+	defer srv.Close()
+
+	enc := NewEncoder(EncoderConfig{
+		Endpoint:        srv.URL + "/v1",
+		Model:           "test-model",
+		Dimension:       3,
+		Timeout:         5 * time.Second,
+		MaxRetries:      1,
+		RetryRateLimits: true,
+	})
+
+	out, err := enc(context.Background(), []string{"hello"})
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	// Not an exact count: Go's transport can silently retry a request once at
+	// the connection level after a backoff-induced idle period, so the raw
+	// request count the server observes isn't 1:1 with encode()'s own retry
+	// counter. What actually matters is that MORE than MaxRetries rate-limited
+	// responses didn't abort the call.
+	assert.GreaterOrEqual(t, attempts.Load(), int32(rateLimitedResponses+1))
+}
+
+func TestEncoderRetryRateLimitsDisabledFailsFastOn429PastMaxRetries(t *testing.T) {
+	// Without RetryRateLimits, a 429 is just another retryable error and
+	// still respects MaxRetries -- this is the pre-existing behavior for
+	// latency-sensitive query encoders (see newVectorQueryEncoder).
+	var attempts atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("rate limited"))
+	}))
+	defer srv.Close()
+
+	enc := NewEncoder(EncoderConfig{
+		Endpoint:   srv.URL + "/v1",
+		Model:      "test-model",
+		Dimension:  3,
+		Timeout:    5 * time.Second,
+		MaxRetries: 2,
+	})
+
+	_, err := enc(context.Background(), []string{"hello"})
+	require.Error(t, err)
+	assert.Equal(t, int32(2), attempts.Load())
+}
+
 func TestEncoder500ExhaustsRetries(t *testing.T) {
 	var attempts atomic.Int32
 
@@ -1332,7 +1398,7 @@ func TestEncoderContextCancellationAbortsBackoffPromptly(t *testing.T) {
 
 // TestEncoder400ReturnsPermanentHTTPStatusError covers fix 1a: a non-200
 // response must come back as a *HTTPStatusError carrying the status code,
-// so callers (kit's FillOptions.OnEncodeError) can distinguish a permanent
+// so callers (kit's WithFillEncodeError handler) can distinguish a permanent
 // rejection from a transient one instead of string-matching the message.
 func TestEncoder400ReturnsPermanentHTTPStatusError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

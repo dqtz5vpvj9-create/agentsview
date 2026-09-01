@@ -14,7 +14,9 @@ import (
 
 type usageFactsGroup struct {
 	SessionID, Date, Project, Agent, Machine     string
+	ProviderID                                   string
 	Model, PricedModel, MatchedPattern           string
+	PricingTimestamp                             string
 	RateOK                                       bool
 	InputTokens, OutputTokens, ReasoningTokens   int64
 	CacheCreationTokens, CacheReadTokens         int64
@@ -170,7 +172,8 @@ func readUsageDailyRollups(
 ) (usageFactsResult, error) {
 	from, to := usageRollupDateBounds(snapshot)
 	rows, err := conn.QueryContext(ctx, `SELECT i.session_id, r.local_date,
-		r.reported_model, r.priced_model, r.matched_pattern, r.rate_ok,
+		r.reported_model, r.provider_id, r.priced_model, r.matched_pattern, r.rate_ok,
+		r.pricing_timestamp,
 		r.input_tokens, r.output_tokens, r.reasoning_tokens,
 		r.cache_creation_tokens, r.cache_read_tokens,
 		r.estimated_cost_microdollars, r.savings_microdollars,
@@ -181,7 +184,8 @@ func readUsageDailyRollups(
 		JOIN usage_rollup_installs i ON i.id = r.rollup_install_id
 		WHERE i.timezone_id = ? AND (? = '' OR r.local_date >= ?)
 		  AND (? = '' OR r.local_date <= ?)
-		ORDER BY r.local_date, i.session_id, r.reported_model, r.band_threshold`,
+		ORDER BY r.local_date, i.session_id, r.reported_model,
+			r.provider_id, r.band_threshold`,
 		timezoneID, from, from, to, to)
 	if err != nil {
 		return usageFactsResult{}, err
@@ -194,7 +198,8 @@ func readUsageDailyRollups(
 		var rateOK int
 		var authoritative, band sql.NullInt64
 		if err := rows.Scan(&group.SessionID, &group.Date, &group.Model,
-			&group.PricedModel, &group.MatchedPattern, &rateOK,
+			&group.ProviderID, &group.PricedModel, &group.MatchedPattern, &rateOK,
+			&group.PricingTimestamp,
 			&group.InputTokens, &group.OutputTokens, &group.ReasoningTokens,
 			&group.CacheCreationTokens, &group.CacheReadTokens,
 			&group.CostMicrodollars, &group.SavingsMicrodollars, &authoritative,
@@ -234,8 +239,9 @@ func readUsageRollupExceptions(
 	rows, err := conn.QueryContext(ctx, `SELECT e.cached_session_id, e.fact_index,
 		e.source_session_id, e.local_date, e.source, e.message_ordinal,
 		e.timestamp_ms, e.timestamp_ns, e.raw_timestamp, e.uses_session_start,
-		e.model, e.input_tokens, e.output_tokens, e.reasoning_tokens,
-		e.cache_creation_tokens, e.cache_read_tokens, e.web_search_requests,
+		e.model, e.provider_id, e.input_tokens, e.output_tokens, e.reasoning_tokens,
+		e.cache_creation_tokens, e.cache_creation_1h_tokens,
+		e.cache_read_tokens, e.web_search_requests,
 		e.reported_cost_microdollars, e.cost_source, e.request_scoped,
 		e.is_headless, e.claude_message_id, e.claude_request_id, e.source_uuid,
 		e.usage_dedup_key, COUNT(*) OVER ()
@@ -261,8 +267,9 @@ func readUsageRollupExceptions(
 		if err := rows.Scan(&fact.CachedSessionID, &fact.FactIndex,
 			&fact.SourceSessionID, &fact.LocalDate, &fact.Fact.Source, &ordinal,
 			&millis, &nanos, &fact.Fact.RawTimestamp, &usesStart, &fact.Model,
-			&fact.Fact.InputTokens, &fact.Fact.OutputTokens,
+			&fact.Fact.ProviderID, &fact.Fact.InputTokens, &fact.Fact.OutputTokens,
 			&fact.Fact.ReasoningTokens, &fact.Fact.CacheCreationTokens,
+			&fact.Fact.CacheCreation1hTokens,
 			&fact.Fact.CacheReadTokens, &fact.Fact.WebSearchRequests, &reported,
 			&fact.Fact.CostSource, &requestScoped, &isHeadless,
 			&fact.Fact.ClaudeMessageID,
@@ -389,9 +396,9 @@ func aggregateUsageRollupExceptions(
 	general = deduplicateUsageRollupGeneral(general)
 	survivors := append(plain, general...)
 	type key struct {
-		session, date, model, priced, pattern, rateHash string
-		rateOK                                          bool
-		band                                            int
+		session, date, model, providerID, priced, pattern, rateHash string
+		rateOK                                                      bool
+		band                                                        int
 	}
 	groups := make(map[key]*usageFactsGroup)
 	type authoritativeCandidate struct {
@@ -402,8 +409,9 @@ func aggregateUsageRollupExceptions(
 	authoritative := make(map[string]authoritativeCandidate)
 	for _, fact := range survivors {
 		priced, err := priceUsageFact(usagePriceInput{
-			Fact: fact.Fact, Timestamp: fact.DedupTimestamp,
+			Fact: fact.Fact, Timestamp: fact.Fact.RawTimestamp,
 			ReportedModel: fact.Model,
+			ProviderID:    fact.Fact.ProviderID,
 		}, resolver)
 		if err != nil {
 			return nil, err
@@ -413,6 +421,7 @@ func aggregateUsageRollupExceptions(
 			band = *priced.BandThreshold
 		}
 		itemKey := key{fact.AttributionSessionID, fact.LocalDate, fact.Model,
+			fact.Fact.ProviderID,
 			priced.PricedModel, priced.MatchedPattern, priced.RateHash,
 			priced.RateOK, band}
 		group := groups[itemKey]
@@ -424,12 +433,16 @@ func aggregateUsageRollupExceptions(
 			group = &usageFactsGroup{
 				SessionID: fact.AttributionSessionID, Date: fact.LocalDate,
 				Project: session.Project, Agent: session.Agent, Machine: session.Machine,
-				Model: fact.Model, PricedModel: priced.PricedModel,
+				ProviderID: fact.Fact.ProviderID,
+				Model:      fact.Model, PricedModel: priced.PricedModel,
 				MatchedPattern: priced.MatchedPattern, RateOK: priced.RateOK,
+				PricingTimestamp:              fact.Fact.RawTimestamp,
 				BandThreshold:                 priced.BandThreshold,
 				DiscardedSnapshotOutputTokens: discarded,
 			}
 			groups[itemKey] = group
+		} else if group.PricingTimestamp == "" {
+			group.PricingTimestamp = fact.Fact.RawTimestamp
 		}
 		if err := addUsageFactToGroup(group, fact, priced); err != nil {
 			return nil, err
@@ -748,7 +761,8 @@ func compareNullableInt64(left, right *int64, nilHigh bool) int {
 
 func compareUsageFactsGroup(left, right usageFactsGroup) int {
 	for _, pair := range [][2]string{{left.Date, right.Date},
-		{left.SessionID, right.SessionID}, {left.Model, right.Model}} {
+		{left.SessionID, right.SessionID}, {left.Model, right.Model},
+		{left.ProviderID, right.ProviderID}} {
 		if order := cmp.Compare(pair[0], pair[1]); order != 0 {
 			return order
 		}

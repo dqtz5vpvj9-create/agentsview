@@ -44,11 +44,11 @@ func BuildManifest(targets TargetSet) (Manifest, error) {
 	}
 	m := Manifest{Files: []ManifestEntry{}}
 	forbidden := newForbiddenRootMatcher(targets.ForbiddenRoots)
-	hermesStateDBs := hermesStateDBTargets(targets)
-	hermesSQLite := make(map[string]struct{}, len(hermesStateDBs)*4)
-	for _, stateDB := range hermesStateDBs {
-		for _, path := range hermesSQLitePaths(stateDB) {
-			hermesSQLite[path] = struct{}{}
+	snapshotTargets := sqliteSnapshotTargets(targets)
+	snapshotPaths := make(map[string]struct{}, len(snapshotTargets)*4)
+	for stateDB := range snapshotTargets {
+		for _, path := range sqliteSnapshotPaths(stateDB) {
+			snapshotPaths[path] = struct{}{}
 		}
 	}
 	add := func(path string, info os.FileInfo) {
@@ -78,11 +78,11 @@ func BuildManifest(targets TargetSet) (Manifest, error) {
 		if parser.RemoteSyncExcludedAgent(agent) {
 			continue
 		}
-		if _, fileScoped := targets.Files[agent]; fileScoped {
+		if targets.isFileScoped(agent) {
 			continue
 		}
 		for _, root := range dirs {
-			if _, ok := hermesSQLite[filepath.Clean(root)]; ok {
+			if _, ok := snapshotPaths[filepath.Clean(root)]; ok {
 				continue
 			}
 			if err := manifestWalk(root, forbidden, add); err != nil {
@@ -95,7 +95,7 @@ func BuildManifest(targets TargetSet) (Manifest, error) {
 			continue
 		}
 		for _, path := range files {
-			if _, ok := hermesSQLite[filepath.Clean(path)]; ok {
+			if _, ok := snapshotPaths[filepath.Clean(path)]; ok {
 				continue
 			}
 			if err := addLstat(path); err != nil {
@@ -104,18 +104,18 @@ func BuildManifest(targets TargetSet) (Manifest, error) {
 		}
 	}
 	for _, path := range targets.AllExtraFiles() {
-		if _, ok := hermesSQLite[filepath.Clean(path)]; ok {
+		if _, ok := snapshotPaths[filepath.Clean(path)]; ok {
 			continue
 		}
 		if err := addLstat(path); err != nil {
 			return Manifest{}, err
 		}
 	}
-	for _, stateDB := range hermesStateDBs {
+	for stateDB := range snapshotTargets {
 		if forbidden.within(stateDB) {
 			continue
 		}
-		size, modTime, exists := hermesSQLiteSnapshotIdentity(stateDB)
+		size, modTime, exists := sqliteSnapshotIdentity(stateDB)
 		if exists {
 			m.Files = append(m.Files, ManifestEntry{
 				Path: stateDB, Size: size, MtimeNS: modTime.UnixNano(),

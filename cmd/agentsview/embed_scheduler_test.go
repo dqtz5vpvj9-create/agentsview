@@ -1449,7 +1449,12 @@ func TestEmbeddingsDaemonClientBuildSucceedsThroughRealMiddleware(t *testing.T) 
 		"a POST build must succeed once the client sets Origin to satisfy the CSRF guard")
 }
 
-func TestVectorServingCloseWaitsForAPIStartedRecallBuild(t *testing.T) {
+// TestVectorServingCloseCancelsAPIStartedRecallBuild pins the shutdown
+// contract for detached API builds: Close cancels an in-flight build rather
+// than waiting for it, because a document build may be waiting out provider
+// rate limits indefinitely (EncoderConfig.RetryRateLimits) and progress is
+// durable across restarts anyway.
+func TestVectorServingCloseCancelsAPIStartedRecallBuild(t *testing.T) {
 	dataDir := t.TempDir()
 	database := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "sessions.db"))
 	dbtest.SeedSession(t, database, "s1", "agentsview")
@@ -1479,7 +1484,9 @@ func TestVectorServingCloseWaitsForAPIStartedRecallBuild(t *testing.T) {
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.MarshalWrite(w, map[string]any{"data": data}))
+		// Best-effort: once Close cancels the build, the client has already
+		// aborted this request and the write fails with a dead connection.
+		_ = json.MarshalWrite(w, map[string]any{"data": data})
 	}))
 	t.Cleanup(stub.Close)
 
@@ -1512,20 +1519,15 @@ func TestVectorServingCloseWaitsForAPIStartedRecallBuild(t *testing.T) {
 		require.Fail(t, "manual Recall build never reached the encoder")
 	}
 
+	// The encoder is never released before Close: Close itself must cancel
+	// the detached build to return.
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- closeVectorServing() }()
 	select {
 	case closeErr := <-closeDone:
 		require.NoError(t, closeErr)
-		require.Fail(t, "vector serving closed while the API build was active")
-	case <-time.After(100 * time.Millisecond):
-	}
-	releaseEncode()
-	select {
-	case closeErr := <-closeDone:
-		require.NoError(t, closeErr)
 	case <-time.After(10 * time.Second):
-		require.Fail(t, "vector serving did not close after the API build completed")
+		require.Fail(t, "vector serving did not cancel the in-flight API build on Close")
 	}
 }
 

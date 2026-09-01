@@ -116,7 +116,7 @@ func (ix *Index) SearchPage(
 	}
 
 	vectors, err := kitvec.EncodeBatched(ctx, enc,
-		[]kitvec.Chunk{{Index: 0, Text: query}}, kitvec.BatchOptions{})
+		[]kitvec.Chunk{{Index: 0, Text: query}})
 	if err != nil {
 		return nil, false, &QueryEncodeError{Err: err}
 	}

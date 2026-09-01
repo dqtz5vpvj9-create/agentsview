@@ -20,7 +20,30 @@ called out when it is not the product's own producer source.
 
 ## Pricing Catalog Evidence
 
-Agentsview's fetched and embedded token prices come from LiteLLM's
+Agentsview uses Pydantic GenAI Prices v2 as its historical and conditional
+pricing source. The embedded snapshot pins upstream
+[`data.json`](https://github.com/pydantic/genai-prices/blob/83a49e8b386176a1e28e9d9aedeea5e2b4abc586/prices/new_data/v2/data.json)
+and its generated
+[`JSON Schema`](https://github.com/pydantic/genai-prices/blob/83a49e8b386176a1e28e9d9aedeea5e2b4abc586/prices/new_data/v2/data.schema.json)
+at commit `83a49e8b386176a1e28e9d9aedeea5e2b4abc586`. Agentsview preserves the
+complete upstream JSON in its embedded artifact and refreshed singleton row. It
+compiles the provider and model match rules, ordered start-date and UTC
+time-window conditions, token prices, and whole-request tier thresholds at
+runtime. The upstream v2 schema permits generic JSON numbers for prices;
+Agentsview rejects negative scalar, tier base, and tier prices while accepting
+zero. Reverified 2026-08-26 against the pinned data, schema, typed Python
+source, and parser boundary.
+
+For a usage event with a valid timestamp, pricing precedence is a user custom
+rate resolved from the reported or caller-supplied canonical model, a matching
+Pydantic conditional rate at that timestamp, then the existing flat catalog. An
+exact custom rate for the reported model takes precedence over canonicalization.
+Events without a valid timestamp skip Pydantic because choosing its oldest
+conditional record would invent a historical date. Pydantic currently carries
+both GPT-5.6 Luna price periods but not Grok 4.6, so the flat fallback remains
+necessary.
+
+Agentsview's flat fallback prices come from LiteLLM's
 [`model_prices_and_context_window.json`](https://github.com/BerriAI/litellm/blob/418c7c6012d7c39a9d4a28c72cabe1995595ad2b/model_prices_and_context_window.json)
 at pinned commit `418c7c6012d7c39a9d4a28c72cabe1995595ad2b`. LiteLLM's
 [`cost_per_token` implementation](https://github.com/BerriAI/litellm/blob/418c7c6012d7c39a9d4a28c72cabe1995595ad2b/litellm/litellm_core_utils/llm_cost_calc/utils.py)
@@ -30,12 +53,19 @@ cost implementation.
 
 Agentsview recognizes the anchored standard field shape
 `input_cost_per_token_above_<N>[k]_tokens`, including the published 200K and
-272K bands, and reads output, cache-creation, and cache-read companions with the
-same suffix. A band applies only when whole-request input is strictly greater
-than its threshold; when several bands exist, the highest eligible threshold
-wins. Additional suffixes for Batch, Flex, Priority, regional, or other service
-tiers are deliberately excluded because stored usage does not identify those
-variants.
+272K bands, and reads output, cache-creation, 1h cache-creation, and cache-read
+companions with the same suffix. The base
+`cache_creation_input_token_cost_above_1hr` key is the 1-hour-TTL cache-write
+rate (2x input for Anthropic models), not a request-pricing band; its own banded
+variants such as `cache_creation_input_token_cost_above_1hr_above_200k_tokens`
+follow the companion-suffix shape. Reverified 2026-08-25 against the pinned
+catalog: `claude-fable-5` publishes `cache_creation_input_token_cost` 1.25e-05
+and `cache_creation_input_token_cost_above_1hr` 2e-05 per token.
+
+A band applies only when whole-request input is strictly greater than its
+threshold; when several bands exist, the highest eligible threshold wins.
+Additional suffixes for Batch, Flex, Priority, regional, or other service tiers
+are deliberately excluded because stored usage does not identify those variants.
 
 Claude and Codex session artifacts provide normalized input, output,
 cache-creation, and cache-read token categories, but they do not supply this
@@ -89,6 +119,18 @@ add an archived or maintained mirror without replacing the original identity.
 - **Usage and cost:** Assistant messages persist input, output, cache-creation,
   and cache-read tokens. Model IDs are present. No authoritative persisted USD
   cost field is consumed; Agentsview prices the tokens from its catalog.
+  Claude Code also persists Anthropic's nested cache-write TTL breakdown
+  verbatim: `message.usage.cache_creation` carries `ephemeral_1h_input_tokens`
+  and `ephemeral_5m_input_tokens`, whose sum matches the flat
+  `cache_creation_input_tokens` counter. Verified 2026-08-25 against Claude
+  Code 2.1.231 transcripts with 1h prompt caching:
+  `claude -p --output-format json` `total_cost_usd` matches hand math only
+  when the `ephemeral_1h_input_tokens` subset bills at the catalog's 1h
+  cache-write rate (2x input), so Agentsview prices that subset at
+  `cache_creation_input_token_cost_above_1hr` and the remainder at the 5m
+  rate. The flat counter stays authoritative: the nested subset is clamped to
+  it, and an absent or malformed breakdown falls back to the 5m rate for the
+  whole write total (issue #1452).
 - **Server tool use (web search):** Anthropic bills server-side web search at
   $10 per 1,000 requests on top of tokens and reports the count in
   `message.usage.server_tool_use.web_search_requests`, which Claude Code
@@ -242,7 +284,12 @@ add an archived or maintained mirror without replacing the original identity.
   cannot hide missing delegated input or cache usage. Reverified 2026-08-22
   that an incomplete category breakdown, malformed included transcript, or
   unfinished included session withholds computed or mixed cost;
-  provider-reported cost remains authoritative.
+  provider-reported cost remains authoritative. Reverified 2026-08-27 that
+  raw-capture membership mirrors persisted tool output resolution: it includes
+  regular files at any depth in the session's `tool-results/` directory and,
+  for subagents, the enclosing parent session's `tool-results/` directory.
+  These immutable companions are captured with the appendable transcript so a
+  reconstructed tree preserves the parser's physical inputs.
 
 ## OpenClaude (`openclaude`)
 
@@ -383,7 +430,10 @@ add an archived or maintained mirror without replacing the original identity.
   includes an unterminated invalid final record after `task_complete`;
   ordinary live parsing still defers that tail while its writer can complete
   it. This bounded lookup is deliberately separate from the provider's general
-  full-archive UUID discovery.
+  full-archive UUID discovery. Hosted raw discovery and event-driven capture
+  preserve each physical transcript under its configured root; duplicate
+  ranking remains limited to normalized discovery. Reverified 2026-08-29 with
+  live and archived copies sharing one UUID.
 
 ## TraeX (`traex`)
 
@@ -573,6 +623,7 @@ add an archived or maintained mirror without replacing the original identity.
   [message-v2.ts](https://github.com/anomalyco/opencode/blob/67caf894e0843ee370e72839e8265e483233479b/packages/opencode/src/session/message-v2.ts)
   and
   [session.ts](https://github.com/anomalyco/opencode/blob/67caf894e0843ee370e72839e8265e483233479b/packages/opencode/src/session/session.ts).
+  Channel database naming was reverified 2026-08-27 against `database.ts`.
 - **Usage and cost:** Assistant messages persist input, output, cache-read, and
   cache-write tokens, plus model/provider identity. Agentsview computes price
   from those tokens rather than consuming a persisted USD total.
@@ -659,20 +710,25 @@ add an archived or maintained mirror without replacing the original identity.
   session or project row that advances past its own stored metadata watermark
   is always a candidate, wherever other sessions' watermarks or its own child
   timestamps sit. Periodic full passes and streamed reconciliation passes over
-  a container whose captured state still matches the last fully verified pass
-  also list the watermark form (`SQLiteContainerUnchangedSinceTrust`): every
+  a container whose last complete digest verification is less than five minutes
+  old may list the watermark form (`SQLiteContainerListsWatermarkOnly`): every
   member gate-skips before fingerprinting, so the child identity scan would be
-  archive-sized work nothing reads; any write breaks that trust and the next
-  pass carries the complete digest again. Watermark-only skips additionally
+  archive-sized work nothing reads. A changed container may continue using
+  this form during that bounded interval; after the interval, the next pass
+  carries the complete digest again. Watermark-only skips additionally
   require the pass's container capture to still be valid
   (`sqliteContainerPassCaptureValid`) — a container that changes between
   listing and the recapture check resolves full per-session digests instead,
   so a concurrent child-only write cannot hide beneath an unchanged metadata
   watermark. The trade is explicit: any child-only write that leaves the
   session and project rows untouched — wherever its timestamps land relative
-  to the stored composite — is invisible to a watcher pass and is reconciled
-  by the next full-discovery pass over the now-untrusted container, whose
-  digest still catches it; on the production container above, 96% of sessions
+  to the stored composite — is invisible to watermark-only discovery and is
+  reconciled by the next full digest pass, at most five minutes after the last
+  successful digest verification. That due pass bypasses the container-level
+  trusted-state skip so every session reaches the authoritative digest comparison;
+  when the platform cannot provide stable file identity, the policy fails closed
+  to this full digest form rather than authorizing a stale verification timestamp;
+  on the production container above, 96% of sessions
   carry a session/project timestamp at or above every child, and actively
   watched sessions bypass this entirely via the per-session composite poll.
   Per-event work is bounded by the changed batch plus one O(session-count)
@@ -791,15 +847,68 @@ add an archived or maintained mirror without replacing the original identity.
   confirms local chat persistence and the separate SQLite history index.
   Cursor support on the official forum documents the
   [`~/.cursor/projects/<project>/agent-transcripts` layout](https://forum.cursor.com/t/chat-history-gone-after-pc-restart-agent-transcripts-files-emptied-how-to-recover/158251/5)
-  and identifies `state.vscdb` as metadata. Cursor's public GitHub
-  organization was also searched 2026-07-19; no transcript schema or producer
-  source was found.
+  and identifies `state.vscdb` as metadata **for this CLI producer**. That
+  characterization does not extend to Cursor IDE (the GUI editor, see below):
+  for the GUI, `state.vscdb` is the only transcript store, not metadata beside
+  one. Cursor's public GitHub organization was also searched 2026-07-19; no
+  transcript schema or producer source was found.
 - **Usage and cost:** The consumed text/JSONL transcripts have no reliable
   per-message token, cache, reasoning, credit, or monetary-cost fields.
 - **Agentsview:** `internal/parser/cursor.go`,
   `internal/parser/cursor_paths.go`, and `internal/parser/cursor_provider.go`;
   workspace identity uses a filesystem-backed unique-match resolver, while
   role and attribution boundaries are reconstructed from Markdown.
+
+## Cursor IDE (`cursor-ide`)
+
+- **Format:** A shared VS Code-style global-state SQLite database
+  (`state.vscdb`), whose `cursorDiskKV` key-value table holds one JSON blob
+  per key: `composerData:<uuid>` is one chat session, and
+  `bubbleId:<composerId>:<bubbleUuid>` is one turn of that session. This is a
+  distinct product and store from Cursor Agent (the CLI, above): the GUI
+  writes no `agent-transcripts` files at all.
+- **Evidence:** `no-public-source`.
+- **Upstream:** Cursor's public GitHub organization and first-party docs were
+  searched 2026-08-25; no `cursorDiskKV`, `composerData`, or `bubbleId` schema
+  was found. This is consistent with two independent local-history tools
+  hitting the same wall (see agentsview issue #1515): a VS Code local-history
+  extension states it does not decode Cursor's DB-only chat blobs, and `ctx`
+  (`https://github.com/ctxrs/ctx`, checked at `8c6d670`) reads only
+  `agent-transcripts` and contains none of those three strings. Evidence here
+  is instead direct inspection of a live local `state.vscdb` (macOS, 86MB,
+  `PRAGMA quick_check` = `ok`): `composerData` documents observed at `_v: 16`
+  and bubble documents at `_v: 3`. `composerData.createdAt` and
+  `.lastUpdatedAt` are epoch milliseconds; bubble `.createdAt` is a separate
+  ISO-8601 string encoding. `composerData.fullConversationHeadersOnly` is the
+  session's turn order (`bubbleId` + `type`: `1` user, `2` assistant); the
+  sibling `conversationMap` field, structurally an alternative inline-message
+  store, was observed empty (`{}`) on every real conversation inspected,
+  including multi-hundred-KB ones, so it is not a usable source at this schema
+  version. An assistant bubble's tool call is inline on that bubble's
+  `toolFormerData` (name, `rawArgs`, `result`), unlike Claude's separate
+  call/result blocks. `workspaceIdentifier.uri.fsPath` and
+  `trackedGitRepos[].{repoPath,branches[].branchName}` give cwd and git
+  branch. The issue's reporter additionally documents that a Cursor version
+  update (3.16.29) has shrunk or wiped some users' `cursorDiskKV` rows, so the
+  parser tolerates a `fullConversationHeadersOnly` entry whose `bubbleId` row
+  is missing rather than failing the whole session.
+- **Usage and cost:** No per-message or per-session token, cache, reasoning,
+  credit, or monetary-cost fields were observed in `composerData` or bubble
+  documents. Agentsview emits no usage events for this agent; cost is
+  unpriced.
+- **Agentsview:** `internal/parser/cursor_ide.go` and
+  `internal/parser/cursor_ide_provider.go`, built on the shared
+  `multiSessionContainerSourceSet` framework (see Zed, below). Fingerprinting
+  never hashes the full database (86MB+ locally, 500MB+ reported in the wild):
+  a container-level fingerprint uses whole-file size, composite mtime, and a
+  SQLite transaction-state hash over just the database and WAL headers, so a
+  rewrite that leaves size and mtime unchanged still misses the skip cache; a
+  member-level fingerprint digests every parse input of that one composer (the
+  raw `composerData` document plus its bubble rows' keys and values), so an
+  equal-length bubble rewrite, a header reorder, or a rename that leaves
+  `lastUpdatedAt` untouched still reads as changed. A chat deleted inside
+  Cursor IDE is retired through stored-source-hint tombstones on `state.vscdb`
+  change events and through complete-container ownership reconciliation.
 
 ## Amp (`amp`)
 
@@ -963,11 +1072,11 @@ add an archived or maintained mirror without replacing the original identity.
 - **Upstream:** Clone `https://github.com/PrimeIntellect-ai/prime-agent.git` at
   `0e0d23391bcd879f1aea70dbda4d07dda7970b34`; see the pinned
 
-    [session format](https://github.com/PrimeIntellect-ai/prime-agent/blob/0e0d23391bcd879f1aea70dbda4d07dda7970b34/packages/coding-agent/docs/session-format.md),
+  [session format](https://github.com/PrimeIntellect-ai/prime-agent/blob/0e0d23391bcd879f1aea70dbda4d07dda7970b34/packages/coding-agent/docs/session-format.md),
 
-    [session types and persistence](https://github.com/PrimeIntellect-ai/prime-agent/blob/0e0d23391bcd879f1aea70dbda4d07dda7970b34/packages/coding-agent/src/core/session-manager.ts),
-    and
-    [configuration paths](https://github.com/PrimeIntellect-ai/prime-agent/blob/0e0d23391bcd879f1aea70dbda4d07dda7970b34/packages/coding-agent/src/config.ts).
+  [session types and persistence](https://github.com/PrimeIntellect-ai/prime-agent/blob/0e0d23391bcd879f1aea70dbda4d07dda7970b34/packages/coding-agent/src/core/session-manager.ts),
+  and
+  [configuration paths](https://github.com/PrimeIntellect-ai/prime-agent/blob/0e0d23391bcd879f1aea70dbda4d07dda7970b34/packages/coding-agent/src/config.ts).
 
 - **Usage and cost:** Assistant messages persist input, output, cache-read, and
   cache-write tokens with model IDs. `child_usage_attributed` entries replace
@@ -1009,9 +1118,9 @@ add an archived or maintained mirror without replacing the original identity.
   `39c95e5e29b1c8b082059f57421ce445c3dffdd4`; see
   [session-entries.ts](https://github.com/can1357/oh-my-pi/blob/39c95e5e29b1c8b082059f57421ce445c3dffdd4/packages/coding-agent/src/session/session-entries.ts),
 
-    [session-persistence.ts](https://github.com/can1357/oh-my-pi/blob/39c95e5e29b1c8b082059f57421ce445c3dffdd4/packages/coding-agent/src/session/session-persistence.ts),
-    and
-    [usage.ts](https://github.com/can1357/oh-my-pi/blob/39c95e5e29b1c8b082059f57421ce445c3dffdd4/packages/ai/src/usage.ts).
+  [session-persistence.ts](https://github.com/can1357/oh-my-pi/blob/39c95e5e29b1c8b082059f57421ce445c3dffdd4/packages/coding-agent/src/session/session-persistence.ts),
+  and
+  [usage.ts](https://github.com/can1357/oh-my-pi/blob/39c95e5e29b1c8b082059f57421ce445c3dffdd4/packages/ai/src/usage.ts).
 
 - **Usage and cost:** Pi-family usage persists input, output, cache-read, and
   cache-write tokens with a model. Agentsview derives monetary cost from the
@@ -1091,23 +1200,23 @@ add an archived or maintained mirror without replacing the original identity.
   `47f943859bef60e4160492346772ded9b24f765a`. See the pinned
   [JSONL layout, header, and scanner](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/session/session-persistence-jsonl/src/format.ts),
 
-    [multi-frame zstd backend](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/session/session-persistence-jsonl/src/index.ts),
+  [multi-frame zstd backend](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/session/session-persistence-jsonl/src/index.ts),
 
-    [packed chunk codec](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/core/session/src/chunk-rows.ts),
+  [packed chunk codec](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/core/session/src/chunk-rows.ts),
 
-    [session event and seed schema](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/core/session/src/types.ts),
+  [session event and seed schema](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/core/session/src/types.ts),
 
-    [turn and step production order](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/core/agent-loop/src/agent.ts#L245-L292),
+  [turn and step production order](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/core/agent-loop/src/agent.ts#L245-L292),
 
-    [turn and step invariants](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/core/session/src/invariant.ts),
+  [turn and step invariants](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/core/session/src/invariant.ts),
 
-    [agent preset reconstruction](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/preset/agent-presets/src/session.ts),
+  [agent preset reconstruction](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/preset/agent-presets/src/session.ts),
 
-    [compaction model-call facts](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/compaction/compaction/src/types.ts),
-    and the
-    [message/content schema](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/llm/llm/src/message.ts)
-    plus the
-    [usage schema](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/llm/llm/src/types.ts).
+  [compaction model-call facts](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/compaction/compaction/src/types.ts),
+  and the
+  [message/content schema](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/llm/llm/src/message.ts)
+  plus the
+  [usage schema](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/llm/llm/src/types.ts).
 
 - **Usage and cost:** Each model response and summarizing compaction can persist
   disjoint input, output, cache-read, cache-write, and reasoning token counts.
@@ -1183,9 +1292,9 @@ add an archived or maintained mirror without replacing the original identity.
   `4a550effdfcb29a25a5d325bf935296cc50cd417`; see
   [session.py](https://github.com/MoonshotAI/kimi-cli/blob/4a550effdfcb29a25a5d325bf935296cc50cd417/src/kimi_cli/session.py),
 
-    [wire-mode.md](https://github.com/MoonshotAI/kimi-cli/blob/4a550effdfcb29a25a5d325bf935296cc50cd417/docs/en/customization/wire-mode.md),
-    and the
-    [Kimi provider usage mapping](https://github.com/MoonshotAI/kimi-cli/blob/4a550effdfcb29a25a5d325bf935296cc50cd417/packages/kosong/src/kosong/chat_provider/kimi.py).
+  [wire-mode.md](https://github.com/MoonshotAI/kimi-cli/blob/4a550effdfcb29a25a5d325bf935296cc50cd417/docs/en/customization/wire-mode.md),
+  and the
+  [Kimi provider usage mapping](https://github.com/MoonshotAI/kimi-cli/blob/4a550effdfcb29a25a5d325bf935296cc50cd417/packages/kosong/src/kosong/chat_provider/kimi.py).
 
 - **Usage and cost:** Native usage distinguishes uncached/other input, output,
   cache read, and cache creation. The aggregate fallback exposes only output
@@ -1265,6 +1374,18 @@ add an archived or maintained mirror without replacing the original identity.
 - **Format:** Legacy JSONL plus companion metadata JSON, and newer SQLite
   session databases.
 
+  The issue-reported current layout uses
+  `~/.kiro/sessions/<workspace>/sess_<id>/messages.jsonl` or the direct
+  `sess_<id>/messages.jsonl` form, with optional `session.json`. Agentsview
+  admits only these exact producer-relative shapes: one workspace segment, no
+  `.history` or `snapshots` workspace, a valid `sess_<id>` directory, and no
+  nested session directory. It preserves the literal `sess_<id>` identity and
+  maps user, assistant, tool-call, and tool-result envelope fields; unknown
+  and malformed records are ignored. This observed layout has no pinned
+  producer schema source. For duplicate IDs, SQLite outranks current JSONL,
+  current outranks legacy JSONL, configured root order breaks ties within a
+  class, and recency then canonical path provide deterministic ties.
+
 - **Evidence:** `documentation`.
 
 - **Upstream:** Kiro's first-party [license page](https://kiro.dev/license/) and
@@ -1281,11 +1402,11 @@ add an archived or maintained mirror without replacing the original identity.
   at `12375a273a289c131a45b4fd3eb1ad6483b4e9d4`; see its pinned
   [Kiro JSONL parser](https://github.com/ingo-eichhorst/Irrlicht/blob/12375a273a289c131a45b4fd3eb1ad6483b4e9d4/core/adapters/inbound/agents/kirocli/parser.go),
 
-    [sidecar metrics reader](https://github.com/ingo-eichhorst/Irrlicht/blob/12375a273a289c131a45b4fd3eb1ad6483b4e9d4/core/adapters/inbound/agents/kirocli/sidecar_metrics.go),
-    and recorded
-    [token-accounting assessment](https://github.com/ingo-eichhorst/Irrlicht/blob/12375a273a289c131a45b4fd3eb1ad6483b4e9d4/replaydata/agents/kiro-cli/scenarios/5-1_token-accounting/metadata.json).
-    These are consumer observations, not Kiro producer authority, and they do
-    not cover the newer `conversations_v2` writer.
+  [sidecar metrics reader](https://github.com/ingo-eichhorst/Irrlicht/blob/12375a273a289c131a45b4fd3eb1ad6483b4e9d4/core/adapters/inbound/agents/kirocli/sidecar_metrics.go),
+  and recorded
+  [token-accounting assessment](https://github.com/ingo-eichhorst/Irrlicht/blob/12375a273a289c131a45b4fd3eb1ad6483b4e9d4/replaydata/agents/kiro-cli/scenarios/5-1_token-accounting/metadata.json).
+  These are consumer observations, not Kiro producer authority, and they do
+  not cover the newer `conversations_v2` writer.
 
 - **Usage and cost:** JSONL events contain no model, token, cache, credit, or
   USD fields. The companion state can contain model/window metadata, context
@@ -1397,7 +1518,27 @@ add an archived or maintained mirror without replacing the original identity.
 - **Usage and cost:** Message or aggregate metrics can persist prompt,
   completion, and cached tokens. The parser handles multiple observed field
   names; no authoritative provider-reported USD value is consumed, so pricing
-  is catalog-derived when model attribution is possible.
+  is catalog-derived when model attribution is possible. Transcript JSON is
+  written only by an explicit session export, so most sessions have none; for
+  those the parser reads per-assistant-message counters from the
+  `message_nodes` fallback at `chat_message -> metadata.metrics`
+  (`input_tokens`, `output_tokens`, `cache_read_tokens`,
+  `cache_creation_tokens`, any of which may be JSON null). `message_nodes` is
+  a forest, so totals are summed only along the main chain
+  (`sessions.main_chain_id` walked up via `parent_node_id`); summing every row
+  double-counts retries and edits. Older databases that predate
+  `sessions.main_chain_id` keep that field invalid and fall back to all
+  message nodes in creation order. Verified against a live Devin CLI database.
+  Each message-node request is attributed to the concrete model at
+  `metadata.generation_model` (falling back to the session-level
+  `sessions.model` alias), because the session column is often empty or a
+  coarse alias. Devin reports the base model with a reasoning-effort or speed
+  tier appended (`-thinking`, `-high`, `-medium`, `-low`, `-xhigh`, `-max`,
+  and `-*-fast` combinations); those tiers do not change per-token price, so
+  the shared pricing resolver strips them to the base model as a last-resort
+  match (see `EffortTierBaseModel` in `internal/pricing/normalize.go`). Truly
+  opaque names (`adaptive`, `compactor`, `MODEL_PRIVATE_*`, Devin codenames
+  such as `claude-5-fable-*`) have no catalog entry and remain unpriced.
 - **Agentsview:** `internal/parser/devin.go` and
   `internal/parser/devin_provider.go`; metric aliases are implementation
   evidence because the upstream schema is unavailable.
@@ -1431,9 +1572,9 @@ add an archived or maintained mirror without replacing the original identity.
   `69ce3728acae0b01c2f457b65a90c144664686aa`; see the pinned
   [agent conversation migration](https://github.com/warpdotdev/warp/blob/69ce3728acae0b01c2f457b65a90c144664686aa/crates/persistence/migrations/2025-06-09-013710_create_agent_conversations_table/up.sql),
 
-    [persistence writer](https://github.com/warpdotdev/warp/blob/69ce3728acae0b01c2f457b65a90c144664686aa/app/src/persistence/agent.rs),
-    and
-    [conversation usage types](https://github.com/warpdotdev/warp/blob/69ce3728acae0b01c2f457b65a90c144664686aa/crates/persistence/src/model.rs).
+  [persistence writer](https://github.com/warpdotdev/warp/blob/69ce3728acae0b01c2f457b65a90c144664686aa/app/src/persistence/agent.rs),
+  and
+  [conversation usage types](https://github.com/warpdotdev/warp/blob/69ce3728acae0b01c2f457b65a90c144664686aa/crates/persistence/src/model.rs).
 
 - **Usage and cost:** The consumed metadata has aggregate `warp_tokens` and
   `byok_tokens` by model and category, plus custom-endpoint tokens and credit
@@ -1464,7 +1605,8 @@ add an archived or maintained mirror without replacing the original identity.
 ## Posit Assistant (`posit-assistant`)
 
 - **Format:** Workspace conversation directories containing `conversation.json`,
-  `lm-messages.jsonl`, and `ui-messages.jsonl`.
+  `lm-messages.jsonl`, `ui-messages.jsonl`, and an optional
+  `usage-events.jsonl` sidecar of auxiliary per-request usage.
 - **Evidence:** `no-public-source`.
 - **Upstream:** Posit's product documentation and the
   [posit-dev GitHub organization](https://github.com/posit-dev) were searched
@@ -1478,10 +1620,52 @@ add an archived or maintained mirror without replacing the original identity.
   were also public, but no matching producer or authoritative
   persisted-session schema was found.
 - **Usage and cost:** Language-model messages can persist input, output,
-  cache-read, and cache-write tokens with model identity. Agentsview
-  catalog-prices these values; no provider-reported USD total is consumed.
+  cache-read, and cache-write tokens with model identity. Observed GLM, Gemma,
+  and Kimi records use the Anthropic-shaped `cacheWriteTokens` field for the
+  uncached prompt remainder while leaving `inputTokens` at zero; these model
+  families do not expose a separately billed cache-write category in the
+  pricing catalog. Claude records retain real cache-write semantics.
+  Agentsview catalog-prices these values; no provider-reported USD total is
+  consumed. Auxiliary usage that never appears in the transcript —
+  cache-keepalive pings and classifier calls — is appended to
+  `usage-events.jsonl` as
+  `{"type":"usage","kind":"keepalive"|"classifier", "timestamp":…,"anchorMessageId":…,"providerId":…,"modelId":…, "inputTokens":…,"outputTokens":…,"totalTokens":…,"cacheReadTokens":…, "cacheWriteTokens":…}`
+  lines; subagent conversations carry their own sidecar. Observed on real
+  idle sessions: repeated keepalive pings whose spend is invisible in
+  `lm-messages.jsonl`. Assistant messages additionally carry a billing
+  provider identity at `providerOptions.providerMetadata.positai.providerId`,
+  and sidecar lines carry the same identity as their top-level `providerId`.
+  Observed values are `positai` for requests billed through the managed Posit
+  AI service and `anthropic` for bring-your-own-provider requests; both can
+  appear within one session. These serialized values are implementation
+  evidence from observed session artifacts, not published schema. Separately,
+  Posit's public [FAQ](https://docs.posit.co/posit-ai/user/faq/) states that
+  managed credit usage "is calculated at a 10% premium over model provider
+  rates" (checked 2026-08-29); the FAQ substantiates the premium but does not
+  define the `providerId` field. Agentsview applies the 11/10 billing
+  adjustment only to rows whose provider ID is exactly `positai`. Empty and
+  other values, including `anthropic`, price at base catalog rates, custom
+  pricing overrides are never adjusted, and explicit reported costs stay
+  authoritative.
 - **Agentsview:** `internal/parser/posit_assistant_provider.go`; current schema
-  details are based on observed files and fixtures.
+  details are based on observed files and fixtures. Reverified 2026-08-22
+  against the samples reported in
+  [#1466](https://github.com/kenn-io/agentsview/issues/1466): the parser folds
+  the persisted cache-write remainder into uncached input only for recognized
+  GLM, Gemma, and Kimi model families. Missing and unrecognized model
+  identities preserve Posit Assistant's original buckets, and full context
+  remains the sum of the persisted input, cache-read, and cache-write fields.
+  Data version 91 reparses existing Posit Assistant archives through the
+  normal non-destructive resync path. `usage-events.jsonl` lines are ingested
+  as request-scoped usage events (`posit-assistant-` + kind) with the same
+  model-family token normalization; the sidecar participates in the composite
+  fingerprint and changed-path classification so keepalive appends on
+  otherwise idle sessions trigger resync. Data version 92 reparses existing
+  archives to pick up sidecar spend. Conversations with valid sidecar usage
+  are retained even when they have no renderable transcript messages, and
+  newer sidecar timestamps extend the session end time. Data version 95 reparses
+  existing archives so message and usage-event rows persist the row-level
+  provider identity that drives the billing adjustment.
 
 ## Z Code (`zcode`)
 
@@ -1517,21 +1701,21 @@ add an archived or maintained mirror without replacing the original identity.
 - **Upstream:** Clone `https://github.com/aaif-goose/goose.git` at
   `5ab0e6df34e69444f6f2016de40717a9f54bf816`; see the pinned
 
-    [session manager](https://github.com/aaif-goose/goose/blob/5ab0e6df34e69444f6f2016de40717a9f54bf816/crates/goose/src/session/session_manager.rs),
+  [session manager](https://github.com/aaif-goose/goose/blob/5ab0e6df34e69444f6f2016de40717a9f54bf816/crates/goose/src/session/session_manager.rs),
 
-    [message model](https://github.com/aaif-goose/goose/blob/5ab0e6df34e69444f6f2016de40717a9f54bf816/crates/goose-provider-types/src/conversation/message.rs),
+  [message model](https://github.com/aaif-goose/goose/blob/5ab0e6df34e69444f6f2016de40717a9f54bf816/crates/goose-provider-types/src/conversation/message.rs),
 
-    [tool-result serialization](https://github.com/aaif-goose/goose/blob/5ab0e6df34e69444f6f2016de40717a9f54bf816/crates/goose-provider-types/src/conversation/tool_result_serde.rs),
-    and
-    [path resolution](https://github.com/aaif-goose/goose/blob/5ab0e6df34e69444f6f2016de40717a9f54bf816/crates/goose/src/config/paths.rs).
+  [tool-result serialization](https://github.com/aaif-goose/goose/blob/5ab0e6df34e69444f6f2016de40717a9f54bf816/crates/goose-provider-types/src/conversation/tool_result_serde.rs),
+  and
+  [path resolution](https://github.com/aaif-goose/goose/blob/5ab0e6df34e69444f6f2016de40717a9f54bf816/crates/goose/src/config/paths.rs).
 
-    `Paths::data_dir()` uses etcetera 0.11 `choose_app_strategy` (XDG on macOS and
-    Linux; the Windows strategy appends a `data` subfolder under
-    `%APPDATA%\Block\goose\`), and `GOOSE_PATH_ROOT` overrides it with
-    `<root>/data`. The first-party
-    [session-management guide](https://goose-docs.ai/docs/guides/sessions/session-management/)
-    and an isolated observed schema-version-15 database were also checked
-    2026-08-03.
+  `Paths::data_dir()` uses etcetera 0.11 `choose_app_strategy` (XDG on macOS and
+  Linux; the Windows strategy appends a `data` subfolder under
+  `%APPDATA%\Block\goose\`), and `GOOSE_PATH_ROOT` overrides it with
+  `<root>/data`. The first-party
+  [session-management guide](https://goose-docs.ai/docs/guides/sessions/session-management/)
+  and an isolated observed schema-version-15 database were also checked
+  2026-08-03.
 
 - **Usage and cost:** `usage_ledger` rows provide model, input, output,
   cache-read, cache-write, compaction, cost, and cost-source data without a
@@ -1623,7 +1807,15 @@ add an archived or maintained mirror without replacing the original identity.
   provider USD cost is consumed.
 - **Agentsview:** `internal/parser/antigravity_cli.go`,
   `internal/parser/antigravity_crypto.go`, and
-  `internal/parser/antigravity_cli_provider.go`.
+  `internal/parser/antigravity_cli_provider.go`. The CLI `history.jsonl`
+  `workspace` value and the current CLI's `cache/last_conversations.json`
+  workspace-to-conversation mapping are authoritative session CWD sources when
+  the workspace is an absolute path. Agentsview prefers the first valid
+  current-cache folder for an exact conversation ID, retains the strict
+  prompt/time fallback for older untagged history rows, and leaves CWD empty
+  when the value is missing or relative. The exact absolute workspace remains
+  the CWD. The project label is derived from the path text without probing the
+  recorded folder when filesystem discovery is disabled.
 
 ## iFlow CLI (`iflow`)
 
@@ -1650,18 +1842,50 @@ add an archived or maintained mirror without replacing the original identity.
 
 ## ICodeMate (`icodemate`)
 
-- **Format:** OpenCode-compatible SQLite or legacy session/message/part storage.
+- **Format:** Two storage families under one agent, matched by on-disk layout:
+  the VSCode-extension OpenCode-compatible SQLite or legacy
+  session/message/part storage, and the terminal CLI Claude-format projects
+  JSONL (`<projectsRoot>/<project>/<session>.jsonl`).
 - **Evidence:** `no-public-source`.
 - **Upstream:** ICodeMate's first-party product pages, documentation, and public
   GitHub repository search were checked 2026-07-19 without finding producer
   source or an authoritative disk schema. The OpenCode source pinned in the
-  `opencode` entry is compatible-family evidence only.
+  `opencode` entry is compatible-family evidence for the VSCode path only; the
+  terminal CLI path's Claude-format transcript schema (type/user/assistant
+  records carrying uuid, parentUuid, sessionId, cwd, gitBranch, timestamp, and
+  message.usage token fields) is compatible-family evidence from the `claude`
+  entry.
 - **Usage and cost:** Compatible messages can persist input, output, cache-read,
   cache-write, and model identity. Agentsview catalog-prices these values and
   consumes no product-reported USD total.
 - **Agentsview:** `internal/parser/icodemate.go` delegates to
-  `internal/parser/opencode.go`; product-specific divergence is a known
-  limitation.
+  `internal/parser/opencode.go` for the VSCode OpenCode path;
+  `internal/parser/icodemate_cli.go` parses the Claude-format CLI projects
+  transcripts, and `internal/parser/icodemate_provider.go` fans the configured
+  roots out to whichever layout each root owns. Product-specific divergence is
+  a known limitation. Reverified 2026-08-22 with controlled compatible-format
+  fixtures: the CLI parser uses the Claude UUID/parent UUID graph, coalesces
+  repeated assistant message snapshots by message ID, and resolves local and
+  S3-materialized persisted tool-result sidecars before extracting content.
+  Local sidecar writes map back to their owning transcript and participate in
+  its content-based, extraction-root-independent freshness fingerprint. Remote
+  imports resolve persisted paths against their extracted sidecars before
+  parsing. CLI project attribution uses transcript cwd and branch metadata to
+  resolve repository subdirectories and managed worktrees. Transcript identity
+  is the filename session ID across configured roots, so duplicate or moved
+  copies reconcile as one `icodemate:` session. Branch reconciliation follows
+  that identity across prior and current source paths and archive rebuilds. S3
+  subagent refreshes retain archived parent provider and machine metadata
+  instead of importing ICodeMate children as Claude. S3 discovery also
+  preserves transcript-only size and mtime separately from composite sidecar
+  freshness. A trailing partial local or S3 JSONL record stays incomplete and
+  retryable without replacing archived branch content. Polling includes local
+  and S3 sidecar mtimes, shortened CLI transcripts replace archived messages,
+  and duplicate ranking uses transcript metadata rather than sidecar volume.
+  Complete CLI parses reconcile the transcript's current branch membership,
+  and source freshness is recorded only after every emitted branch commits;
+  unchanged S3 transcripts use that persisted all-branch state to skip object
+  downloads.
 
 ## WorkBuddy (`workbuddy`)
 
@@ -1730,7 +1954,13 @@ add an archived or maintained mirror without replacing the original identity.
   `c40d46d16a32295da63221629293a000b0675df2` and inspect its pinned
   [Qoder source adapter](https://github.com/chenhg5/tape/blob/c40d46d16a32295da63221629293a000b0675df2/internal/source/qoder/qoder.go),
   which documents the transcript/metadata pair and shared Qwen `ChatRecord`
-  shape.
+  shape. Agentsview issue
+  [#1405](https://github.com/kenn-io/agentsview/issues/1405), checked
+  2026-08-28, reports Qoder CLI CN 1.1.21 storing the same project-scoped JSONL
+  family under `~/.qoder-cn/projects/<project-slug>/`, including
+  `<session-id>.jsonl`. This is a user-reported local observation, not
+  producer-side evidence, and does not establish storage behavior for all
+  Qoder CN releases or platforms.
 - **Usage and cost:** The consumed files provide transcript and model/session
   metadata but no authoritative token, cache, reasoning, credit, or USD events
   to Agentsview.

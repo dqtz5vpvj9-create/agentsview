@@ -89,42 +89,31 @@ func writeSQLiteSnapshot(dstPath, srcPath string) (err error) {
 	return nil
 }
 
-func sqliteSnapshotIdentity(path string) (int64, time.Time, bool, error) {
+// sqliteSnapshotIdentity treats an unusable database as an optional
+// missing archive component. The SQLite archive preserves imported
+// sessions even when their source files disappear, so omitting an
+// unreadable database from the manifest costs only the mirror's cached
+// copy, and a later sync retries after the writer repairs or replaces
+// it. Failing the manifest instead would block every other agent's
+// sync behind one bad file.
+func sqliteSnapshotIdentity(path string) (int64, time.Time, bool) {
 	info, err := os.Lstat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 0, time.Time{}, false, nil
-		}
-		return 0, time.Time{}, false, fmt.Errorf("stat sqlite database %q: %w", path, err)
-	}
-	if !info.Mode().IsRegular() {
-		return 0, time.Time{}, false, nil
+	if err != nil || !info.Mode().IsRegular() {
+		return 0, time.Time{}, false
 	}
 	conn, err := sql.Open("sqlite3", sqliteReadOnlyDSN(path))
 	if err != nil {
-		return 0, time.Time{}, false, fmt.Errorf("open sqlite database %q: %w", path, err)
+		return 0, time.Time{}, false
 	}
 	defer conn.Close()
 	var pageSize, pageCount int64
 	if err := conn.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
-		return 0, time.Time{}, false, fmt.Errorf("read sqlite page size %q: %w", path, err)
-	}
-	if err := conn.QueryRow(`PRAGMA page_count`).Scan(&pageCount); err != nil {
-		return 0, time.Time{}, false, fmt.Errorf("read sqlite page count %q: %w", path, err)
-	}
-	return pageSize * pageCount, sqliteSnapshotModTime(path, info.ModTime()), true, nil
-}
-
-// hermesSQLiteSnapshotIdentity treats an unusable state database as an
-// optional missing archive component. Hermes transcripts remain independently
-// useful, and a later sync can retry the database after the writer repairs or
-// replaces it.
-func hermesSQLiteSnapshotIdentity(path string) (int64, time.Time, bool) {
-	size, modTime, exists, err := sqliteSnapshotIdentity(path)
-	if err != nil {
 		return 0, time.Time{}, false
 	}
-	return size, modTime, exists
+	if err := conn.QueryRow(`PRAGMA page_count`).Scan(&pageCount); err != nil {
+		return 0, time.Time{}, false
+	}
+	return pageSize * pageCount, sqliteSnapshotModTime(path, info.ModTime()), true
 }
 
 func sqliteSnapshotModTime(stateDB string, modTime time.Time) time.Time {
@@ -175,7 +164,23 @@ func hermesStateDBTargets(targets TargetSet) []string {
 	return paths
 }
 
-func hermesSQLitePaths(stateDB string) []string {
+// sqliteSnapshotTargets returns the set of databases (Hermes state.db,
+// Zed threads.db) whose manifest and archive entries are consistent
+// snapshots rather than raw file copies.
+func sqliteSnapshotTargets(targets TargetSet) map[string]struct{} {
+	out := make(map[string]struct{})
+	for _, path := range hermesStateDBTargets(targets) {
+		out[path] = struct{}{}
+	}
+	for _, path := range targets.Files[parser.AgentZed] {
+		if filepath.Base(filepath.Clean(path)) == "threads.db" {
+			out[filepath.Clean(path)] = struct{}{}
+		}
+	}
+	return out
+}
+
+func sqliteSnapshotPaths(stateDB string) []string {
 	return []string{
 		filepath.Clean(stateDB),
 		filepath.Clean(stateDB + "-wal"),
@@ -184,16 +189,16 @@ func hermesSQLitePaths(stateDB string) []string {
 	}
 }
 
-func hermesStateDBForArchivePath(path string) (string, bool) {
+func sqliteSnapshotForArchivePath(path string) (string, bool) {
 	path = filepath.Clean(path)
 	switch filepath.Base(path) {
-	case "state.db":
+	case "state.db", "threads.db":
 		return path, true
-	case "state.db-wal":
+	case "state.db-wal", "threads.db-wal":
 		return strings.TrimSuffix(path, "-wal"), true
-	case "state.db-shm":
+	case "state.db-shm", "threads.db-shm":
 		return strings.TrimSuffix(path, "-shm"), true
-	case "state.db-journal":
+	case "state.db-journal", "threads.db-journal":
 		return strings.TrimSuffix(path, "-journal"), true
 	default:
 		return "", false

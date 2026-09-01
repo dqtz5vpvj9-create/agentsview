@@ -1088,7 +1088,6 @@ func TestFailedReportRetryPreservesFirstFailureUntilSuccess(t *testing.T) {
 	captureDir := filepath.Join(t.TempDir(), "capture")
 	firstResultPath := filepath.Join(t.TempDir(), "first.json")
 	limits := testLimits()
-	limits.FinalizationWait = 5 * time.Second
 	limits.MaxSourceBytes = 8 << 10
 	producer := copyCaptureHelper(t, "claude")
 
@@ -1306,6 +1305,8 @@ func TestRunCodexMalformedRecordSealsPartialUsage(t *testing.T) {
 			root := t.TempDir()
 			resultPath := filepath.Join(t.TempDir(), "result.json")
 			producer := copyCaptureHelper(t, "codex")
+			limits := testLimits()
+			limits.FinalizationWait = 30 * time.Second
 			_, err := Run(context.Background(), RunOptions{
 				Provider: ProviderCodex, OccurrenceID: "codex-malformed-" + tc.name,
 				CaptureDir: filepath.Join(t.TempDir(), "capture"),
@@ -1313,7 +1314,7 @@ func TestRunCodexMalformedRecordSealsPartialUsage(t *testing.T) {
 				Command:     []string{producer, "exec", "--json", "prompt"},
 				Environment: helperEnvironment(root, tc.mode, 0),
 				Streams:     Streams{Stdout: io.Discard, Stderr: io.Discard},
-				Limits:      testLimits(), CustomPricing: testPricing(),
+				Limits:      limits, CustomPricing: testPricing(),
 			})
 			require.NoError(t, err)
 
@@ -1450,7 +1451,6 @@ func TestRunCodexFindsChildInSpawnDayShard(t *testing.T) {
 	resultPath := filepath.Join(t.TempDir(), "result.json")
 	producer := copyCaptureHelper(t, "codex")
 	limits := testLimits()
-	limits.FinalizationWait = 5 * time.Second
 	_, err := Run(context.Background(), RunOptions{
 		Provider: ProviderCodex, OccurrenceID: "codex-late-child",
 		CaptureDir: filepath.Join(t.TempDir(), "capture"), ResultPath: resultPath,
@@ -2100,8 +2100,10 @@ func TestCaptureDistinguishesAnObservedSourceThatDisappears(t *testing.T) {
 		err     error
 	}
 	done := make(chan runResponse, 1)
+	persisted := make(chan struct{})
+	release := make(chan struct{}, 1)
 	go func() {
-		outcome, runErr := Run(context.Background(), RunOptions{
+		outcome, runErr := runWithHooks(context.Background(), RunOptions{
 			Provider: ProviderClaude, OccurrenceID: "source-disappeared",
 			CaptureDir: captureDir, ResultPath: resultPath,
 			ProviderRoot: root, WorkDir: workDir,
@@ -2109,19 +2111,31 @@ func TestCaptureDistinguishesAnObservedSourceThatDisappears(t *testing.T) {
 			Environment: helperEnvironment(root, "claude-final", 0),
 			Streams:     Streams{Stdout: io.Discard, Stderr: io.Discard},
 			Limits:      limits, CustomPricing: testPricing(),
+		}, &captureHooks{
+			afterPersistedSources: func() {
+				close(persisted)
+				<-release
+			},
 		})
 		done <- runResponse{outcome: outcome, err: runErr}
 	}()
-
-	require.Eventually(t, func() bool {
-		data, err := os.ReadFile(filepath.Join(captureDir, manifestFileName))
-		if err != nil {
-			return false
+	t.Cleanup(func() {
+		select {
+		case release <- struct{}{}:
+		default:
 		}
-		var captured manifest
-		return json.Unmarshal(data, &captured) == nil && captured.SourceObserved
-	}, 20*time.Second, 10*time.Millisecond)
+	})
+
+	select {
+	case <-persisted:
+	case response := <-done:
+		require.Failf(t, "capture completed before persisting its source set",
+			"exit=%d err=%v", response.outcome.ExitCode, response.err)
+	case <-time.After(20 * time.Second):
+		require.Fail(t, "capture did not persist its source set")
+	}
 	require.NoError(t, os.Rename(root, root+"-gone"))
+	release <- struct{}{}
 	response := <-done
 	require.Error(t, response.err)
 	assert.Equal(t, ReportFailureExitCode, response.outcome.ExitCode)
@@ -2129,7 +2143,8 @@ func TestCaptureDistinguishesAnObservedSourceThatDisappears(t *testing.T) {
 	require.NoError(t, err)
 	result, err := DecodeResult(bytes.NewReader(data))
 	require.NoError(t, err)
-	assert.Equal(t, ReasonSourceUnavailable, result.Reporting.Reason)
+	assert.Equal(t, ReasonSourceUnavailable, result.Reporting.Reason,
+		"run error: %v", response.err)
 }
 
 func TestCaptureLeavesNormalRuntimeStateUntouched(t *testing.T) {

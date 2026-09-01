@@ -30,20 +30,22 @@ func fallbackPricingRows() []db.ModelPricing {
 		bands := make([]db.PricingBand, len(p.Bands))
 		for j, band := range p.Bands {
 			bands[j] = db.PricingBand{
-				AboveInputTokens:     band.AboveInputTokens,
-				InputPerMTok:         band.InputPerMTok,
-				OutputPerMTok:        band.OutputPerMTok,
-				CacheCreationPerMTok: band.CacheCreationPerMTok,
-				CacheReadPerMTok:     band.CacheReadPerMTok,
+				AboveInputTokens:       band.AboveInputTokens,
+				InputPerMTok:           band.InputPerMTok,
+				OutputPerMTok:          band.OutputPerMTok,
+				CacheCreationPerMTok:   band.CacheCreationPerMTok,
+				CacheCreation1hPerMTok: band.CacheCreation1hPerMTok,
+				CacheReadPerMTok:       band.CacheReadPerMTok,
 			}
 		}
 		out[i] = db.ModelPricing{
-			ModelPattern:         p.ModelPattern,
-			InputPerMTok:         p.InputPerMTok,
-			OutputPerMTok:        p.OutputPerMTok,
-			CacheCreationPerMTok: p.CacheCreationPerMTok,
-			CacheReadPerMTok:     p.CacheReadPerMTok,
-			Bands:                bands,
+			ModelPattern:           p.ModelPattern,
+			InputPerMTok:           p.InputPerMTok,
+			OutputPerMTok:          p.OutputPerMTok,
+			CacheCreationPerMTok:   p.CacheCreationPerMTok,
+			CacheCreation1hPerMTok: p.CacheCreation1hPerMTok,
+			CacheReadPerMTok:       p.CacheReadPerMTok,
+			Bands:                  bands,
 		}
 	}
 	return out
@@ -68,12 +70,13 @@ func pgFallbackRateMap() map[string]export.ModelRates {
 	out := make(map[string]export.ModelRates, len(src))
 	for _, p := range src {
 		out[p.ModelPattern] = export.ModelRates{
-			InputPerMTok:      p.InputPerMTok,
-			OutputPerMTok:     p.OutputPerMTok,
-			CacheWritePerMTok: p.CacheCreationPerMTok,
-			CacheReadPerMTok:  p.CacheReadPerMTok,
-			Source:            export.PricingRowSourceEmbedded,
-			Bands:             pgCatalogPricingBands(p.Bands),
+			InputPerMTok:        p.InputPerMTok,
+			OutputPerMTok:       p.OutputPerMTok,
+			CacheWritePerMTok:   p.CacheCreationPerMTok,
+			CacheWrite1hPerMTok: p.CacheCreation1hPerMTok,
+			CacheReadPerMTok:    p.CacheReadPerMTok,
+			Source:              export.PricingRowSourceEmbedded,
+			Bands:               pgCatalogPricingBands(p.Bands),
 		}
 	}
 	return out
@@ -88,12 +91,13 @@ func pgModelPricingRates(p db.ModelPricing) export.ModelRates {
 		}
 	}
 	return export.ModelRates{
-		InputPerMTok:      p.InputPerMTok,
-		OutputPerMTok:     p.OutputPerMTok,
-		CacheWritePerMTok: p.CacheCreationPerMTok,
-		CacheReadPerMTok:  p.CacheReadPerMTok,
-		UpdatedAt:         updatedAt,
-		Bands:             pgStoredPricingBands(p.Bands),
+		InputPerMTok:        p.InputPerMTok,
+		OutputPerMTok:       p.OutputPerMTok,
+		CacheWritePerMTok:   p.CacheCreationPerMTok,
+		CacheWrite1hPerMTok: p.CacheCreation1hPerMTok,
+		CacheReadPerMTok:    p.CacheReadPerMTok,
+		UpdatedAt:           updatedAt,
+		Bands:               pgStoredPricingBands(p.Bands),
 	}
 }
 
@@ -101,11 +105,12 @@ func pgCatalogPricingBands(bands []pricing.PricingBand) []export.PricingBand {
 	out := make([]export.PricingBand, len(bands))
 	for i, band := range bands {
 		out[i] = export.PricingBand{
-			AboveInputTokens:  band.AboveInputTokens,
-			InputPerMTok:      band.InputPerMTok,
-			OutputPerMTok:     band.OutputPerMTok,
-			CacheWritePerMTok: band.CacheCreationPerMTok,
-			CacheReadPerMTok:  band.CacheReadPerMTok,
+			AboveInputTokens:    band.AboveInputTokens,
+			InputPerMTok:        band.InputPerMTok,
+			OutputPerMTok:       band.OutputPerMTok,
+			CacheWritePerMTok:   band.CacheCreationPerMTok,
+			CacheWrite1hPerMTok: band.CacheCreation1hPerMTok,
+			CacheReadPerMTok:    band.CacheReadPerMTok,
 		}
 	}
 	return out
@@ -120,12 +125,13 @@ func pgStoredPricingBands(bands []db.PricingBand) []export.PricingBand {
 			updatedAt = &t
 		}
 		out[i] = export.PricingBand{
-			AboveInputTokens:  band.AboveInputTokens,
-			InputPerMTok:      band.InputPerMTok,
-			OutputPerMTok:     band.OutputPerMTok,
-			CacheWritePerMTok: band.CacheCreationPerMTok,
-			CacheReadPerMTok:  band.CacheReadPerMTok,
-			UpdatedAt:         updatedAt,
+			AboveInputTokens:    band.AboveInputTokens,
+			InputPerMTok:        band.InputPerMTok,
+			OutputPerMTok:       band.OutputPerMTok,
+			CacheWritePerMTok:   band.CacheCreationPerMTok,
+			CacheWrite1hPerMTok: band.CacheCreation1hPerMTok,
+			CacheReadPerMTok:    band.CacheReadPerMTok,
+			UpdatedAt:           updatedAt,
 		}
 	}
 	return out
@@ -138,6 +144,7 @@ func pgModelPricingSource(
 		rates.InputPerMTok == p.InputPerMTok &&
 		rates.OutputPerMTok == p.OutputPerMTok &&
 		rates.CacheWritePerMTok == p.CacheCreationPerMTok &&
+		rates.CacheWrite1hPerMTok == p.CacheCreation1hPerMTok &&
 		rates.CacheReadPerMTok == p.CacheReadPerMTok &&
 		pgPricingBandsEqual(rates.Bands, pgStoredPricingBands(p.Bands)) {
 		return export.PricingRowSourceEmbedded
@@ -154,6 +161,7 @@ func pgPricingBandsEqual(a, b []export.PricingBand) bool {
 			a[i].InputPerMTok != b[i].InputPerMTok ||
 			a[i].OutputPerMTok != b[i].OutputPerMTok ||
 			a[i].CacheWritePerMTok != b[i].CacheWritePerMTok ||
+			a[i].CacheWrite1hPerMTok != b[i].CacheWrite1hPerMTok ||
 			a[i].CacheReadPerMTok != b[i].CacheReadPerMTok {
 			return false
 		}
@@ -187,6 +195,72 @@ func clonePricingRows(
 		out[i] = row
 	}
 	return out
+}
+
+type pgGenAIPricingQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func embeddedPGGenAIPricingDocument() db.GenAIPricingDocument {
+	embedded := pricing.EmbeddedGenAIDocument()
+	return db.GenAIPricingDocument{
+		Version: embedded.Version, SourceRef: embedded.SourceRef,
+		Source: db.GenAIPricingSourceEmbedded, Data: embedded.RawJSON(),
+	}
+}
+
+func loadPGGenAIPricing(
+	ctx context.Context, q pgGenAIPricingQuerier,
+) (*db.GenAIPricingDocument, error) {
+	var document db.GenAIPricingDocument
+	err := q.QueryRowContext(ctx, `
+		SELECT version, source_ref, source, data_json, updated_at
+		FROM genai_pricing WHERE singleton = 1`).Scan(
+		&document.Version, &document.SourceRef, &document.Source,
+		&document.Data, &document.UpdatedAt,
+	)
+	if err == sql.ErrNoRows || isUndefinedTable(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading pg GenAI pricing document: %w", err)
+	}
+	return &document, nil
+}
+
+func pgGenAIEffectivePricingRow(
+	document *db.GenAIPricingDocument,
+) (export.EffectivePricingRow, error) {
+	if document == nil {
+		embedded := pricing.EmbeddedGenAIDocument()
+		return export.EffectivePricingRow{
+			GenAI: embedded.Prices, GenAIVersion: embedded.Version,
+			GenAISource: export.PricingRowSourceEmbedded,
+		}, nil
+	}
+	parsed, err := pricing.ParseGenAIDocument(
+		document.Data, document.Version, document.SourceRef,
+	)
+	if err != nil {
+		return export.EffectivePricingRow{}, fmt.Errorf(
+			"parsing pg GenAI pricing document: %w", err,
+		)
+	}
+	var updatedAt *time.Time
+	if parsedTime, parseErr := time.Parse(
+		time.RFC3339Nano, document.UpdatedAt,
+	); parseErr == nil {
+		utc := parsedTime.UTC()
+		updatedAt = &utc
+	}
+	source := export.PricingRowSourceFetched
+	if document.Source == db.GenAIPricingSourceEmbedded {
+		source = export.PricingRowSourceEmbedded
+	}
+	return export.EffectivePricingRow{
+		GenAI: parsed.Prices, GenAIVersion: parsed.Version,
+		GenAISource: source, GenAIUpdatedAt: updatedAt,
+	}, nil
 }
 
 func (s *Store) loadPricingMap(
@@ -229,19 +303,27 @@ func (s *Store) startPricingLoad() *pricingLoad {
 }
 
 func (s *Store) runPricingLoad(ctx context.Context, load *pricingLoad) {
+	defer load.cancel()
 	out := map[string]export.ModelRates{}
 	dbRows, err := s.mergeDBPricing(ctx, out)
 	if err == nil && dbRows == 0 {
 		out = fallbackPricingMap()
 	}
-	load.cancel()
-
 	var prices []export.EffectivePricingRow
 	if err == nil {
 		s.pricingMu.Lock()
 		s.applyCustomPricing(out)
 		s.pricingMu.Unlock()
 		prices = pricingMapRows(out)
+		var document *db.GenAIPricingDocument
+		document, err = loadPGGenAIPricing(ctx, s.pg)
+		if err == nil {
+			var row export.EffectivePricingRow
+			row, err = pgGenAIEffectivePricingRow(document)
+			if err == nil {
+				prices = append(prices, row)
+			}
+		}
 	}
 
 	s.pricingLoadMu.Lock()
@@ -327,6 +409,9 @@ func (s *Store) applyCustomPricing(out map[string]export.ModelRates) {
 			CacheWritePerMTok: money.Money{
 				Microdollars: cp.CacheCreationMicrodollarsPerMTok,
 			},
+			CacheWrite1hPerMTok: money.Money{
+				Microdollars: cp.CacheCreation1hMicrodollarsPerMTok,
+			},
 			CacheReadPerMTok: money.Money{
 				Microdollars: cp.CacheReadMicrodollarsPerMTok,
 			},
@@ -347,12 +432,14 @@ const pgModelPricingSelect = `SELECT
 	p.input_microdollars_per_mtok,
 	p.output_microdollars_per_mtok,
 	p.cache_creation_microdollars_per_mtok,
+	p.cache_creation_1h_microdollars_per_mtok,
 	p.cache_read_microdollars_per_mtok,
 	p.updated_at,
 	b.above_input_tokens,
 	b.input_microdollars_per_mtok,
 	b.output_microdollars_per_mtok,
 	b.cache_creation_microdollars_per_mtok,
+	b.cache_creation_1h_microdollars_per_mtok,
 	b.cache_read_microdollars_per_mtok,
 	b.updated_at
 FROM model_pricing p
@@ -365,19 +452,19 @@ func pgPricingUpsertStatement(
 	var b strings.Builder
 	b.WriteString(`INSERT INTO model_pricing
 		(model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
-		 cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok,
-		 updated_at)
+		 cache_creation_microdollars_per_mtok, cache_creation_1h_microdollars_per_mtok,
+		 cache_read_microdollars_per_mtok, updated_at)
 	VALUES `)
-	args := make([]any, 0, len(prices)*6)
+	args := make([]any, 0, len(prices)*7)
 	for i, p := range prices {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		base := i*6 + 1
+		base := i*7 + 1
 		fmt.Fprintf(
 			&b,
-			"($%d, $%d, $%d, $%d, $%d, $%d)",
-			base, base+1, base+2, base+3, base+4, base+5,
+			"($%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+			base, base+1, base+2, base+3, base+4, base+5, base+6,
 		)
 		updatedAt := p.UpdatedAt
 		if updatedAt == "" {
@@ -388,6 +475,7 @@ func pgPricingUpsertStatement(
 			p.InputPerMTok,
 			p.OutputPerMTok,
 			p.CacheCreationPerMTok,
+			p.CacheCreation1hPerMTok,
 			p.CacheReadPerMTok,
 			sanitizePG(updatedAt),
 		)
@@ -397,6 +485,7 @@ func pgPricingUpsertStatement(
 		input_microdollars_per_mtok = EXCLUDED.input_microdollars_per_mtok,
 		output_microdollars_per_mtok = EXCLUDED.output_microdollars_per_mtok,
 		cache_creation_microdollars_per_mtok = EXCLUDED.cache_creation_microdollars_per_mtok,
+		cache_creation_1h_microdollars_per_mtok = EXCLUDED.cache_creation_1h_microdollars_per_mtok,
 		cache_read_microdollars_per_mtok = EXCLUDED.cache_read_microdollars_per_mtok,
 		updated_at = CASE
 			WHEN model_pricing.updated_at = '' THEN EXCLUDED.updated_at
@@ -414,6 +503,8 @@ func pgPricingUpsertStatement(
 			EXCLUDED.output_microdollars_per_mtok
 		OR model_pricing.cache_creation_microdollars_per_mtok IS DISTINCT FROM
 			EXCLUDED.cache_creation_microdollars_per_mtok
+		OR model_pricing.cache_creation_1h_microdollars_per_mtok IS DISTINCT FROM
+			EXCLUDED.cache_creation_1h_microdollars_per_mtok
 		OR model_pricing.cache_read_microdollars_per_mtok IS DISTINCT FROM
 			EXCLUDED.cache_read_microdollars_per_mtok
 	RETURNING model_pattern`)
@@ -439,19 +530,22 @@ func scanPGModelPricingRows(rows *sql.Rows) ([]db.ModelPricing, error) {
 	byPattern := make(map[string]int)
 	for rows.Next() {
 		var p db.ModelPricing
-		var threshold, input, output, cacheCreation, cacheRead sql.NullInt64
+		var threshold, input, output, cacheCreation, cacheCreation1h,
+			cacheRead sql.NullInt64
 		var bandUpdatedAt sql.NullString
 		if err := rows.Scan(
 			&p.ModelPattern,
 			&p.InputPerMTok,
 			&p.OutputPerMTok,
 			&p.CacheCreationPerMTok,
+			&p.CacheCreation1hPerMTok,
 			&p.CacheReadPerMTok,
 			&p.UpdatedAt,
 			&threshold,
 			&input,
 			&output,
 			&cacheCreation,
+			&cacheCreation1h,
 			&cacheRead,
 			&bandUpdatedAt,
 		); err != nil {
@@ -481,6 +575,9 @@ func scanPGModelPricingRows(rows *sql.Rows) ([]db.ModelPricing, error) {
 				},
 				CacheCreationPerMTok: money.Money{
 					Microdollars: cacheCreation.Int64,
+				},
+				CacheCreation1hPerMTok: money.Money{
+					Microdollars: cacheCreation1h.Int64,
 				},
 				CacheReadPerMTok: money.Money{
 					Microdollars: cacheRead.Int64,
@@ -559,16 +656,17 @@ func pgPricingBandInsertStatement(
 		(model_pattern, above_input_tokens,
 		 input_microdollars_per_mtok, output_microdollars_per_mtok,
 		 cache_creation_microdollars_per_mtok,
+		 cache_creation_1h_microdollars_per_mtok,
 		 cache_read_microdollars_per_mtok, updated_at)
 	VALUES `)
-	args := make([]any, 0, len(bands)*7)
+	args := make([]any, 0, len(bands)*8)
 	for i, item := range bands {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		base := i*7 + 1
-		fmt.Fprintf(&b, "($%d, $%d, $%d, $%d, $%d, $%d, $%d)",
-			base, base+1, base+2, base+3, base+4, base+5, base+6)
+		base := i*8 + 1
+		fmt.Fprintf(&b, "($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+			base, base+1, base+2, base+3, base+4, base+5, base+6, base+7)
 		updatedAt := item.band.UpdatedAt
 		if updatedAt == "" {
 			updatedAt = defaultUpdatedAt
@@ -579,6 +677,7 @@ func pgPricingBandInsertStatement(
 			item.band.InputPerMTok,
 			item.band.OutputPerMTok,
 			item.band.CacheCreationPerMTok,
+			item.band.CacheCreation1hPerMTok,
 			item.band.CacheReadPerMTok,
 			sanitizePG(updatedAt),
 		)
@@ -594,15 +693,15 @@ func pgPricingMetaUpsertStatement(
 	var b strings.Builder
 	b.WriteString(`INSERT INTO model_pricing
 		(model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
-		 cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok,
-		 updated_at)
+		 cache_creation_microdollars_per_mtok, cache_creation_1h_microdollars_per_mtok,
+		 cache_read_microdollars_per_mtok, updated_at)
 	VALUES `)
 	args := make([]any, 0, len(metaRows)*2)
 	for i, row := range metaRows {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		fmt.Fprintf(&b, "($%d, 0, 0, 0, 0, $%d)", i*2+1, i*2+2)
+		fmt.Fprintf(&b, "($%d, 0, 0, 0, 0, 0, $%d)", i*2+1, i*2+2)
 		args = append(args,
 			sanitizePG(row.ModelPattern), sanitizePG(row.UpdatedAt),
 		)
@@ -779,6 +878,28 @@ func lockPGModelPricing(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+func upsertPGGenAIPricing(
+	ctx context.Context, tx *sql.Tx, document db.GenAIPricingDocument,
+) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO genai_pricing
+			(singleton, version, source_ref, source, data_json, updated_at)
+		VALUES (1, $1, $2, $3, $4, $5)
+		ON CONFLICT(singleton) DO UPDATE SET
+			version = excluded.version,
+			source_ref = excluded.source_ref,
+			source = excluded.source,
+			data_json = excluded.data_json,
+			updated_at = excluded.updated_at`,
+		document.Version, document.SourceRef, document.Source,
+		document.Data, document.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("upserting pg GenAI pricing document: %w", err)
+	}
+	return nil
+}
+
 func (s *Sync) syncModelPricing(ctx context.Context) error {
 	prices, err := s.local.ListModelPricing(ctx)
 	if err != nil {
@@ -786,6 +907,14 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 	}
 	if len(prices) == 0 {
 		prices = fallbackPricingRows()
+	}
+	localGenAI, err := s.local.GetGenAIPricing(ctx)
+	if err != nil {
+		return fmt.Errorf("reading local GenAI pricing document: %w", err)
+	}
+	if localGenAI == nil {
+		embedded := embeddedPGGenAIPricingDocument()
+		localGenAI = &embedded
 	}
 	tx, err := s.pg.BeginTx(ctx, nil)
 	if err != nil {
@@ -809,13 +938,23 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("planning model pricing sync: %w", err)
 	}
-	if len(changedPrices) == 0 && len(removePatterns) == 0 {
+	existingGenAI, err := loadPGGenAIPricing(ctx, tx)
+	if err != nil {
+		return err
+	}
+	genAIChanged := !db.GenAIPricingDocumentsEqual(existingGenAI, localGenAI)
+	if len(changedPrices) == 0 && len(removePatterns) == 0 && !genAIChanged {
 		return nil
 	}
 	if err := reconcileModelPricing(
 		ctx, tx, changedPrices, removePatterns,
 	); err != nil {
 		return fmt.Errorf("syncing model pricing to pg: %w", err)
+	}
+	if genAIChanged {
+		if err := upsertPGGenAIPricing(ctx, tx, *localGenAI); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing pg pricing sync: %w", err)
