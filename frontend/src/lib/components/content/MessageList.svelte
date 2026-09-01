@@ -85,6 +85,7 @@
       return filterDisplayItemsByTranscriptMode(
         baseDisplayItemsAsc,
         "focused",
+        { agent: sessions.activeSession?.agent },
       );
     }
 
@@ -92,6 +93,7 @@
       filteredDisplayItemsAsc,
       "focused",
       {
+        agent: sessions.activeSession?.agent,
         isMessageVisible: (message) =>
           hasVisibleSegments(message, (type) =>
             ui.isBlockVisible(type),

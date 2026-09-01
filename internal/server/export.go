@@ -643,7 +643,7 @@ func generateExportHTML(
 		Messages:     make([]exportMessage, len(msgs)),
 	}
 
-	focusedVisible := focusedExportOrdinals(msgs)
+	focusedVisible := focusedExportOrdinals(msgs, session.Agent)
 	for i, m := range msgs {
 		roleClass := "unknown"
 		if m.Role == "user" || m.Role == "assistant" {
@@ -744,7 +744,22 @@ func isThinkingOnly(content string) bool {
 	return strings.TrimSpace(without) == ""
 }
 
-func focusedExportOrdinals(msgs []db.Message) map[int]bool {
+// agentsThatWorkPastTheAnswer lists agents whose transcripts keep calling
+// tools after they answer. Codex and its fork TraeX report a result mid-turn
+// and then continue working, and the next user prompt often lands while that
+// work is still running, so trailing tool calls say nothing about whether the
+// preceding text was the turn's answer. Mirrors
+// keepsAnswerAfterTrailingToolWork in the app's transcript-mode filter; the
+// two must stay in sync so an export matches what the viewer showed.
+var agentsThatWorkPastTheAnswer = map[string]bool{
+	"codex": true,
+	"traex": true,
+}
+
+func focusedExportOrdinals(
+	msgs []db.Message, agent string,
+) map[int]bool {
+	keepAnswerAfterToolWork := agentsThatWorkPastTheAnswer[agent]
 	visible := make(map[int]bool, len(msgs))
 	pendingOrdinal := 0
 	hasPendingAssistant := false
@@ -771,7 +786,7 @@ func focusedExportOrdinals(msgs []db.Message) map[int]bool {
 		}
 
 		if isExportToolOnly(m) {
-			if hasPendingAssistant {
+			if hasPendingAssistant && !keepAnswerAfterToolWork {
 				toolAfterPendingAssistant = true
 			}
 			continue
