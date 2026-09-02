@@ -108,6 +108,17 @@ type codexForkGate struct {
 	// child turn opens it, so the retry verdict reads this sticky flag
 	// instead.
 	resolvedOnce bool
+	// parentTurnless records that the resolved parent transcript held no
+	// turn ids. Codex Desktop writes a rollout when a thread opens, so a
+	// fork taken before the first prompt names a parent like this and has
+	// replayed nothing; the child is then current. Only when the child
+	// also carries the copied parent session_meta (replayObserved) did the
+	// parent write turns the fork copied but its own file has not flushed
+	// yet, and the child waits for the parent to advance.
+	parentTurnless bool
+	// replayObserved marks that the copied parent session_meta was seen,
+	// the positive proof that a replay prefix exists in this rollout.
+	replayObserved bool
 }
 
 // retryReason reports the unresolved-parent retry condition captured
@@ -115,7 +126,10 @@ type codexForkGate struct {
 // provide turn ids keeps the child visible but marks its data version
 // for retry. Empty when the parse is current.
 func (g *codexForkGate) retryReason() string {
-	if !g.lineagePositive || g.resolvedOnce || g.parentSessionID == "" {
+	if !g.lineagePositive || g.parentSessionID == "" {
+		return ""
+	}
+	if g.resolvedOnce && !(g.parentTurnless && g.replayObserved) {
 		return ""
 	}
 	return "codex parent turns unresolved for " + g.parentSessionID
@@ -152,10 +166,13 @@ func (g *codexForkGate) armFromMeta(payload gjson.Result, parentResolved bool) {
 // transcript. Explicit forks are already active when their copied meta
 // arrives.
 func (g *codexForkGate) suppressesSessionMeta(payload gjson.Result) bool {
+	parentID := payload.Get("id").Str
+	if parentID != "" && parentID == g.parentSessionID {
+		g.replayObserved = true
+	}
 	if g.active {
 		return true
 	}
-	parentID := payload.Get("id").Str
 	if parentID == "" || parentID != g.parentSessionID {
 		return false
 	}
@@ -239,6 +256,7 @@ func (b *codexSessionBuilder) armForkGate(payload gjson.Result) {
 		b.parentTurnIDs, resolved = b.resolveParentTurns(parentID)
 	}
 	b.forkGate.armFromMeta(payload, resolved)
+	b.forkGate.parentTurnless = resolved && len(b.parentTurnIDs) == 0
 }
 
 func (b *codexSessionBuilder) suppresses(
@@ -1541,7 +1559,7 @@ func (p *codexProvider) parentTurnResolver(
 		}
 		parentKey := strings.Join(p.sources.roots, "\x00") + "\x00" + parentID
 		if turnIDs, ok := p.parentTurnCache.GetParent(parentKey); ok {
-			return turnIDs, len(turnIDs) > 0
+			return turnIDs, true
 		}
 		parentPath := ""
 		for _, root := range p.sources.roots {
@@ -1564,7 +1582,7 @@ func (p *codexProvider) parentTurnResolver(
 		}
 		cacheKey := codexParentTurnCacheKeyFor(parentPath, info)
 		if turnIDs, ok := p.parentTurnCache.Get(cacheKey); ok {
-			return turnIDs, len(turnIDs) > 0
+			return turnIDs, true
 		}
 
 		turnIDs := make(map[string]struct{})
@@ -1578,7 +1596,7 @@ func (p *codexProvider) parentTurnResolver(
 			return nil, false
 		}
 		p.parentTurnCache.PutParent(parentKey, cacheKey, turnIDs)
-		return turnIDs, len(turnIDs) > 0
+		return turnIDs, true
 	}
 }
 
