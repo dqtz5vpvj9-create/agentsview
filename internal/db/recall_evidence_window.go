@@ -264,7 +264,7 @@ func buildRecallEvidenceWindow(
 		       COALESCE(tc.input_json, ''),
 		       COALESCE(tc.skill_name, ''),
 		       COALESCE(tc.result_content_length, 0),
-		       COALESCE(tc.result_content, ''),
+		       `+ToolCallResultContentSQL("tc", "m.ordinal")+`,
 		       COALESCE(tc.subagent_session_id, '')
 		FROM tool_calls tc
 		JOIN messages m ON m.id = tc.message_id

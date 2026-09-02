@@ -1923,6 +1923,9 @@ func attachToolCallsWithQuerier(
 	if err := attachToolResultEvents(ctx, q, msgs); err != nil {
 		return err
 	}
+	// A summary that only repeated its single event is not stored. Refill it
+	// here, once, so no consumer of a loaded message has to know that.
+	RestoreMessageResultContent(msgs)
 	return nil
 }
 
@@ -2486,6 +2489,45 @@ func (db *DB) SetToolCallSubagentSession(
 	return nil
 }
 
+// soleToolResultEventContentByIDTx is the tool_use_id-keyed twin of
+// soleToolResultEventContentTx, for the subagent-link path that knows the
+// call only by its tool_use_id.
+func soleToolResultEventContentByIDTx(
+	tx *sql.Tx, sessionID, toolUseID string,
+) ([]ToolResultEvent, error) {
+	if toolUseID == "" {
+		return nil, nil
+	}
+	return soleToolResultEventTx(
+		tx, sessionID+"/"+toolUseID,
+		"session_id = ? AND tool_use_id = ?",
+		sessionID, toolUseID,
+	)
+}
+
+// soleToolResultEventTx returns a one-element slice when the matched rows
+// are exactly one event, and nil for every other count, which never dedups.
+// MIN over that single row is just its content.
+func soleToolResultEventTx(
+	tx *sql.Tx, label, where string, args ...any,
+) ([]ToolResultEvent, error) {
+	var count int
+	var content sql.NullString
+	if err := tx.QueryRow(
+		`SELECT COUNT(*), MIN(content) FROM tool_result_events
+		 WHERE `+where,
+		args...,
+	).Scan(&count, &content); err != nil {
+		return nil, fmt.Errorf(
+			"counting tool result events for %s: %w", label, err,
+		)
+	}
+	if count != 1 {
+		return nil, nil
+	}
+	return []ToolResultEvent{{Content: content.String}}, nil
+}
+
 func applyToolCallSubagentLinkTx(
 	tx *sql.Tx, sessionID string, link ToolCallSubagentLink,
 	blockedResultCategories map[string]bool,
@@ -2531,6 +2573,17 @@ func applyToolCallSubagentLinkTx(
 	resultContent := link.ResultContent
 	if blockedResultCategories[category] {
 		resultContent = ""
+	} else {
+		// A linked result carries no events of its own, but the call it
+		// targets may already have one stored. Re-storing a summary the
+		// event repeats would undo the dedup on every incremental pass.
+		sole, err := soleToolResultEventContentByIDTx(
+			tx, sessionID, link.ToolUseID,
+		)
+		if err != nil {
+			return false, err
+		}
+		resultContent = DedupToolCallResultSummary(resultContent, sole)
 	}
 	if currentSubagent == storedSubagent &&
 		currentResultContentLen == link.ResultContentLen &&
@@ -2726,10 +2779,12 @@ func resolveToolCalls(
 				InputJSON:           tc.InputJSON,
 				SkillName:           tc.SkillName,
 				ResultContentLength: tc.ResultContentLength,
-				ResultContent:       tc.ResultContent,
-				SubagentSessionID:   tc.SubagentSessionID,
-				FilePath:            tc.FilePath,
-				CallIndex:           callIdx,
+				ResultContent: DedupToolCallResultSummary(
+					tc.ResultContent, tc.ResultEvents,
+				),
+				SubagentSessionID: tc.SubagentSessionID,
+				FilePath:          tc.FilePath,
+				CallIndex:         callIdx,
 			})
 		}
 	}

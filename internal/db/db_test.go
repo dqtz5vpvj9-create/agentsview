@@ -1052,8 +1052,13 @@ func TestCurrentDataVersionPositAssistantProviderIdentity(t *testing.T) {
 }
 
 func TestCurrentDataVersionAntigravityCLICwdAndWorktreeProject(t *testing.T) {
-	assert.Equal(t, 96, CurrentDataVersion(),
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 96,
 		"Antigravity CLI cwd and worktree project recovery require a sequential backfill")
+}
+
+func TestCurrentDataVersionToolResultSummaryDedup(t *testing.T) {
+	assert.Equal(t, 97, CurrentDataVersion(),
+		"dropping summaries a single result event repeats requires a re-parse")
 }
 
 func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {
