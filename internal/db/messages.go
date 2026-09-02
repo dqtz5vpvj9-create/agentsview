@@ -465,7 +465,7 @@ type UnitOffset struct {
 // since != "" restricts the scan to sessions with ended_at >= since (RFC3339
 // or RFC3339Nano) for incremental refresh, comparing parsed timestamps
 // rather than raw strings via SQLite's datetime() so mixed fractional-second
-// precision doesn't produce a wrong ordering (see optionalSinceClause); ""
+// precision doesn't produce a wrong ordering (see sinceSessionScopeClause); ""
 // scans every session. includeAutomated=false additionally excludes
 // automated sessions (sessions.is_automated = 1) using the exact predicate
 // sessionFilterPredicates' ExcludeAutomated scope applies
@@ -490,32 +490,13 @@ func (db *DB) ScanEmbeddableUnits(
 	ctx context.Context, since string, includeAutomated bool,
 	fn func(EmbeddableUnit) error,
 ) (maxEnded string, err error) {
-	preds := []string{
-		"m.role IN ('user', 'assistant')",
-		"m.is_system = 0",
-		"s.deleted_at IS NULL",
-		SystemPrefixSQL("m.content", "m.role"),
-	}
-	if !includeAutomated {
-		preds = append(preds, automatedScopePredicate("human", "s.is_automated"))
-	}
-
-	query := `
-		SELECT m.session_id, m.role, m.source_uuid, m.ordinal, m.content,
-		       m.is_sidechain, s.relationship_type, s.parent_session_id,
-		       s.ended_at
-		FROM messages m
-		JOIN sessions s ON s.id = m.session_id
-		WHERE ` + strings.Join(preds, "\n\t\t  AND ") + `
-		` + optionalSinceClause(since) + `
-		ORDER BY m.session_id, m.ordinal`
-
 	args := []any{}
 	if since != "" {
 		args = append(args, since)
 	}
 
-	rows, err := db.getReader().QueryContext(ctx, query, args...)
+	rows, err := db.getReader().QueryContext(
+		ctx, embeddableUnitsQuery(since, includeAutomated), args...)
 	if err != nil {
 		return "", fmt.Errorf("scanning embeddable units: %w", err)
 	}
@@ -698,9 +679,49 @@ func runUnit(members []unitRow) EmbeddableUnit {
 	}
 }
 
-// optionalSinceClause returns the AND clause restricting the embeddable scan
-// to sessions with ended_at >= since (or ended_at IS NULL), or "" when since
-// is unset. It compares via SQLite's datetime() rather than raw string
+// embeddableUnitsQuery builds ScanEmbeddableUnits' statement. It takes one
+// bound argument (since) when since is set and none otherwise, and always
+// emits rows in (session_id, ordinal) order, which unitReducer depends on.
+func embeddableUnitsQuery(since string, includeAutomated bool) string {
+	preds := []string{
+		"m.role IN ('user', 'assistant')",
+		"m.is_system = 0",
+		"s.deleted_at IS NULL",
+		SystemPrefixSQL("m.content", "m.role"),
+	}
+	if !includeAutomated {
+		preds = append(preds, automatedScopePredicate("human", "s.is_automated"))
+	}
+	return `
+		SELECT m.session_id, m.role, m.source_uuid, m.ordinal, m.content,
+		       m.is_sidechain, s.relationship_type, s.parent_session_id,
+		       s.ended_at
+		FROM messages m
+		JOIN sessions s ON s.id = m.session_id
+		WHERE ` + strings.Join(preds, "\n\t\t  AND ") + `
+		` + sinceSessionScopeClause(since, includeAutomated) + `
+		ORDER BY m.session_id, m.ordinal`
+}
+
+// sinceSessionScopeClause returns the AND clause restricting the embeddable
+// scan to sessions with ended_at >= since (or ended_at IS NULL), or "" when
+// since is unset.
+//
+// The restriction is written as a session-id IN subquery rather than a
+// predicate on the joined sessions row so SQLite can drive the scan from
+// sessions, which is orders of magnitude smaller than messages. With the
+// predicate on the join, the planner had no indexed way to apply it and
+// scanned every message row (content included) through
+// idx_messages_session_ordinal before discarding almost all of them; an
+// incremental refresh touching eight sessions still read the whole corpus.
+// The IN form makes the candidate session list the outer loop and looks its
+// messages up with SEARCH ... (session_id=?) on that same index, which also
+// keeps the ORDER BY m.session_id, m.ordinal contract satisfied by the index
+// instead of a sort. The subquery repeats the caller's deleted_at and
+// automated-scope predicates so the candidate list stays as small as the
+// outer query's own filters allow.
+//
+// The since comparison uses SQLite's datetime() rather than raw string
 // ordering: RFC3339Nano's variable fractional-second precision (e.g.
 // ended_at values are sometimes stored with milliseconds, sometimes
 // without) makes lexicographic comparison wrong, since "...00.123Z" sorts
@@ -719,12 +740,19 @@ func runUnit(members []unitRow) EmbeddableUnit {
 // the same way via NULLIF(s.ended_at, ""): without it, "" is neither NULL
 // nor >= since, so a changed legacy session would never be rescanned again
 // once any watermark exists.
-func optionalSinceClause(since string) string {
+func sinceSessionScopeClause(since string, includeAutomated bool) string {
 	if since == "" {
 		return ""
 	}
-	return "AND (NULLIF(s.ended_at, '') IS NULL OR " +
-		"datetime(NULLIF(s.ended_at, '')) >= datetime(?))"
+	preds := []string{"es.deleted_at IS NULL"}
+	if !includeAutomated {
+		preds = append(preds, automatedScopePredicate("human", "es.is_automated"))
+	}
+	preds = append(preds, "(NULLIF(es.ended_at, '') IS NULL OR "+
+		"datetime(NULLIF(es.ended_at, '')) >= datetime(?))")
+	return `AND m.session_id IN (
+			SELECT es.id FROM sessions es
+			 WHERE ` + strings.Join(preds, "\n\t\t\t   AND ") + `)`
 }
 
 // endedAfter reports whether candidate is chronologically after current,
