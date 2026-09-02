@@ -212,6 +212,11 @@ func (b *codexSessionBuilder) armForkGate(payload gjson.Result) {
 		b.parentTurnIDs, resolved = b.resolveParentTurns(parentID)
 	}
 	b.forkGate.armFromMeta(payload, resolved)
+	if resolved && len(b.parentTurnIDs) == 0 {
+		// The parent exists but holds no turns, so the fork replayed no
+		// history: every record in this rollout is the child's own.
+		b.forkGate.active = false
+	}
 }
 
 func (b *codexSessionBuilder) suppresses(
@@ -1669,8 +1674,12 @@ func (p *codexProvider) codexParentResolution(
 	if parentID == "" || !resolutionNeeded {
 		return "", false
 	}
-	turnIDs, resolved := p.parentTurnResolver(ctx, childPath)(parentID)
-	return parentID, resolved && len(turnIDs) > 0
+	// A parent that was read but never opened a turn (Codex Desktop writes
+	// a rollout on thread open, and a fork taken before the first prompt
+	// copies nothing) is resolved: there is no replayed history to drop,
+	// and nothing a retry could learn later.
+	_, resolved := p.parentTurnResolver(ctx, childPath)(parentID)
+	return parentID, resolved
 }
 
 // CodexReplayParentID returns the explicit parent only when the rollout has a
