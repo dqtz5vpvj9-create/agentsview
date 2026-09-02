@@ -19,17 +19,35 @@ var ErrUnifiedRebuildAborted = errors.New(
 // RebuildContributor adds another configured sync source to an atomic full
 // rebuild. Contributors run sequentially against the same temporary database.
 type RebuildContributor struct {
-	Name      string
-	Config    EngineConfig
+	Name   string
+	Config EngineConfig
+
+	// ForceParse bypasses freshness gates for every contributor source. Remote
+	// explicit-full imports use this to preserve their parsing contract while
+	// participating in a unified replacement-database rebuild.
+	ForceParse bool
+	// ForceFullParseAfterCache preserves full-source parsing for work not
+	// reached by an interrupted remote attempt while allowing its durable
+	// failure-cache entries to suppress sources that were already attempted.
+	ForceFullParseAfterCache bool
+
 	Progress  func(Progress) Progress
 	Started   func()
 	Finished  func(SyncStats, error)
 	AfterSync func(*Engine, *db.DB) error
+	// AfterFailure runs before an incomplete contributor's replacement
+	// database is discarded. The database argument is the active archive, so
+	// callers can preserve retry state produced by the failed attempt.
+	AfterFailure func(*Engine, *db.DB) error
 }
 
 // RebuildOptions configures optional sources for an atomic full rebuild.
 type RebuildOptions struct {
 	Contributors []RebuildContributor
+	// UnavailableContributorIDPrefixes identifies configured contributor
+	// namespaces that could not be prepared. Their history is excluded from
+	// rebuild safety expectations and survives through orphan copying.
+	UnavailableContributorIDPrefixes []string
 	// includePhaseDiagnostics is enabled only by the options entrypoint. The
 	// legacy ResyncAll wrapper keeps both returned and in-flight stats free of
 	// options-only diagnostics.
@@ -63,6 +81,7 @@ func (e *RebuildContributorError) Unwrap() error { return e.Err }
 
 type rebuildOperations struct {
 	rebuildFTS                        func(*db.DB) error
+	rebuildUsageIndexes               func(*db.DB) error
 	reopen                            func(*db.DB) error
 	listActiveWorktreeMappingMachines func(context.Context, *db.DB) ([]string, error)
 	applyWorktreeMappings             func(context.Context, *db.DB, string) (db.ApplyWorktreeProjectMappingsResult, error)
@@ -70,7 +89,10 @@ type rebuildOperations struct {
 
 var productionRebuildOperations = rebuildOperations{
 	rebuildFTS: func(database *db.DB) error { return database.RebuildFTS() },
-	reopen:     func(database *db.DB) error { return database.Reopen() },
+	rebuildUsageIndexes: func(database *db.DB) error {
+		return database.RebuildUsageMessageIndexes()
+	},
+	reopen: func(database *db.DB) error { return database.Reopen() },
 	listActiveWorktreeMappingMachines: func(
 		ctx context.Context, database *db.DB,
 	) ([]string, error) {
@@ -86,6 +108,9 @@ var productionRebuildOperations = rebuildOperations{
 func (ops rebuildOperations) withDefaults() rebuildOperations {
 	if ops.rebuildFTS == nil {
 		ops.rebuildFTS = productionRebuildOperations.rebuildFTS
+	}
+	if ops.rebuildUsageIndexes == nil {
+		ops.rebuildUsageIndexes = productionRebuildOperations.rebuildUsageIndexes
 	}
 	if ops.reopen == nil {
 		ops.reopen = productionRebuildOperations.reopen
@@ -116,9 +141,11 @@ func phaseSnapshot(name string, stats *PhaseStats) RebuildPhaseStats {
 func mergeSyncStats(dst *SyncStats, src SyncStats) {
 	dst.TotalSessions += src.TotalSessions
 	dst.Synced += src.Synced
+	dst.CwdUpdated += src.CwdUpdated
 	dst.Skipped += src.Skipped
 	dst.Failed += src.Failed
 	dst.OrphanedCopied += src.OrphanedCopied
+	dst.Tombstoned += src.Tombstoned
 	dst.Warnings = append(dst.Warnings, src.Warnings...)
 	dst.Aborted = dst.Aborted || src.Aborted
 	dst.RebuildPhases = append(dst.RebuildPhases, src.RebuildPhases...)
@@ -129,6 +156,20 @@ func mergeSyncStats(dst *SyncStats, src SyncStats) {
 	dst.messagesIndexed += src.messagesIndexed
 	dst.parserExcludedFiles += src.parserExcludedFiles
 	dst.parserExcludedIDs = append(dst.parserExcludedIDs, src.parserExcludedIDs...)
+	dst.sourceMissingArchiveMembers = append(
+		dst.sourceMissingArchiveMembers, src.sourceMissingArchiveMembers...,
+	)
 	dst.cwdFilteredSessions += src.cwdFilteredSessions
 	dst.cwdFilteredFiles += src.cwdFilteredFiles
+	if !dst.deferredRetryOverflow {
+		if src.deferredRetryOverflow {
+			dst.deferredRetryOverflow = true
+			dst.deferredRetryPaths = nil
+		} else {
+			for _, path := range src.deferredRetryPaths {
+				dst.retainDeferredRetryPath(path)
+			}
+		}
+	}
+	dst.Deferred += src.Deferred
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding"
-	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -57,11 +56,10 @@ func TestCodexCheckpointHashStateBoundedToCommittedOffset(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, int64(len(initial)), before.Offset)
 
-	// Model a rollout append after the full parse/DB commit but before
-	// persistFullParseCheckpoint runs. The persisted state must still
-	// cover exactly the committed snapshot, never the appended bytes:
-	// build the snapshot-bounded hash state and anchor digest the way the
-	// parser's single-pass tee would have captured them.
+	// Appending after the atomic content/checkpoint commit leaves the stored
+	// checkpoint anchored to the original committed prefix. The next sync
+	// resumes from that state and advances both content and checkpoint in one
+	// transaction.
 	tail := testjsonl.JoinJSONL(testjsonl.CodexFunctionCallOutputJSON(
 		"call_race", "done", "2024-01-01T10:00:03Z",
 	))
@@ -71,47 +69,18 @@ func TestCodexCheckpointHashStateBoundedToCommittedOffset(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	snapshotHash := sha256.New()
-	_, err = snapshotHash.Write([]byte(initial))
-	require.NoError(t, err)
-	snapshotState, err := snapshotHash.(encoding.BinaryMarshaler).
-		MarshalBinary()
-	require.NoError(t, err)
-	anchor := initial[max(0, len(initial)-128<<10):]
-	anchorSum := sha256.Sum256([]byte(anchor))
-
-	blobs, ok, err := database.GetParserCheckpointBlobs("codex:" + uuid)
+	afterAppend, ok, err := database.GetParserCheckpoint("codex:" + uuid)
 	require.NoError(t, err)
 	require.True(t, ok)
+	require.Equal(t, int64(len(initial)), afterAppend.Offset)
 
-	engine.persistFullParseCheckpoint(context.Background(), pendingWrite{
-		sess: parser.ParsedSession{
-			ID:    "codex:" + uuid,
-			Agent: parser.AgentCodex,
-			File: parser.FileInfo{
-				Path: path,
-				Size: int64(len(initial)),
-				Hash: before.Hash,
-			},
-		},
-		checkpoint:             blobs.Cursor,
-		checkpointHashState:    snapshotState,
-		checkpointAnchorDigest: hex.EncodeToString(anchorSum[:]),
-	})
-
-	after, ok, err := database.GetParserCheckpoint("codex:" + uuid)
+	beforeBlobs, ok, err := database.GetParserCheckpointBlobs("codex:" + uuid)
 	require.NoError(t, err)
 	require.True(t, ok)
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	require.Equal(t, int64(len(initial)), after.Offset,
-		"DB still commits only the original prefix")
-
-	afterBlobs, ok, err := database.GetParserCheckpointBlobs("codex:" + uuid)
-	require.NoError(t, err)
-	require.True(t, ok)
 	_, resumedHash, err := codexResumeHash(
-		path, after.Offset, info.Size(), afterBlobs.HashState,
+		path, afterAppend.Offset, info.Size(), beforeBlobs.HashState,
 	)
 	require.NoError(t, err)
 	actualHash, err := ComputeFileHash(path)
@@ -388,7 +357,7 @@ func TestCodexCheckpointAuditRepairsSameStatRewrite(t *testing.T) {
 
 	engine.SetCheckpointAudit(true)
 	stats, tombstoned, err := engine.ReconcileWatchRootsWithStats(
-		context.Background(), []string{root}, false,
+		context.Background(), []string{root}, false, nil,
 	)
 	require.NoError(t, err)
 	require.Zero(t, tombstoned)
@@ -400,4 +369,83 @@ func TestCodexCheckpointAuditRepairsSameStatRewrite(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, msgs, 1)
 	require.Equal(t, "bravo request", msgs[0].Content)
+}
+
+func TestCodexIncrementalDuplicateCallIDTargetsExactOccurrence(t *testing.T) {
+	const (
+		uuid   = "019eb791-cf7d-75c1-8439-9ed74c122daa"
+		callID = "reused-call"
+	)
+	root := t.TempDir()
+	day := filepath.Join(root, "2024", "01", "01")
+	require.NoError(t, os.MkdirAll(day, 0o755))
+	path := filepath.Join(
+		day, "rollout-2024-01-01T10-00-00-"+uuid+".jsonl",
+	)
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/workspace/project", "codex_cli_rs",
+			"2024-01-01T10:00:00Z",
+		),
+		testjsonl.CodexTurnContextJSON(
+			"gpt-5.4", "2024-01-01T10:00:01Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"user", "run twice", "2024-01-01T10:00:02Z",
+		),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"exec_command", callID, nil, "2024-01-01T10:00:03Z",
+		),
+		testjsonl.CodexFunctionCallOutputJSON(
+			callID, "first result", "2024-01-01T10:00:04Z",
+		),
+		testjsonl.CodexTokenCountJSON(
+			"2024-01-01T10:00:05Z", 100, 10, 80,
+		),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"exec_command", callID, nil, "2024-01-01T10:00:06Z",
+		),
+	)
+	require.NoError(t, os.WriteFile(path, []byte(initial), 0o644))
+
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+
+	tail := testjsonl.JoinJSONL(
+		testjsonl.CodexFunctionCallOutputJSON(
+			callID, "second result", "2024-01-01T10:00:07Z",
+		),
+		testjsonl.CodexTokenCountJSON(
+			"2024-01-01T10:00:08Z", 200, 20, 160,
+		),
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(tail)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	stats := engine.SyncAll(t.Context(), nil)
+	require.Zero(t, stats.Failed)
+	require.Equal(t, 1, stats.Synced)
+
+	sess, err := database.GetSessionFull(t.Context(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.True(t, sess.LastWriteIncremental)
+	msgs, err := database.GetAllMessages(t.Context(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.Len(t, msgs, 3)
+	require.Len(t, msgs[1].ToolCalls, 1)
+	require.Len(t, msgs[2].ToolCalls, 1)
+	require.Equal(t, "first result", msgs[1].ToolCalls[0].ResultContent)
+	require.Equal(t, "second result", msgs[2].ToolCalls[0].ResultContent)
+	require.NotEmpty(t, msgs[2].TokenUsage)
 }

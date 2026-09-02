@@ -27,8 +27,10 @@ type fakeSignalQuery struct {
 	// callEvents is the call's full stored history, returned by
 	// CallResultEvents. inserted maps a tool_use_id to the events this
 	// transaction inserted, returned by InsertedResultEvents.
-	callEvents []db.ToolResultEvent
-	inserted   map[string][]db.ToolResultEvent
+	callEvents          []db.ToolResultEvent
+	inserted            map[db.ToolCallPosition][]db.ToolResultEvent
+	updatedUsageOrdinal map[int]bool
+	requestedPositions  []db.ToolCallPosition
 }
 
 func (f *fakeSignalQuery) Session(context.Context) (*db.Session, error) {
@@ -51,9 +53,10 @@ func (f *fakeSignalQuery) TrailingToolCalls(
 	return nil, nil
 }
 
-func (f *fakeSignalQuery) ToolCallsByUseID(
-	context.Context, []string,
+func (f *fakeSignalQuery) ToolCallsByPosition(
+	_ context.Context, positions []db.ToolCallPosition,
 ) ([]db.ToolCallSignalFact, error) {
+	f.requestedPositions = append([]db.ToolCallPosition(nil), positions...)
 	return f.callFacts, nil
 }
 
@@ -64,9 +67,13 @@ func (f *fakeSignalQuery) CallResultEvents(
 }
 
 func (f *fakeSignalQuery) InsertedResultEvents(
-	toolUseID string,
+	position db.ToolCallPosition,
 ) []db.ToolResultEvent {
-	return f.inserted[toolUseID]
+	return f.inserted[position]
+}
+
+func (f *fakeSignalQuery) MessageTokenUsageUpdated(ordinal int) bool {
+	return f.updatedUsageOrdinal[ordinal]
 }
 
 // newTestMaintainer builds a maintainer stamped with the current quality
@@ -87,7 +94,7 @@ func newTestMaintainer(
 func currentStateBlob(t *testing.T) []byte {
 	t.Helper()
 	state := signals.SeedIncrementalState(
-		nil, nil, "", "", nil, nil, 0, 0,
+		nil, nil, "", "", nil, nil, 0, 0, 0,
 	)
 	blob, err := state.MarshalBinary()
 	require.NoError(t, err)
@@ -190,6 +197,7 @@ func TestIncrementalMaintainerScansOnlyInsertedResultEvents(t *testing.T) {
 	m := newTestMaintainer("rev", secrets.DefiniteRulesVersion(), nil)
 	m.resultUpdates = []db.ToolCallResultUpdate{{
 		ToolUseID: "call_0",
+		Position:  db.ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
 	}}
 	state := signals.SeedIncrementalState(
 		[]signals.ToolCallRow{{
@@ -201,7 +209,7 @@ func TestIncrementalMaintainerScansOnlyInsertedResultEvents(t *testing.T) {
 			CallIndex:      0,
 			EventStatus:    "completed",
 		}},
-		nil, "", "", nil, nil, 0, 0,
+		nil, "", "", nil, nil, 0, 0, 0,
 	)
 	blob, err := state.MarshalBinary()
 	require.NoError(t, err)
@@ -233,8 +241,8 @@ func TestIncrementalMaintainerScansOnlyInsertedResultEvents(t *testing.T) {
 			ContentLength: len(oldContent),
 			EventIndex:    0,
 		}},
-		inserted: map[string][]db.ToolResultEvent{
-			"call_0": {{
+		inserted: map[db.ToolCallPosition][]db.ToolResultEvent{
+			{MessageOrdinal: 0, CallIndex: 0}: {{
 				ToolUseID:     "call_0",
 				Source:        "function_call_output",
 				Content:       newContent,
@@ -262,6 +270,77 @@ func TestIncrementalMaintainerScansOnlyInsertedResultEvents(t *testing.T) {
 		"the inserted event's finding must land with its real index")
 }
 
+func TestIncrementalMaintainerTargetsDuplicateCallIDOccurrence(t *testing.T) {
+	first := db.ToolCallPosition{MessageOrdinal: 0, CallIndex: 0}
+	second := db.ToolCallPosition{MessageOrdinal: 1, CallIndex: 0}
+	state := signals.SeedIncrementalState(
+		[]signals.ToolCallRow{
+			{
+				ToolName: "exec_command", Category: "Bash", InputJSON: `{}`,
+				ResultContent: "ok", MessageOrdinal: first.MessageOrdinal,
+				CallIndex: first.CallIndex,
+			},
+			{
+				ToolName: "exec_command", Category: "Bash", InputJSON: `{}`,
+				ResultContent: "ok", MessageOrdinal: second.MessageOrdinal,
+				CallIndex: second.CallIndex,
+			},
+		},
+		nil, "", "", nil, nil, 0, 0, 0,
+	)
+	blob, err := state.MarshalBinary()
+	require.NoError(t, err)
+
+	m := newTestMaintainer("rev", secrets.DefiniteRulesVersion(), nil)
+	m.resultUpdates = []db.ToolCallResultUpdate{{
+		ToolUseID: "reused-call",
+		Position:  second,
+	}}
+	q := &fakeSignalQuery{
+		sess: &db.Session{
+			QualitySignalVersion: db.CurrentQualitySignalVersion,
+		},
+		state: db.SessionSignalState{
+			State:              blob,
+			TranscriptRevision: "rev",
+			SignalVersion:      db.CurrentQualitySignalVersion,
+		},
+		hasState: true,
+		revision: "rev",
+		// Return both reused-ID facts in the opposite order. The maintainer
+		// must select by occurrence coordinates rather than whichever raw ID
+		// happens to win a map assignment.
+		callFacts: []db.ToolCallSignalFact{
+			{
+				MessageOrdinal: second.MessageOrdinal,
+				CallIndex:      second.CallIndex,
+				ToolName:       "exec_command",
+				Category:       "Bash",
+				InputJSON:      `{}`,
+				ResultContent:  "failed",
+				EventStatus:    "errored",
+				ToolUseID:      "reused-call",
+			},
+			{
+				MessageOrdinal: first.MessageOrdinal,
+				CallIndex:      first.CallIndex,
+				ToolName:       "exec_command",
+				Category:       "Bash",
+				InputJSON:      `{}`,
+				ResultContent:  "ok",
+				ToolUseID:      "reused-call",
+			},
+		},
+	}
+
+	delta, err := m.MaintainTx(context.Background(), q)
+	require.NoError(t, err)
+	require.NotNil(t, delta)
+	assert.Equal(t, []db.ToolCallPosition{second}, q.requestedPositions)
+	assert.Equal(t, 1, delta.Update.ToolFailureSignalCount,
+		"only the targeted reused-ID occurrence should become a failure")
+}
+
 // TestIncrementalMaintainerCompactionExplicitBoundaryParity pins parity
 // between the full compute and the incremental fold for compaction count:
 // an explicit compact boundary suppresses token-drop compactions, so a
@@ -281,7 +360,7 @@ func TestIncrementalMaintainerCompactionExplicitBoundaryParity(t *testing.T) {
 		require.Equal(t, 1, full.CompactionCount)
 
 		state := signals.SeedIncrementalState(
-			nil, []int{0}, "", "", nil, nil, 0, 1000,
+			nil, []int{0}, "", "", nil, nil, 0, 1000, 1,
 		)
 		blob, err := state.MarshalBinary()
 		require.NoError(t, err)
@@ -314,7 +393,7 @@ func TestIncrementalMaintainerCompactionExplicitBoundaryParity(t *testing.T) {
 		require.Equal(t, 1, full.CompactionCount)
 
 		state := signals.SeedIncrementalState(
-			nil, nil, "", "", nil, nil, 0, 1000,
+			nil, nil, "", "", nil, nil, 0, 1000, 1,
 		)
 		blob, err := state.MarshalBinary()
 		require.NoError(t, err)
@@ -340,6 +419,88 @@ func TestIncrementalMaintainerCompactionExplicitBoundaryParity(t *testing.T) {
 	})
 }
 
+// TestIncrementalMaintainerDeclinesOutOfOrderLateUsage pins the guard for
+// a resumed Codex tail whose token_count targets an assistant message
+// earlier than one that already carries usage: a later sync can already
+// have resolved a chronologically-later assistant's usage (via the
+// in-memory backward-walk ApplyTokenUsageToLastAssistant performs when
+// multiple token_count events land in one parse) before an earlier
+// assistant's own token_count -- appearing later in the file -- is ever
+// read. Folding that late update forward would treat an older
+// measurement as newer and corrupt compaction detection. The maintainer
+// must decline (nil, nil) so the caller falls back to a full recompute.
+func TestIncrementalMaintainerDeclinesOutOfOrderLateUsage(t *testing.T) {
+	state := signals.SeedIncrementalState(
+		nil, nil, "", "", nil, nil, 0, 1000, 5,
+	)
+	blob, err := state.MarshalBinary()
+	require.NoError(t, err)
+
+	m := newTestMaintainer("rev", secrets.DefiniteRulesVersion(), nil)
+	m.messageUsageUpdates = []db.MessageTokenUsageUpdate{{
+		Ordinal: 3, ContextTokens: 200, HasContextTokens: true,
+	}}
+	q := &fakeSignalQuery{
+		sess: &db.Session{
+			QualitySignalVersion: db.CurrentQualitySignalVersion,
+		},
+		state: db.SessionSignalState{
+			State:              blob,
+			TranscriptRevision: "rev",
+			SignalVersion:      db.CurrentQualitySignalVersion,
+		},
+		hasState:            true,
+		revision:            "rev",
+		updatedUsageOrdinal: map[int]bool{3: true},
+	}
+	delta, err := m.MaintainTx(context.Background(), q)
+	require.NoError(t, err)
+	assert.Nil(t, delta,
+		"a late usage update targeting an ordinal at or before the "+
+			"recorded last measurement must decline, not fold out of order")
+}
+
+// TestIncrementalMaintainerAppliesInOrderLateUsage is the companion
+// positive case: a late usage update targeting an ordinal after the
+// recorded last measurement folds normally and advances both the token
+// value and its ordinal in the persisted compact state.
+func TestIncrementalMaintainerAppliesInOrderLateUsage(t *testing.T) {
+	state := signals.SeedIncrementalState(
+		nil, nil, "", "", nil, nil, 0, 1000, 3,
+	)
+	blob, err := state.MarshalBinary()
+	require.NoError(t, err)
+
+	m := newTestMaintainer("rev", secrets.DefiniteRulesVersion(), nil)
+	m.messageUsageUpdates = []db.MessageTokenUsageUpdate{{
+		Ordinal: 5, ContextTokens: 200, HasContextTokens: true,
+	}}
+	q := &fakeSignalQuery{
+		sess: &db.Session{
+			QualitySignalVersion: db.CurrentQualitySignalVersion,
+		},
+		state: db.SessionSignalState{
+			State:              blob,
+			TranscriptRevision: "rev",
+			SignalVersion:      db.CurrentQualitySignalVersion,
+		},
+		hasState:            true,
+		revision:            "rev",
+		updatedUsageOrdinal: map[int]bool{5: true},
+	}
+	delta, err := m.MaintainTx(context.Background(), q)
+	require.NoError(t, err)
+	require.NotNil(t, delta,
+		"a late usage update after the recorded last measurement must fold")
+	assert.Equal(t, 1, delta.Update.CompactionCount,
+		"the 1000->200 drop must be detected as a compaction")
+
+	var next signals.IncrementalState
+	require.NoError(t, next.UnmarshalBinary(delta.State.State))
+	assert.Equal(t, 200, next.LastValidTokens)
+	assert.Equal(t, 5, next.LastValidTokensOrdinal)
+}
+
 // TestIncrementalMaintainerContextPressureSessionPeakParity pins parity
 // for context pressure when the session-level peak exceeds per-message
 // maxima: both paths must feed sess.PeakContextTokens into
@@ -361,7 +522,7 @@ func TestIncrementalMaintainerContextPressureSessionPeakParity(t *testing.T) {
 
 	state := signals.SeedIncrementalState(
 		nil, nil, "", "",
-		map[string]int{model: 1}, map[string]int{model: 0}, 1, 0,
+		map[string]int{model: 1}, map[string]int{model: 0}, 1, 0, 0,
 	)
 	blob, err := state.MarshalBinary()
 	require.NoError(t, err)
@@ -605,6 +766,119 @@ func TestIncrementalSignalMaintainerParityWithFullResync(t *testing.T) {
 	_ = state
 }
 
+// TestIncrementalSignalMaintainerHandlesCommittedUsageUpdate proves the
+// real Codex late-output shape (function_call_output followed by token_count)
+// stays on the bounded delta path. The usage belongs to an assistant message
+// committed before the checkpoint, so maintenance must fold its token-derived
+// state without loading the historical transcript.
+func TestIncrementalSignalMaintainerHandlesCommittedUsageUpdate(t *testing.T) {
+	root := t.TempDir()
+	day := filepath.Join(root, "2024", "01", "01")
+	require.NoError(t, os.MkdirAll(day, 0o755))
+	path := filepath.Join(
+		day, "rollout-2024-01-01T10-00-00-"+signalMaintainUUID+".jsonl",
+	)
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			signalMaintainUUID, "/workspace/project", "codex_cli_rs",
+			"2024-01-01T10:00:00Z",
+		),
+		testjsonl.CodexTurnContextJSON(
+			"gpt-5.4", "2024-01-01T10:00:00Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"user", "first turn", "2024-01-01T10:00:01Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"assistant", "first response", "2024-01-01T10:00:02Z",
+		),
+		testjsonl.CodexTokenCountJSON(
+			"2024-01-01T10:00:03Z", 1000, 20, 100,
+		),
+		testjsonl.CodexMsgJSON(
+			"user", "run the command", "2024-01-01T10:00:04Z",
+		),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"exec_command", "call_usage", nil,
+			"2024-01-01T10:00:05Z",
+		),
+	)
+	require.NoError(t, os.WriteFile(path, []byte(initial), 0o644))
+
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+
+	appended := testjsonl.JoinJSONL(
+		testjsonl.CodexFunctionCallOutputJSON(
+			"call_usage", "command complete", "2024-01-01T10:00:06Z",
+		),
+		testjsonl.CodexTokenCountJSON(
+			"2024-01-01T10:00:07Z", 500, 30, 50,
+		),
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(appended)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	loadsBefore := database.MessagesLoadCount()
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+	require.Equal(t, loadsBefore, database.MessagesLoadCount(),
+		"late result plus committed usage must not load session history")
+
+	sessionID := "codex:" + signalMaintainUUID
+	incrementalSession, err := database.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, incrementalSession)
+	require.True(t, incrementalSession.LastWriteIncremental)
+	require.Equal(t, db.CurrentQualitySignalVersion,
+		incrementalSession.QualitySignalVersion)
+	require.Equal(t, 1, incrementalSession.CompactionCount,
+		"the committed usage update must contribute token-drop compaction state")
+
+	incrementalMessages, err := database.GetAllMessages(t.Context(), sessionID)
+	require.NoError(t, err)
+	var usageMessage *db.Message
+	for i := range incrementalMessages {
+		if len(incrementalMessages[i].ToolCalls) > 0 &&
+			incrementalMessages[i].ToolCalls[0].ToolUseID == "call_usage" {
+			usageMessage = &incrementalMessages[i]
+			break
+		}
+	}
+	require.NotNil(t, usageMessage)
+	require.True(t, usageMessage.HasContextTokens)
+	require.Equal(t, 500, usageMessage.ContextTokens)
+
+	// A fresh authoritative import of the complete file must produce the
+	// same observable signal state and message token metadata.
+	fullDatabase := openTestDB(t)
+	fullEngine := NewEngine(fullDatabase, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(fullEngine.Close)
+	require.Equal(t, 1, fullEngine.SyncAll(t.Context(), nil).Synced)
+	fullSession, err := fullDatabase.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, fullSession)
+	require.Equal(t, snapshotSessionSignals(fullSession),
+		snapshotSessionSignals(incrementalSession))
+	fullMessages, err := fullDatabase.GetAllMessages(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.Equal(t, fullMessages, incrementalMessages)
+}
+
 // TestIncrementalSignalMaintainerDeclinesForUserMessage verifies the
 // fallback contract: a delta carrying a user message is not folded — the
 // debounced full recompute runs (loading history) and keeps signals
@@ -655,4 +929,167 @@ func TestIncrementalSignalMaintainerDeclinesForUserMessage(t *testing.T) {
 	require.Equal(t, db.CurrentQualitySignalVersion, sess.QualitySignalVersion,
 		"the fallback recompute must keep the signal version current")
 	require.Equal(t, 2, sess.MessageCount)
+}
+
+func TestFullSignalRecomputeRetriesWhenTranscriptRevisionChanges(t *testing.T) {
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122d77"
+	root := t.TempDir()
+	day := filepath.Join(root, "2024", "01", "01")
+	require.NoError(t, os.MkdirAll(day, 0o755))
+	path := filepath.Join(
+		day, "rollout-2024-01-01T10-00-00-"+uuid+".jsonl",
+	)
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/workspace/project", "codex_cli_rs",
+			"2024-01-01T10:00:00Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"user", "start", "2024-01-01T10:00:01Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"assistant", "old answer", "2024-01-01T10:00:02Z",
+		),
+	)
+	require.NoError(t, os.WriteFile(path, []byte(initial), 0o644))
+
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+
+	sessionID := "codex:" + uuid
+	hookCalls := 0
+	_, err := engine.recomputeSignalsFromDBWithHook(
+		t.Context(), sessionID,
+		func(attempt int) {
+			hookCalls++
+			if attempt != 0 {
+				return
+			}
+			appended := testjsonl.JoinJSONL(testjsonl.CodexMsgJSON(
+				"assistant", "new answer", "2024-01-01T10:00:03Z",
+			))
+			f, openErr := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+			require.NoError(t, openErr)
+			_, writeErr := f.WriteString(appended)
+			require.NoError(t, writeErr)
+			require.NoError(t, f.Close())
+			require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+		},
+	)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, hookCalls, 2,
+		"a changed revision must force a fresh snapshot attempt")
+
+	sess, err := database.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TranscriptRevision)
+	stored, ok, err := database.GetSessionSignalState(sessionID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, *sess.TranscriptRevision, stored.TranscriptRevision)
+
+	var state signals.IncrementalState
+	require.NoError(t, state.UnmarshalBinary(stored.State))
+	require.Equal(t, "new answer", state.LastContent,
+		"the current revision must never be stamped onto the stale snapshot")
+}
+
+func TestFullSignalRecomputeRetriesWhenMetadataChanges(t *testing.T) {
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c122d88"
+	root := t.TempDir()
+	day := filepath.Join(root, "2024", "01", "01")
+	require.NoError(t, os.MkdirAll(day, 0o755))
+	path := filepath.Join(
+		day, "rollout-2024-01-01T10-00-00-"+uuid+".jsonl",
+	)
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/workspace/project", "codex_cli_rs",
+			"2024-01-01T10:00:00Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"user", "start", "2024-01-01T10:00:01Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"assistant", "answer", "2024-01-01T10:00:02Z",
+		),
+	)
+	require.NoError(t, os.WriteFile(path, []byte(initial), 0o644))
+
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+
+	sessionID := "codex:" + uuid
+	before, err := database.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.NotNil(t, before.TranscriptRevision)
+	originalRevision := *before.TranscriptRevision
+
+	hookCalls := 0
+	_, err = engine.recomputeSignalsFromDBWithHook(
+		t.Context(), sessionID,
+		func(attempt int) {
+			hookCalls++
+			if attempt != 0 {
+				return
+			}
+			current, loadErr := database.GetSessionFull(t.Context(), sessionID)
+			require.NoError(t, loadErr)
+			require.NotNil(t, current)
+			endedAt := "2026-08-18T12:00:00Z"
+			current.EndedAt = &endedAt
+			current.IsAutomated = true
+			current.MessageCount = 7
+			current.PeakContextTokens = 12345
+			current.HasPeakContextTokens = true
+			require.NoError(t, database.UpsertSession(*current))
+			afterMetadata, loadErr := database.GetSessionFull(
+				t.Context(), sessionID,
+			)
+			require.NoError(t, loadErr)
+			require.NotNil(t, afterMetadata)
+			require.NotNil(t, afterMetadata.TranscriptRevision)
+			require.Equal(t, originalRevision, *afterMetadata.TranscriptRevision,
+				"metadata-only update must leave transcript revision unchanged")
+		},
+	)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, hookCalls, 2,
+		"metadata-only input changes must force a fresh snapshot attempt")
+
+	after, err := database.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.TranscriptRevision)
+	require.Equal(t, originalRevision, *after.TranscriptRevision)
+	require.Equal(t, 7, after.MessageCount)
+	require.True(t, after.IsAutomated)
+	require.Equal(t, 12345, after.PeakContextTokens)
+	stored, ok, err := database.GetSessionSignalState(sessionID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, originalRevision, stored.TranscriptRevision)
+}
+
+func TestCloneCountsNilReturnsWritableMap(t *testing.T) {
+	counts := cloneCounts(nil)
+	require.NotNil(t, counts)
+	counts["gpt-test"] = 1
+	require.Equal(t, 1, counts["gpt-test"])
 }

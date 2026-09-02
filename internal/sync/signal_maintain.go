@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -25,6 +26,10 @@ type incrementalSignalMaintainer struct {
 	appended []db.Message
 	// resultUpdates carries the sanitized late tool-result updates.
 	resultUpdates []db.ToolCallResultUpdate
+	// messageUsageUpdates carries token metadata attached to assistant
+	// messages committed before this incremental batch. These updates are
+	// ordered before appended messages in the canonical transcript.
+	messageUsageUpdates []db.MessageTokenUsageUpdate
 	// preWriteRevision is the transcript revision before this write's
 	// bump; the persisted state token must match it.
 	preWriteRevision string
@@ -50,6 +55,7 @@ func (e *Engine) newIncrementalSignalMaintainer(
 	inc *incrementalUpdate,
 	appended []db.Message,
 	resultUpdates []db.ToolCallResultUpdate,
+	messageUsageUpdates []db.MessageTokenUsageUpdate,
 	preWriteRevision, preWriteSecretsVersion string,
 ) db.SignalMaintainer {
 	return &incrementalSignalMaintainer{
@@ -57,6 +63,7 @@ func (e *Engine) newIncrementalSignalMaintainer(
 		sessionID:              inc.sessionID,
 		appended:               appended,
 		resultUpdates:          resultUpdates,
+		messageUsageUpdates:    messageUsageUpdates,
 		preWriteRevision:       preWriteRevision,
 		preWriteSecretsVersion: preWriteSecretsVersion,
 		qualitySignalVersion:   db.CurrentQualitySignalVersion,
@@ -109,22 +116,27 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 	modified := make(map[signals.CallPos]signals.ToolFact)
 	deleteKeys := make([]db.FindingDeleteKey, 0, len(m.resultUpdates))
 	var insertFindings []db.SecretFinding
-	useIDs := make([]string, 0, len(m.resultUpdates))
+	positions := make([]db.ToolCallPosition, 0, len(m.resultUpdates))
 	for _, u := range m.resultUpdates {
 		if u.ToolUseID != "" {
-			useIDs = append(useIDs, u.ToolUseID)
+			positions = append(positions, u.Position)
 		}
 	}
-	callFacts, err := q.ToolCallsByUseID(ctx, useIDs)
+	callFacts, err := q.ToolCallsByPosition(ctx, positions)
 	if err != nil {
 		return nil, err
 	}
-	factByUseID := make(map[string]db.ToolCallSignalFact, len(callFacts))
+	factByPosition := make(
+		map[db.ToolCallPosition]db.ToolCallSignalFact, len(callFacts),
+	)
 	for _, f := range callFacts {
-		factByUseID[f.ToolUseID] = f
+		factByPosition[db.ToolCallPosition{
+			MessageOrdinal: f.MessageOrdinal,
+			CallIndex:      f.CallIndex,
+		}] = f
 	}
 	for _, u := range m.resultUpdates {
-		fact, ok := factByUseID[u.ToolUseID]
+		fact, ok := factByPosition[u.Position]
 		if !ok {
 			continue // update targeted nothing stored
 		}
@@ -154,7 +166,7 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 		// When any event exists the full compute scans events instead of
 		// the result_content summary, so the summary-derived finding must
 		// go and the inserted events are scanned with their real indexes.
-		events := q.InsertedResultEvents(u.ToolUseID)
+		events := q.InsertedResultEvents(u.Position)
 		if len(events) == 0 {
 			continue
 		}
@@ -212,7 +224,36 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 	modelFirstSeen := cloneCounts(nextState.ModelFirstSeen)
 	compactionDelta := 0
 	lastTokens := nextState.LastValidTokens
+	lastTokensOrdinal := nextState.LastValidTokensOrdinal
 	appendedHasContextData := false
+
+	// A resumed Codex tail may carry token_count for the final assistant
+	// message committed before the checkpoint. That message is already
+	// represented in the compact state, but its token-derived contribution
+	// is not. Apply the usage update before later appended messages so the
+	// compaction detector sees canonical message order without loading the
+	// historical transcript.
+	for _, usage := range m.messageUsageUpdates {
+		if !q.MessageTokenUsageUpdated(usage.Ordinal) ||
+			!usage.HasContextTokens {
+			continue
+		}
+		if lastTokens > 0 && usage.Ordinal <= lastTokensOrdinal {
+			// A later assistant already contributed a newer measurement
+			// than the one this late update targets: applying it here
+			// would fold tokens out of chronological order and corrupt
+			// compaction detection and the tail token value. Decline and
+			// let the caller fall back to a full recompute.
+			return nil, nil
+		}
+		appendedHasContextData = true
+		if lastTokens > 0 &&
+			float64(usage.ContextTokens) < 0.7*float64(lastTokens) {
+			compactionDelta++
+		}
+		lastTokens = usage.ContextTokens
+		lastTokensOrdinal = usage.Ordinal
+	}
 	for _, msg := range m.appended {
 		msgIndex++
 		if msg.IsSystem {
@@ -232,6 +273,7 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 				compactionDelta++
 			}
 			lastTokens = msg.ContextTokens
+			lastTokensOrdinal = msg.Ordinal
 		}
 	}
 	nextState.LastRole = lastRole
@@ -240,17 +282,14 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 	nextState.ModelCounts = modelCounts
 	nextState.ModelFirstSeen = modelFirstSeen
 	nextState.LastValidTokens = lastTokens
+	nextState.LastValidTokensOrdinal = lastTokensOrdinal
 
 	hasToolCalls := sess.HasToolCalls || len(appendedRows) > 0
 	hasContextData := sess.HasContextData || appendedHasContextData
 	noCodeContext := sess.NoCodeContextCount
-	if noCodeContext > 0 {
-		for _, r := range appendedRows {
-			if signals.IsContextToolCall(r) {
-				noCodeContext = 0
-				break
-			}
-		}
+	if noCodeContext > 0 &&
+		slices.ContainsFunc(appendedRows, signals.IsContextToolCall) {
+		noCodeContext = 0
 	}
 	// When the session has explicit compact boundaries the full compute
 	// derives the compaction count from the boundary count and ignores
@@ -370,9 +409,9 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 }
 
 func cloneCounts(in map[string]int) map[string]int {
-	out := make(map[string]int, len(in))
-	for k, v := range in {
-		out[k] = v
+	out := maps.Clone(in)
+	if out == nil {
+		out = make(map[string]int)
 	}
 	return out
 }
@@ -417,42 +456,82 @@ func extractModelCounts(
 }
 
 // seedSignalStateFromFull builds and persists the compact incremental state
-// after a full signal recompute so later incremental deltas can fold. The
-// persisted token (transcript revision + signal version) is read after the
-// recompute's rows committed; a state that falls behind is rejected by the
-// maintainer and reseeded by the next full recompute.
+// after a synchronous full-content write so later incremental deltas can fold.
+// Callers run under the engine's sync serialization; the conditional database
+// write still refuses publication if another writer advances the transcript
+// after the revision is captured.
 func (e *Engine) seedSignalStateFromFull(
 	sessionID string, msgs []db.Message,
 ) error {
-	lastRole, lastContent := extractLastMessageRole(msgs)
-	counts, firstSeen, msgIndex := extractModelCounts(msgs)
-	lastTokens := 0
-	for _, m := range slices.Backward(msgs) {
-		if m.Role == "assistant" && m.HasContextTokens {
-			lastTokens = m.ContextTokens
-			break
-		}
-	}
-	state := signals.SeedIncrementalState(
-		extractToolCallRows(msgs),
-		extractCompactBoundaryOrdinals(msgs),
-		lastRole, lastContent,
-		counts, firstSeen, msgIndex, lastTokens,
+	return e.seedSignalStateFromRows(
+		sessionID, msgs, extractToolCallRows(msgs),
 	)
-	blob, err := state.MarshalBinary()
-	if err != nil {
-		return fmt.Errorf(
-			"encoding signal state %s: %w", sessionID, err,
-		)
-	}
+}
+
+// seedSignalStateFromFullWithContentFailures is the staged streaming
+// variant: the seeded incremental state must see the same pre-computed
+// content-failure verdicts the signal pass used, or later deltas fold
+// against a different failure history.
+func (e *Engine) seedSignalStateFromFullWithContentFailures(
+	sessionID string, msgs []db.Message, failures map[string]bool,
+) error {
+	toolRows := extractToolCallRows(msgs)
+	patchToolCallRowsWithContentFailures(toolRows, msgs, failures)
+	return e.seedSignalStateFromRows(sessionID, msgs, toolRows)
+}
+
+func (e *Engine) seedSignalStateFromRows(
+	sessionID string, msgs []db.Message, toolRows []signals.ToolCallRow,
+) error {
 	rev, err := e.db.TranscriptRevision(sessionID)
 	if err != nil {
 		return err
 	}
-	return e.db.UpsertSessionSignalState(db.SessionSignalState{
+	state, err := buildSignalStateFromRows(sessionID, msgs, toolRows, rev)
+	if err != nil {
+		return err
+	}
+	_, err = e.db.UpsertSessionSignalStateIfRevision(state)
+	return err
+}
+
+// buildSignalStateFromRows is the pure full-snapshot counterpart of the
+// incremental fold. revision must be captured before the rows represented by
+// msgs are loaded; callers that read from the database then publish through
+// ReplaceSessionSignalsIfRevision so a concurrent transcript change cannot
+// make stale aggregates appear current.
+func buildSignalStateFromRows(
+	sessionID string,
+	msgs []db.Message,
+	toolRows []signals.ToolCallRow,
+	revision string,
+) (db.SessionSignalState, error) {
+	lastRole, lastContent := extractLastMessageRole(msgs)
+	counts, firstSeen, msgIndex := extractModelCounts(msgs)
+	lastTokens, lastTokensOrdinal := 0, 0
+	for _, m := range slices.Backward(msgs) {
+		if m.Role == "assistant" && m.HasContextTokens {
+			lastTokens = m.ContextTokens
+			lastTokensOrdinal = m.Ordinal
+			break
+		}
+	}
+	state := signals.SeedIncrementalState(
+		toolRows,
+		extractCompactBoundaryOrdinals(msgs),
+		lastRole, lastContent,
+		counts, firstSeen, msgIndex, lastTokens, lastTokensOrdinal,
+	)
+	blob, err := state.MarshalBinary()
+	if err != nil {
+		return db.SessionSignalState{}, fmt.Errorf(
+			"encoding signal state %s: %w", sessionID, err,
+		)
+	}
+	return db.SessionSignalState{
 		SessionID:          sessionID,
 		State:              blob,
-		TranscriptRevision: rev,
+		TranscriptRevision: revision,
 		SignalVersion:      db.CurrentQualitySignalVersion,
-	})
+	}, nil
 }

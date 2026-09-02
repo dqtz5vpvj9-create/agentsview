@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -53,6 +54,13 @@ type ProviderFactory interface {
 type ProviderConfig struct {
 	Roots   []string
 	Machine string
+	// StableSourceSnapshots reports that source files cannot change during
+	// parsing. Bounded capture enables it after copying quiescent transcripts
+	// so providers can classify an invalid end-of-file record as durable.
+	StableSourceSnapshots bool
+	// SourceMachines labels configured roots with their source machine. A
+	// provider must treat roots owned by another machine as remote metadata.
+	SourceMachines map[string]string
 	// PathRewriter maps an on-disk source path to its canonical stored form.
 	// It is non-nil only during remote (SSH) sync, where source files are read
 	// from a temporary extraction directory but must keep a stable identity
@@ -60,22 +68,18 @@ type ProviderConfig struct {
 	// path (Aider) use it to seed those IDs from the canonical remote path
 	// rather than the changing temp path. Most providers ignore it.
 	PathRewriter func(string) string
-	// SQLiteContainerUnchangedSinceTrust reports that the shared SQLite
-	// container at dbPath is byte-identical to the last pass that verified
-	// every one of its sessions, as captured before this discovery began.
-	// Providers that fan such a container out to per-session sources may
-	// answer discovery for it with the bounded watermark-only listing: the
-	// caller's container gate will skip every member before fingerprinting,
-	// so computing the full child digest would be archive-sized work for
-	// values nothing reads. Nil (the default, and every non-discovery
-	// construction) means no container is trusted and listings stay
-	// full-fidelity.
-	SQLiteContainerUnchangedSinceTrust func(dbPath string) bool
+	// SQLiteContainerListsWatermarkOnly authorizes a shared SQLite container
+	// at dbPath to use its complete-membership, session/project-watermark
+	// listing for this discovery pass. The caller's container gate decides
+	// when that listing is safe; nil (the default, and every non-discovery
+	// construction) means listings stay full-fidelity.
+	SQLiteContainerListsWatermarkOnly func(dbPath string) bool
 }
 
 // Clone returns an independent config snapshot.
 func (cfg ProviderConfig) Clone() ProviderConfig {
 	cfg.Roots = cfg.RootsCopy()
+	cfg.SourceMachines = maps.Clone(cfg.SourceMachines)
 	return cfg
 }
 
@@ -166,6 +170,34 @@ type ReconciliationSourceResolver interface {
 	SourceForReconciliation(
 		context.Context, string, string,
 	) (SourceRef, bool, error)
+}
+
+// ReconciliationSourceStateResolver is the fast source resolver for candidates
+// that carry provider-owned discovery state. It may use that state to avoid
+// reopening a shared container while still resolving storage shadows.
+type ReconciliationSourceStateResolver interface {
+	SourceForReconciliationWithState(
+		context.Context, string, string, ReconciliationSourceState,
+	) (SourceRef, bool, error)
+}
+
+// ReconciliationSourceState is a bounded provider-owned payload carried with
+// a streamed reconciliation candidate. It preserves discovery metadata across
+// the temporary sync spool without retaining provider sources in memory.
+type ReconciliationSourceState struct {
+	Version uint8
+	Payload []byte
+}
+
+// ReconciliationSourceStateProvider serializes and reapplies the bounded
+// discovery state needed after a candidate crosses the reconciliation spool.
+// A provider may ignore state when source resolution promotes a candidate to a
+// different representation, such as a storage shadow.
+type ReconciliationSourceStateProvider interface {
+	ReconciliationSourceState(SourceRef) (ReconciliationSourceState, bool)
+	ApplyReconciliationSourceState(
+		*SourceRef, ReconciliationSourceState,
+	) error
 }
 
 // ReconciliationSourceRank is compared lexicographically after configured-root
@@ -594,6 +626,28 @@ func containerAwareReconciliationScopePlan(
 	return plan
 }
 
+// SourceCwdState identifies the authority a provider has for a source's local
+// working directory. Providers that do not participate leave the state at its
+// zero value.
+type SourceCwdState uint8
+
+const (
+	SourceCwdUnspecified SourceCwdState = iota
+	SourceCwdResolved
+	SourceCwdNone
+	SourceCwdAmbiguous
+	SourceCwdUnavailable
+	SourceCwdRemote
+)
+
+// SourceCwdResolution carries optional, provider-derived Cwd metadata. Path is
+// populated only for SourceCwdResolved; the other states describe what the
+// provider knows without exposing provider-specific filesystem knowledge.
+type SourceCwdResolution struct {
+	State SourceCwdState
+	Path  string
+}
+
 // SourceRef is the engine-visible handle for provider-owned source data. It is
 // the only source identity the engine should carry between discovery, changed
 // path classification, lookup, fingerprinting, parsing, skip-cache checks, and
@@ -627,6 +681,9 @@ type SourceRef struct {
 	ReconciliationIdentity string
 	// ProjectHint is advisory metadata for UI grouping and may be empty.
 	ProjectHint string
+	// CwdResolution is optional source metadata used by generic sync freshness
+	// and write preparation. Its zero value preserves existing provider behavior.
+	CwdResolution SourceCwdResolution
 	// DiscoveryMTimeNS is an optional per-source modification time in Unix
 	// nanoseconds captured at discovery. Providers whose sources are virtual --
 	// a shared store fanned out to one source per session, where DisplayPath is
@@ -895,6 +952,9 @@ type ParseRequest struct {
 	Fingerprint SourceFingerprint
 	Machine     string
 	ForceParse  bool
+	// StoredPathResolver maps a canonical remote companion path back to the
+	// materialized file used by this parse.
+	StoredPathResolver func(string) (string, bool)
 }
 
 // ParseOutcome is the full-parse provider output. It is meaningful only when
@@ -1002,14 +1062,20 @@ type IncrementalRequest struct {
 	// the appended assistant head continues exactly this message id.
 	// nil keeps the conservative fallback.
 	StoredLastClaudeMessageID *string
+	// StoredPendingUsageOrdinal is the last assistant message without token
+	// usage in the current turn, as resolved from the committed transcript.
+	// Codex uses it to attach a token_count that follows a late tool result
+	// without re-reading or rebuilding the committed prefix.
+	StoredPendingUsageOrdinal *int
 }
 
 // IncrementalOutcome is the append-only parse output.
 type IncrementalOutcome struct {
-	SessionID       string
-	Messages        []ParsedMessage
-	SubagentLinks   []ClaudeSubagentLink
-	ToolCallUpdates []ParsedToolCallUpdate
+	SessionID                string
+	Messages                 []ParsedMessage
+	SubagentLinks            []ClaudeSubagentLink
+	ToolCallUpdates          []ParsedToolCallUpdate
+	MessageTokenUsageUpdates []ParsedMessageTokenUsageUpdate
 	// NextCursor is the provider's continuation state after consuming the
 	// appended tail, for persistence alongside the committed offset.
 	NextCursor           []byte
@@ -1083,10 +1149,14 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newCortexProviderFactory(def)
 	case AgentCursor:
 		return newCursorProviderFactory(def)
+	case AgentCursorIDE:
+		return newCursorIDEProviderFactory(def)
 	case AgentChatGPT:
 		return newImportOnlyProviderFactory(def)
 	case AgentDeepSeekTUI:
 		return newDeepSeekTUIProviderFactory(def)
+	case AgentDeepSeekHarness:
+		return newDeepSeekHarnessProviderFactory(def)
 	case AgentForge:
 		return newForgeProviderFactory(def)
 	case AgentDevin:

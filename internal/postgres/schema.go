@@ -209,6 +209,7 @@ CREATE TABLE IF NOT EXISTS messages (
     token_usage    TEXT NOT NULL DEFAULT '',
     context_tokens INT NOT NULL DEFAULT 0,
     output_tokens  INT NOT NULL DEFAULT 0,
+    provider_id    TEXT NOT NULL DEFAULT '',
     has_context_tokens BOOLEAN NOT NULL DEFAULT FALSE,
     has_output_tokens  BOOLEAN NOT NULL DEFAULT FALSE,
     claude_message_id  TEXT NOT NULL DEFAULT '',
@@ -228,12 +229,17 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_velocity
     ON messages (session_id, ordinal, role, timestamp, content_length);
 
+CREATE INDEX IF NOT EXISTS idx_messages_activity_timestamp
+    ON messages (timestamp, session_id, ordinal)
+    WHERE timestamp IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS usage_events (
     id BIGSERIAL PRIMARY KEY,
     session_id TEXT NOT NULL,
     message_ordinal INT,
     source TEXT NOT NULL,
     model TEXT NOT NULL,
+    provider_id TEXT NOT NULL DEFAULT '',
     input_tokens INT NOT NULL DEFAULT 0,
     output_tokens INT NOT NULL DEFAULT 0,
     cache_creation_input_tokens INT NOT NULL DEFAULT 0,
@@ -334,6 +340,7 @@ CREATE TABLE IF NOT EXISTS model_pricing (
     input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
     output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
     cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+    cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
     cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT ''
 );
@@ -345,9 +352,19 @@ CREATE TABLE IF NOT EXISTS model_pricing_bands (
     input_microdollars_per_mtok BIGINT NOT NULL,
     output_microdollars_per_mtok BIGINT NOT NULL,
     cache_creation_microdollars_per_mtok BIGINT NOT NULL,
+    cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
     cache_read_microdollars_per_mtok BIGINT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (model_pattern, above_input_tokens)
+);
+
+CREATE TABLE IF NOT EXISTS genai_pricing (
+    singleton SMALLINT PRIMARY KEY CHECK (singleton = 1),
+    version TEXT NOT NULL,
+    source_ref TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL CHECK (source IN ('embedded', 'fetched')),
+    data_json BYTEA NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS source_archives (
@@ -900,6 +917,9 @@ func EnsureSchema(
 	if _, err := db.ExecContext(ctx, coreDDL); err != nil {
 		return fmt.Errorf("creating pg tables: %w", err)
 	}
+	if err := ensureRawIngestSchemaPG(ctx, db); err != nil {
+		return err
+	}
 	log.Printf(
 		"pg schema: core DDL step completed in %s",
 		time.Since(step).Round(time.Millisecond),
@@ -915,6 +935,16 @@ func EnsureSchema(
 
 	// Idempotent column additions for forward compatibility.
 	alters := []columnMigration{
+		{
+			"model_pricing", "cache_creation_1h_microdollars_per_mtok",
+			`cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0`,
+			"adding model_pricing.cache_creation_1h_microdollars_per_mtok",
+		},
+		{
+			"model_pricing_bands", "cache_creation_1h_microdollars_per_mtok",
+			`cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0`,
+			"adding model_pricing_bands.cache_creation_1h_microdollars_per_mtok",
+		},
 		{
 			"sessions", "transcript_revision",
 			`transcript_revision TEXT NOT NULL DEFAULT '0'`,
@@ -994,6 +1024,16 @@ func EnsureSchema(
 			"messages", "output_tokens",
 			`output_tokens INT NOT NULL DEFAULT 0`,
 			"adding messages.output_tokens",
+		},
+		{
+			"messages", "provider_id",
+			`provider_id TEXT NOT NULL DEFAULT ''`,
+			"adding messages.provider_id",
+		},
+		{
+			"usage_events", "provider_id",
+			`provider_id TEXT NOT NULL DEFAULT ''`,
+			"adding usage_events.provider_id",
 		},
 		{
 			"messages", "has_context_tokens",
@@ -1379,6 +1419,9 @@ func EnsureSchema(
 			time.Since(step).Round(time.Millisecond),
 		)
 	}
+	if err := repairLegacySourceMissingDeletionPG(ctx, db); err != nil {
+		return err
+	}
 	step = time.Now()
 	remoteScrubbed, err := scrubProjectIdentityGitRemoteCredentialsPG(ctx, db)
 	if err != nil {
@@ -1496,6 +1539,9 @@ func createPartialIndexesPG(ctx context.Context, db *sql.DB) error {
 		 WHERE token_usage != ''
 		   AND model != ''
 		   AND model != '<synthetic>'`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_activity_timestamp
+		 ON messages(timestamp, session_id, ordinal)
+		 WHERE timestamp IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_has_secret
 		 ON sessions(secret_leak_count) WHERE secret_leak_count > 0`,
 		// idx_tool_calls_file_path backs the cross-session Recent Edits feed.
@@ -1609,6 +1655,9 @@ func runSchemaDataRepairsPG(ctx context.Context, db *sql.DB) error {
 	if _, err := runSourceCurationBackfill(ctx, db, false); err != nil {
 		return err
 	}
+	if err := repairLegacySourceMissingDeletionPG(ctx, db); err != nil {
+		return err
+	}
 	if _, err := scrubProjectIdentityGitRemoteCredentialsPG(ctx, db); err != nil {
 		return err
 	}
@@ -1623,6 +1672,23 @@ func runSchemaDataRepairsPG(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	return markTokenCoverageRepairDone(ctx, db)
+}
+
+// repairLegacySourceMissingDeletionPG restores mirror rows written while
+// source absence was represented as deletion. Source availability is local
+// SQLite sync state; PostgreSQL retains only user-owned deletion state.
+func repairLegacySourceMissingDeletionPG(ctx context.Context, pg *sql.DB) error {
+	_, err := pg.ExecContext(ctx, `
+		UPDATE sessions
+		SET deleted_at = NULL,
+		    source_deleted_at = NULL,
+		    deletion_cause = NULL,
+		    updated_at = NOW()
+		WHERE deletion_cause = 'source_missing'`)
+	if err != nil {
+		return fmt.Errorf("repairing legacy PG source-missing deletions: %w", err)
+	}
+	return nil
 }
 
 func backfillSourceCurationBaselines(
@@ -2423,7 +2489,7 @@ func CheckSchemaCompat(
 		`SELECT session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use,
 			content_length, is_system, model, token_usage,
-			context_tokens, output_tokens,
+			context_tokens, output_tokens, provider_id,
 			has_context_tokens, has_output_tokens,
 			claude_message_id, claude_request_id,
 			source_type, source_subtype, prompt_source, source_uuid,
@@ -2504,7 +2570,7 @@ func CheckSchemaCompat(
 	rows.Close()
 
 	rows, err = db.QueryContext(ctx,
-		`SELECT id, cost_microdollars FROM usage_events LIMIT 0`)
+		`SELECT id, provider_id, cost_microdollars FROM usage_events LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
 			"usage_events table missing required columns: %w",
@@ -2518,6 +2584,7 @@ func CheckSchemaCompat(
 		`SELECT input_microdollars_per_mtok,
 			output_microdollars_per_mtok,
 			cache_creation_microdollars_per_mtok,
+			cache_creation_1h_microdollars_per_mtok,
 			cache_read_microdollars_per_mtok
 		 FROM model_pricing LIMIT 0`)
 	if err != nil {
@@ -2537,11 +2604,23 @@ func CheckSchemaCompat(
 			`SELECT model_pattern, above_input_tokens,
 				input_microdollars_per_mtok, output_microdollars_per_mtok,
 				cache_creation_microdollars_per_mtok,
+				cache_creation_1h_microdollars_per_mtok,
 				cache_read_microdollars_per_mtok, updated_at
 			 FROM model_pricing_bands LIMIT 0`)
 		if err != nil {
 			return fmt.Errorf(
 				"model_pricing_bands table missing required columns: %w",
+				err,
+			)
+		}
+		rows.Close()
+
+		rows, err = db.QueryContext(ctx,
+			`SELECT singleton, version, source_ref, source, data_json, updated_at
+			 FROM genai_pricing LIMIT 0`)
+		if err != nil {
+			return fmt.Errorf(
+				"genai_pricing table missing required columns: %w",
 				err,
 			)
 		}
@@ -2682,6 +2761,7 @@ func pushSchemaCurrent(ctx context.Context, db *sql.DB) bool {
 	}
 	if !pgHasTable(ctx, db, "model_pricing") ||
 		!pgHasTable(ctx, db, "model_pricing_bands") ||
+		!pgHasTable(ctx, db, "genai_pricing") ||
 		!pgHasTable(ctx, db, "source_archives") ||
 		!pgHasTable(ctx, db, "source_project_identity_observations") ||
 		!pgHasTable(ctx, db, "source_project_identity_observation_scopes") ||
@@ -2726,8 +2806,7 @@ func CheckDataVersionCompat(ctx context.Context, pg *sql.DB) error {
 // read-only or insufficient-privilege condition (SQLSTATE 25006
 // or 42501). Uses pgconn.PgError for reliable SQLSTATE matching.
 func IsReadOnlyError(err error) bool {
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
 		return pgErr.Code == "25006" || pgErr.Code == "42501"
 	}
 	return false

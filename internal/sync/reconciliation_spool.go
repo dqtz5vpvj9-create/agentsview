@@ -17,6 +17,7 @@ import (
 )
 
 const reconciliationPageSize = 256
+const maxReconciliationSourceStateBytes = 4096
 
 type reconciliationCandidate struct {
 	Provider       parser.AgentType
@@ -27,6 +28,7 @@ type reconciliationCandidate struct {
 	WatchRoot      string
 	Machine        string
 	Project        string
+	SourceState    parser.ReconciliationSourceState
 	Preference1    int64
 	Preference2    int64
 	Preference3    int64
@@ -47,16 +49,17 @@ type reconciliationCursor struct {
 // ReconciliationMetrics reports the largest bounded batches retained while a
 // watcher-forced reconciliation was running.
 type ReconciliationMetrics struct {
-	MaxSpoolPageRows         int
-	MaxProviderBuffered      int
-	MaxRehydratedSources     int
-	MaxWorkerResults         int
-	MaxPendingWrites         int
-	ExcludedRemoteRoots      int
-	GlobalLinkPasses         int
-	MaxProviderRetainedBytes int64
-	SharedContainerScans     int
-	OpenCodeSQLiteParses     int
+	MaxSpoolPageRows             int
+	MaxNonAuthoritativeScopeRows int
+	MaxProviderBuffered          int
+	MaxRehydratedSources         int
+	MaxWorkerResults             int
+	MaxPendingWrites             int
+	ExcludedRemoteRoots          int
+	GlobalLinkPasses             int
+	MaxProviderRetainedBytes     int64
+	SharedContainerScans         int
+	OpenCodeSQLiteParses         int
 	// CodexReplacementIndexBuilds counts uuid-to-path replacement index
 	// builds during missing-path tombstoning. A streamed pass answers
 	// replacement lookups from its discovery spool, so this stays zero;
@@ -69,20 +72,33 @@ type reconciliationSpool struct {
 	path string
 	db   *sql.DB
 
-	mu      sync.Mutex
-	closed  bool
-	sealed  bool
-	metrics ReconciliationMetrics
+	mu                sync.Mutex
+	closed            bool
+	sealed            bool
+	lastAddWon        bool
+	lastAddReplaced   reconciliationCandidate
+	lastAddReplacedOK bool
+	metrics           ReconciliationMetrics
 }
 
 type reconciliationSpoolStore interface {
 	Add(context.Context, reconciliationCandidate) error
+	AddNonAuthoritativeScopes(context.Context, []reconciliationSourceScope) error
 	Candidate(context.Context, parser.AgentType, string) (reconciliationCandidate, bool, error)
 	ContainsSource(context.Context, parser.AgentType, string) (bool, error)
 	ContainsSourceIdentity(context.Context, parser.AgentType, string, string) (bool, error)
+	HasNonAuthoritativeScopes(context.Context, parser.AgentType) (bool, error)
+	ContainsNonAuthoritativeScope(context.Context, parser.AgentType, string) (bool, error)
 	Page(context.Context, reconciliationCursor, int) ([]reconciliationCandidate, error)
+	LastAddWon() bool
+	LastAddReplaced() (reconciliationCandidate, bool)
 	Metrics() ReconciliationMetrics
 	CloseAndRemove() error
+}
+
+type reconciliationSourceScope struct {
+	Provider parser.AgentType
+	Path     string
 }
 
 func (spool *reconciliationSpool) Candidate(
@@ -95,13 +111,14 @@ func (spool *reconciliationSpool) Candidate(
 	var providerName string
 	err := spool.db.QueryRowContext(ctx, `
 		SELECT provider, identity, path, stored_path, member_identity, watch_root, machine, project,
-		       preference_1, preference_2, preference_3
+		       source_state_version, source_state, preference_1, preference_2, preference_3
 		FROM candidates
 		WHERE provider = ? AND identity = ?
 	`, string(provider), identity).Scan(
 		&providerName, &candidate.Identity, &candidate.Path, &candidate.StoredPath,
 		&candidate.MemberIdentity,
 		&candidate.WatchRoot, &candidate.Machine, &candidate.Project,
+		&candidate.SourceState.Version, &candidate.SourceState.Payload,
 		&candidate.Preference1, &candidate.Preference2,
 		&candidate.Preference3,
 	)
@@ -240,6 +257,8 @@ func (spool *reconciliationSpool) initialize() error {
 			watch_root TEXT NOT NULL,
 			machine TEXT NOT NULL,
 			project TEXT NOT NULL,
+			source_state_version INTEGER NOT NULL,
+			source_state BLOB NOT NULL,
 			preference_1 INTEGER NOT NULL,
 			preference_2 INTEGER NOT NULL,
 			preference_3 INTEGER NOT NULL,
@@ -247,12 +266,113 @@ func (spool *reconciliationSpool) initialize() error {
 		) WITHOUT ROWID;
 		CREATE INDEX candidates_by_stored_path
 			ON candidates(provider, stored_path, member_identity);
+		CREATE TABLE non_authoritative_scopes (
+			provider TEXT NOT NULL,
+			path TEXT NOT NULL,
+			PRIMARY KEY (provider, path)
+		) WITHOUT ROWID;
 		BEGIN IMMEDIATE;
 	`)
 	if err != nil {
 		return fmt.Errorf("initialize reconciliation spool: %w", err)
 	}
 	return nil
+}
+
+func (spool *reconciliationSpool) AddNonAuthoritativeScopes(
+	ctx context.Context, scopes []reconciliationSourceScope,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(scopes) == 0 {
+		return nil
+	}
+	if err := spool.seal(ctx); err != nil {
+		return err
+	}
+	tx, err := spool.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin non-authoritative reconciliation scope batch: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, scope := range scopes {
+		if scope.Provider == "" || scope.Path == "" {
+			continue
+		}
+		path := canonicalReconciliationSourceIdentity(
+			validatedProviderSourceStatPath(scope.Path),
+		)
+		if path == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT OR IGNORE INTO non_authoritative_scopes(provider, path)
+			VALUES (?, ?)
+		`, string(scope.Provider), path); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return fmt.Errorf("write non-authoritative reconciliation scope: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("commit non-authoritative reconciliation scopes: %w", err)
+	}
+	spool.mu.Lock()
+	spool.metrics.MaxNonAuthoritativeScopeRows = max(
+		spool.metrics.MaxNonAuthoritativeScopeRows, len(scopes),
+	)
+	spool.mu.Unlock()
+	return nil
+}
+
+func (spool *reconciliationSpool) HasNonAuthoritativeScopes(
+	ctx context.Context, provider parser.AgentType,
+) (bool, error) {
+	return spool.queryNonAuthoritativeScope(ctx, provider, "", false)
+}
+
+func (spool *reconciliationSpool) ContainsNonAuthoritativeScope(
+	ctx context.Context, provider parser.AgentType, path string,
+) (bool, error) {
+	path = canonicalReconciliationSourceIdentity(validatedProviderSourceStatPath(path))
+	return spool.queryNonAuthoritativeScope(ctx, provider, path, true)
+}
+
+func (spool *reconciliationSpool) queryNonAuthoritativeScope(
+	ctx context.Context, provider parser.AgentType, path string, exact bool,
+) (bool, error) {
+	if err := spool.seal(ctx); err != nil {
+		return false, err
+	}
+	query := `
+		SELECT 1 FROM non_authoritative_scopes
+		WHERE provider = ? LIMIT 1
+	`
+	args := []any{string(provider)}
+	if exact {
+		query = `
+			SELECT 1 FROM non_authoritative_scopes
+			WHERE provider = ? AND path = ? LIMIT 1
+		`
+		args = append(args, path)
+	}
+	var found int
+	err := spool.db.QueryRowContext(ctx, query, args...).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+		return false, fmt.Errorf("query non-authoritative reconciliation scope: %w", err)
+	}
+	return true, nil
 }
 
 func (spool *reconciliationSpool) Add(
@@ -263,15 +383,45 @@ func (spool *reconciliationSpool) Add(
 	}
 	spool.mu.Lock()
 	sealed := spool.sealed
+	spool.lastAddWon = false
+	spool.lastAddReplaced = reconciliationCandidate{}
+	spool.lastAddReplacedOK = false
 	spool.mu.Unlock()
 	if sealed {
 		return errors.New("reconciliation spool is sealed")
 	}
-	_, err := spool.db.ExecContext(ctx, `
+	stateVersion := candidate.SourceState.Version
+	statePayload := candidate.SourceState.Payload
+	if len(statePayload) > maxReconciliationSourceStateBytes {
+		// State is an optimization. An oversized payload must not make the
+		// authoritative reconciliation pass fail; omitting it makes rehydration
+		// resolve the source's full fingerprint instead.
+		stateVersion = 0
+		statePayload = []byte{}
+	} else if statePayload == nil {
+		statePayload = []byte{}
+	}
+	var existing reconciliationCandidate
+	err := spool.db.QueryRowContext(ctx, `
+		SELECT path, preference_1, preference_2, preference_3
+		FROM candidates WHERE provider = ? AND identity = ?
+	`, string(candidate.Provider), candidate.Identity).Scan(
+		&existing.Path, &existing.Preference1, &existing.Preference2,
+		&existing.Preference3,
+	)
+	existed := err == nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("check reconciliation candidate: %w", err)
+	}
+	_, err = spool.db.ExecContext(ctx, `
 		INSERT INTO candidates (
 			provider, identity, path, stored_path, member_identity, watch_root, machine,
-			project, preference_1, preference_2, preference_3
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			project, source_state_version, source_state, preference_1, preference_2,
+			preference_3
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(provider, identity) DO UPDATE SET
 			path = excluded.path,
 			stored_path = excluded.stored_path,
@@ -279,6 +429,8 @@ func (spool *reconciliationSpool) Add(
 			watch_root = excluded.watch_root,
 			machine = excluded.machine,
 			project = excluded.project,
+			source_state_version = excluded.source_state_version,
+			source_state = excluded.source_state,
 			preference_1 = excluded.preference_1,
 			preference_2 = excluded.preference_2,
 			preference_3 = excluded.preference_3
@@ -294,15 +446,35 @@ func (spool *reconciliationSpool) Add(
 		       AND excluded.path < candidates.path)
 	`, string(candidate.Provider), candidate.Identity, candidate.Path,
 		candidate.StoredPath, candidate.MemberIdentity,
-		candidate.WatchRoot, candidate.Machine, candidate.Project, candidate.Preference1,
-		candidate.Preference2, candidate.Preference3)
+		candidate.WatchRoot, candidate.Machine, candidate.Project,
+		stateVersion, statePayload,
+		candidate.Preference1, candidate.Preference2, candidate.Preference3)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
 		return fmt.Errorf("write reconciliation candidate: %w", err)
 	}
+	existing.Provider = candidate.Provider
+	existing.Identity = candidate.Identity
+	spool.mu.Lock()
+	spool.lastAddWon = !existed
+	spool.lastAddReplaced = existing
+	spool.lastAddReplacedOK = existed && reconciliationCandidatePreferred(candidate, existing)
+	spool.mu.Unlock()
 	return nil
+}
+
+func (spool *reconciliationSpool) LastAddWon() bool {
+	spool.mu.Lock()
+	defer spool.mu.Unlock()
+	return spool.lastAddWon
+}
+
+func (spool *reconciliationSpool) LastAddReplaced() (reconciliationCandidate, bool) {
+	spool.mu.Lock()
+	defer spool.mu.Unlock()
+	return spool.lastAddReplaced, spool.lastAddReplacedOK
 }
 
 func (spool *reconciliationSpool) Page(
@@ -319,7 +491,7 @@ func (spool *reconciliationSpool) Page(
 	}
 	rows, err := spool.db.QueryContext(ctx, `
 		SELECT provider, identity, path, stored_path, member_identity, watch_root, machine, project,
-		       preference_1, preference_2, preference_3
+		       source_state_version, source_state, preference_1, preference_2, preference_3
 		FROM candidates
 		WHERE provider > ? OR (provider = ? AND identity > ?)
 		ORDER BY provider, identity
@@ -341,6 +513,7 @@ func (spool *reconciliationSpool) Page(
 			&provider, &candidate.Identity, &candidate.Path, &candidate.StoredPath,
 			&candidate.MemberIdentity,
 			&candidate.WatchRoot, &candidate.Machine, &candidate.Project,
+			&candidate.SourceState.Version, &candidate.SourceState.Payload,
 			&candidate.Preference1, &candidate.Preference2,
 			&candidate.Preference3,
 		); err != nil {

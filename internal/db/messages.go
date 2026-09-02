@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"log"
@@ -23,7 +23,7 @@ const (
 		COALESCE(timestamp, '') AS timestamp,
 		has_thinking, has_tool_use, content_length,
 		is_system,
-		model, token_usage, context_tokens, output_tokens,
+		model, token_usage, context_tokens, output_tokens, provider_id,
 		has_context_tokens, has_output_tokens,
 		claude_message_id, claude_request_id,
 		source_type, source_subtype, prompt_source, source_uuid,
@@ -33,7 +33,7 @@ const (
 		thinking_text,
 		timestamp, has_thinking, has_tool_use, content_length,
 		is_system,
-		model, token_usage, context_tokens, output_tokens,
+		model, token_usage, context_tokens, output_tokens, provider_id,
 		has_context_tokens, has_output_tokens,
 		claude_message_id, claude_request_id,
 		source_type, source_subtype, prompt_source, source_uuid,
@@ -51,7 +51,7 @@ const (
 	// Keep multi-row INSERT statements below SQLite's historic
 	// 999-variable limit so binaries built against older SQLite
 	// versions still work.
-	messageInsertRowsPerStmt         = 38 // 26 params per row
+	messageInsertRowsPerStmt         = 36 // 27 params per row
 	toolCallInsertRowsPerStmt        = 83 // 12 params per row (999/12 = 83)
 	toolResultEventInsertRowsPerStmt = 80 // 12 params per row
 )
@@ -94,6 +94,10 @@ type ToolResultEvent struct {
 	EventIndex        int    `json:"event_index"`
 }
 
+func formatToolCallPosition(position ToolCallPosition) string {
+	return fmt.Sprintf("%d/%d", position.MessageOrdinal, position.CallIndex)
+}
+
 // SummarizeToolResultEvents derives the display result stored on a tool call
 // from its chronological result events. Anonymous events use the latest
 // content; agent-scoped events keep the latest content for each agent.
@@ -103,23 +107,24 @@ type ToolResultEvent struct {
 // the distinct agents keeps a late result update O(delta) instead of
 // rescanning the call's event history.
 func summarizeToolCallFromStateTx(
-	tx *sql.Tx, sessionID, toolUseID string,
+	tx *sql.Tx, sessionID string, position ToolCallPosition,
 ) (string, error) {
 	rows, err := tx.Query(
 		`SELECT s.agent_id, e.content
-		 FROM tool_call_agent_state s
+		 FROM tool_call_occurrence_agent_state s
 		 JOIN tool_result_events e
 		   ON e.session_id = s.session_id
-		  AND e.tool_use_id = s.tool_use_id
+		  AND e.tool_call_message_ordinal = s.message_ordinal
+		  AND e.call_index = s.call_index
 		  AND e.event_index = s.latest_event_index
-		 WHERE s.session_id = ? AND s.tool_use_id = ?
+		 WHERE s.session_id = ? AND s.message_ordinal = ? AND s.call_index = ?
 		 ORDER BY s.first_event_index`,
-		sessionID, toolUseID,
+		sessionID, position.MessageOrdinal, position.CallIndex,
 	)
 	if err != nil {
 		return "", fmt.Errorf(
 			"loading agent state for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
 	var orderedAgents []string
@@ -132,7 +137,7 @@ func summarizeToolCallFromStateTx(
 			_ = rows.Close()
 			return "", fmt.Errorf(
 				"scanning agent state for %s/%s: %w",
-				sessionID, toolUseID, err,
+				sessionID, formatToolCallPosition(position), err,
 			)
 		}
 		if agentID == "" {
@@ -149,18 +154,21 @@ func summarizeToolCallFromStateTx(
 		_ = rows.Close()
 		return "", fmt.Errorf(
 			"reading agent state for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
 	if err := rows.Close(); err != nil {
 		return "", fmt.Errorf(
 			"closing agent state for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
 	if len(latest) <= 1 {
 		if len(latest) == 1 {
-			summary := latest[orderedAgents[0]]
+			var summary string
+			for _, content := range latest {
+				summary = content
+			}
 			if lastAnon != "" {
 				return summary + "\n\n" + lastAnon, nil
 			}
@@ -187,23 +195,24 @@ func summarizeToolCallFromStateTx(
 // summarizeToolCallFromStateTx: a change to either assembly rule must update
 // both.
 func summarizeToolCallLengthFromStateTx(
-	tx *sql.Tx, sessionID, toolUseID string,
+	tx *sql.Tx, sessionID string, position ToolCallPosition,
 ) (int, error) {
 	rows, err := tx.Query(
 		`SELECT s.agent_id, e.content_length
-		 FROM tool_call_agent_state s
+		 FROM tool_call_occurrence_agent_state s
 		 JOIN tool_result_events e
 		   ON e.session_id = s.session_id
-		  AND e.tool_use_id = s.tool_use_id
+		  AND e.tool_call_message_ordinal = s.message_ordinal
+		  AND e.call_index = s.call_index
 		  AND e.event_index = s.latest_event_index
-		 WHERE s.session_id = ? AND s.tool_use_id = ?
+		 WHERE s.session_id = ? AND s.message_ordinal = ? AND s.call_index = ?
 		 ORDER BY s.first_event_index`,
-		sessionID, toolUseID,
+		sessionID, position.MessageOrdinal, position.CallIndex,
 	)
 	if err != nil {
 		return 0, fmt.Errorf(
 			"loading agent state lengths for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
 	var orderedAgents []string
@@ -216,7 +225,7 @@ func summarizeToolCallLengthFromStateTx(
 			_ = rows.Close()
 			return 0, fmt.Errorf(
 				"scanning agent state lengths for %s/%s: %w",
-				sessionID, toolUseID, err,
+				sessionID, formatToolCallPosition(position), err,
 			)
 		}
 		if agentID == "" {
@@ -232,20 +241,23 @@ func summarizeToolCallLengthFromStateTx(
 		_ = rows.Close()
 		return 0, fmt.Errorf(
 			"reading agent state lengths for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
 	if err := rows.Close(); err != nil {
 		return 0, fmt.Errorf(
 			"closing agent state lengths for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
 	switch {
 	case len(latest) == 0:
 		return lastAnonLen, nil
 	case len(latest) == 1:
-		total := latest[orderedAgents[0]]
+		var total int
+		for _, length := range latest {
+			total = length
+		}
 		if lastAnonLen > 0 {
 			total += 2 + lastAnonLen
 		}
@@ -268,9 +280,10 @@ func summarizeToolCallLengthFromStateTx(
 // before the state table existed or through the staged publish; after
 // that, every late result update reads only the state table.
 func backfillToolCallAgentStateTx(
-	tx *sql.Tx, sessionID, toolUseID string,
-	messageOrdinal, callIndex int,
+	tx *sql.Tx, sessionID string, position ToolCallPosition,
 ) error {
+	messageOrdinal := position.MessageOrdinal
+	callIndex := position.CallIndex
 	rows, err := tx.Query(
 		`SELECT COALESCE(agent_id, ''), content, content_length, event_index
 		 FROM tool_result_events
@@ -282,7 +295,7 @@ func backfillToolCallAgentStateTx(
 	if err != nil {
 		return fmt.Errorf(
 			"backfilling agent state for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
 	type stateRow struct {
@@ -299,7 +312,7 @@ func backfillToolCallAgentStateTx(
 			_ = rows.Close()
 			return fmt.Errorf(
 				"backfill scan for %s/%s: %w",
-				sessionID, toolUseID, err,
+				sessionID, formatToolCallPosition(position), err,
 			)
 		}
 		if strings.TrimSpace(content) == "" && length == 0 {
@@ -317,19 +330,19 @@ func backfillToolCallAgentStateTx(
 		_ = rows.Close()
 		return fmt.Errorf(
 			"backfill read for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
 	if err := rows.Close(); err != nil {
 		return fmt.Errorf(
 			"backfill close for %s/%s: %w",
-			sessionID, toolUseID, err,
+			sessionID, formatToolCallPosition(position), err,
 		)
 	}
-	args := make([]any, 0, len(latest)*5)
+	args := make([]any, 0, len(latest)*6)
 	for key, entry := range latest {
 		args = append(args,
-			sessionID, toolUseID, key,
+			sessionID, position.MessageOrdinal, position.CallIndex, key,
 			entry.firstIndex, entry.latestIndex,
 		)
 	}
@@ -337,17 +350,17 @@ func backfillToolCallAgentStateTx(
 		return nil
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO tool_call_agent_state
-			(session_id, tool_use_id, agent_id,
+		`INSERT INTO tool_call_occurrence_agent_state
+			(session_id, message_ordinal, call_index, agent_id,
 			 first_event_index, latest_event_index)
-		 VALUES `+multiRowPlaceholders(len(args)/5, 5)+`
-		 ON CONFLICT(session_id, tool_use_id, agent_id) DO UPDATE SET
-			latest_event_index = excluded.latest_event_index`,
+		 VALUES `+multiRowPlaceholders(len(args)/6, 6)+`
+		 ON CONFLICT(session_id, message_ordinal, call_index, agent_id)
+		 DO UPDATE SET latest_event_index = excluded.latest_event_index`,
 		args...,
 	); err != nil {
 		return fmt.Errorf(
 			"backfilling tool_call_agent_state (%d rows): %w",
-			len(args)/5, err,
+			len(args)/6, err,
 		)
 	}
 	return nil
@@ -412,29 +425,30 @@ type Message struct {
 	Content   string `json:"content"`
 	// ThinkingText holds the concatenated text of all thinking
 	// blocks for this message; "" if none.
-	ThinkingText      string          `json:"thinking_text"`
-	Timestamp         string          `json:"timestamp"`
-	HasThinking       bool            `json:"has_thinking"`
-	HasToolUse        bool            `json:"has_tool_use"`
-	ContentLength     int             `json:"content_length"`
-	Model             string          `json:"model"`
-	TokenUsage        json.RawMessage `json:"token_usage,omitempty"`
-	ContextTokens     int             `json:"context_tokens"`
-	OutputTokens      int             `json:"output_tokens"`
-	HasContextTokens  bool            `json:"has_context_tokens"`
-	HasOutputTokens   bool            `json:"has_output_tokens"`
-	ClaudeMessageID   string          `json:"claude_message_id,omitempty"`
-	ClaudeRequestID   string          `json:"claude_request_id,omitempty"`
-	ToolCalls         []ToolCall      `json:"tool_calls,omitempty"`
-	ToolResults       []ToolResult    `json:"-"`         // transient, for pairing
-	IsSystem          bool            `json:"is_system"` // persisted, filters search/analytics
-	SourceType        string          `json:"source_type,omitempty"`
-	SourceSubtype     string          `json:"source_subtype,omitempty"`
-	PromptSource      string          `json:"prompt_source,omitempty"`
-	SourceUUID        string          `json:"source_uuid,omitempty"`
-	SourceParentUUID  string          `json:"source_parent_uuid,omitempty"`
-	IsSidechain       bool            `json:"is_sidechain,omitempty"`
-	IsCompactBoundary bool            `json:"is_compact_boundary,omitempty"`
+	ThinkingText      string         `json:"thinking_text"`
+	Timestamp         string         `json:"timestamp"`
+	HasThinking       bool           `json:"has_thinking"`
+	HasToolUse        bool           `json:"has_tool_use"`
+	ContentLength     int            `json:"content_length"`
+	Model             string         `json:"model"`
+	ProviderID        string         `json:"provider_id,omitempty"`
+	TokenUsage        jsontext.Value `json:"token_usage,omitempty"`
+	ContextTokens     int            `json:"context_tokens"`
+	OutputTokens      int            `json:"output_tokens"`
+	HasContextTokens  bool           `json:"has_context_tokens"`
+	HasOutputTokens   bool           `json:"has_output_tokens"`
+	ClaudeMessageID   string         `json:"claude_message_id,omitempty"`
+	ClaudeRequestID   string         `json:"claude_request_id,omitempty"`
+	ToolCalls         []ToolCall     `json:"tool_calls,omitempty"`
+	ToolResults       []ToolResult   `json:"-"`         // transient, for pairing
+	IsSystem          bool           `json:"is_system"` // persisted, filters search/analytics
+	SourceType        string         `json:"source_type,omitempty"`
+	SourceSubtype     string         `json:"source_subtype,omitempty"`
+	PromptSource      string         `json:"prompt_source,omitempty"`
+	SourceUUID        string         `json:"source_uuid,omitempty"`
+	SourceParentUUID  string         `json:"source_parent_uuid,omitempty"`
+	IsSidechain       bool           `json:"is_sidechain,omitempty"`
+	IsCompactBoundary bool           `json:"is_compact_boundary,omitempty"`
 }
 
 type ModelCount struct {
@@ -677,6 +691,33 @@ func (db *DB) GetAllMessages(
 		return nil, err
 	}
 	return msgs, nil
+}
+
+// ListMessageSourceUUIDs returns the non-empty source_uuid values of a
+// session's messages, in ordinal order. The sync engine uses it to verify
+// that a truncated shared-container reparse still contains every archived
+// message before letting it replace the stored transcript.
+func (db *DB) ListMessageSourceUUIDs(
+	ctx context.Context, sessionID string,
+) ([]string, error) {
+	rows, err := db.getReader().QueryContext(ctx, `
+		SELECT source_uuid
+		FROM messages
+		WHERE session_id = ? AND source_uuid != ''
+		ORDER BY ordinal ASC`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("querying message source uuids: %w", err)
+	}
+	defer rows.Close()
+	var uuids []string
+	for rows.Next() {
+		var uuid string
+		if err := rows.Scan(&uuid); err != nil {
+			return nil, fmt.Errorf("scanning message source uuid: %w", err)
+		}
+		uuids = append(uuids, uuid)
+	}
+	return uuids, rows.Err()
 }
 
 func (db *DB) GetResumeModelCounts(
@@ -1039,7 +1080,7 @@ func parseEndedAt(s string) (time.Time, error) {
 // transaction. Returns a slice of message IDs parallel to the
 // input msgs slice. The caller must hold db.mu.
 func insertMessagesTx(
-	tx *sql.Tx, msgs []Message,
+	tx transactionQueries, msgs []Message,
 ) ([]int64, error) {
 	ids := make([]int64, len(msgs))
 	nextID, err := nextMessageIDTx(tx)
@@ -1050,7 +1091,7 @@ func insertMessagesTx(
 	for start := 0; start < len(msgs); start += messageInsertRowsPerStmt {
 		end := min(start+messageInsertRowsPerStmt, len(msgs))
 		batch := msgs[start:end]
-		args := make([]any, 0, len(batch)*26)
+		args := make([]any, 0, len(batch)*27)
 		for i, m := range batch {
 			id := nextID + int64(start+i)
 			ids[start+i] = id
@@ -1060,7 +1101,7 @@ func insertMessagesTx(
 		query := fmt.Sprintf(
 			"INSERT INTO messages (id, %s) VALUES %s",
 			insertMessageCols,
-			multiRowPlaceholders(len(batch), 26),
+			multiRowPlaceholders(len(batch), 27),
 		)
 		if _, err := tx.Exec(query, args...); err != nil {
 			first := batch[0].Ordinal
@@ -1074,7 +1115,7 @@ func insertMessagesTx(
 	return ids, nil
 }
 
-func nextMessageIDTx(tx *sql.Tx) (int64, error) {
+func nextMessageIDTx(tx transactionQueries) (int64, error) {
 	var n sql.NullInt64
 	if err := tx.QueryRow("SELECT MAX(id) FROM messages").Scan(&n); err != nil {
 		return 0, fmt.Errorf("reading next message id: %w", err)
@@ -1104,7 +1145,7 @@ func multiRowPlaceholders(rows, cols int) string {
 }
 
 func insertToolCallsChunkTx(
-	tx *sql.Tx, calls []ToolCall,
+	tx transactionQueries, calls []ToolCall,
 ) error {
 	args := make([]any, 0, len(calls)*12)
 	for _, tc := range calls {
@@ -1138,7 +1179,7 @@ func insertToolCallsChunkTx(
 }
 
 func insertToolResultEventsChunkTx(
-	tx *sql.Tx, rows []toolResultEventRow,
+	tx transactionQueries, rows []toolResultEventRow,
 ) error {
 	args := make([]any, 0, len(rows)*12)
 	for _, r := range rows {
@@ -1180,9 +1221,9 @@ func insertToolResultEventsChunkTx(
 // duplicates event content. Empty-content events contribute nothing,
 // matching SummarizeToolResultEvents.
 func upsertToolCallAgentStateRows(
-	tx *sql.Tx, rows []toolResultEventRow,
+	tx transactionQueries, rows []toolResultEventRow,
 ) error {
-	args := make([]any, 0, len(rows)*5)
+	args := make([]any, 0, len(rows)*6)
 	for _, r := range rows {
 		if strings.TrimSpace(r.Event.Content) == "" &&
 			r.Event.ContentLength == 0 {
@@ -1190,7 +1231,8 @@ func upsertToolCallAgentStateRows(
 		}
 		args = append(args,
 			r.SessionID,
-			r.Event.ToolUseID,
+			r.MessageOrdinal,
+			r.CallIndex,
 			strings.TrimSpace(r.Event.AgentID),
 			r.Event.EventIndex,
 			r.Event.EventIndex,
@@ -1200,16 +1242,16 @@ func upsertToolCallAgentStateRows(
 		return nil
 	}
 	query := `
-		INSERT INTO tool_call_agent_state
-			(session_id, tool_use_id, agent_id,
+		INSERT INTO tool_call_occurrence_agent_state
+			(session_id, message_ordinal, call_index, agent_id,
 			 first_event_index, latest_event_index)
-		VALUES ` + multiRowPlaceholders(len(args)/5, 5) + `
-		ON CONFLICT(session_id, tool_use_id, agent_id) DO UPDATE SET
-			latest_event_index = excluded.latest_event_index`
+		VALUES ` + multiRowPlaceholders(len(args)/6, 6) + `
+		ON CONFLICT(session_id, message_ordinal, call_index, agent_id)
+		DO UPDATE SET latest_event_index = excluded.latest_event_index`
 	if _, err := tx.Exec(query, args...); err != nil {
 		return fmt.Errorf(
 			"upserting tool_call_agent_state (%d rows): %w",
-			len(args)/5, err,
+			len(args)/6, err,
 		)
 	}
 	return nil
@@ -1232,7 +1274,7 @@ func nilIfZero(n int) any {
 // insertToolCallsTx batch-inserts tool calls within an
 // existing transaction.
 func insertToolCallsTx(
-	tx *sql.Tx, calls []ToolCall,
+	tx transactionQueries, calls []ToolCall,
 ) error {
 	for start := 0; start < len(calls); start += toolCallInsertRowsPerStmt {
 		end := min(start+toolCallInsertRowsPerStmt, len(calls))
@@ -1244,7 +1286,7 @@ func insertToolCallsTx(
 }
 
 func insertToolResultEventsTx(
-	tx *sql.Tx, rows []toolResultEventRow,
+	tx transactionQueries, rows []toolResultEventRow,
 ) error {
 	for start := 0; start < len(rows); start += toolResultEventInsertRowsPerStmt {
 		end := min(start+toolResultEventInsertRowsPerStmt, len(rows))
@@ -1297,7 +1339,8 @@ func (db *DB) InsertMessages(msgs []Message) error {
 	if err := insertToolResultEventsTx(tx, events); err != nil {
 		return err
 	}
-	for _, sessionID := range messageSessionIDs(msgs) {
+	sessionIDs := messageSessionIDs(msgs)
+	for _, sessionID := range sessionIDs {
 		if err := bumpTranscriptRevisionTx(tx, sessionID); err != nil {
 			return err
 		}
@@ -1310,7 +1353,11 @@ func (db *DB) InsertMessages(msgs []Message) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	db.notifyUsageSessions(sessionIDs)
+	return nil
 }
 
 // invalidateSessionSignalsTx zeroes quality_signal_version so the
@@ -1359,6 +1406,90 @@ func writeMessagesTx(tx *sql.Tx, msgs []Message) error {
 // reports whether signals were maintained inside the transaction; when
 // false the session's signal version was invalidated and the caller must
 // schedule the debounced full recompute.
+func applyMessageTokenUsageUpdateTx(
+	tx *sql.Tx, sessionID string, update MessageTokenUsageUpdate,
+) (bool, error) {
+	var role, tokenUsage string
+	var contextTokens, outputTokens int
+	var hasContextTokens, hasOutputTokens bool
+	if err := tx.QueryRow(
+		`SELECT role, token_usage, context_tokens, output_tokens,
+		        has_context_tokens, has_output_tokens
+		 FROM messages
+		 WHERE session_id = ? AND ordinal = ?`,
+		sessionID, update.Ordinal,
+	).Scan(
+		&role, &tokenUsage, &contextTokens, &outputTokens,
+		&hasContextTokens, &hasOutputTokens,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, fmt.Errorf(
+				"message usage target %s/%d does not exist",
+				sessionID, update.Ordinal,
+			)
+		}
+		return false, fmt.Errorf(
+			"loading message usage target %s/%d: %w",
+			sessionID, update.Ordinal, err,
+		)
+	}
+	if role != string(parser.RoleAssistant) {
+		return false, fmt.Errorf(
+			"message usage target %s/%d has role %q",
+			sessionID, update.Ordinal, role,
+		)
+	}
+
+	incomingUsage := string(update.TokenUsage)
+	if tokenUsage == incomingUsage &&
+		contextTokens == update.ContextTokens &&
+		outputTokens == update.OutputTokens &&
+		hasContextTokens == update.HasContextTokens &&
+		hasOutputTokens == update.HasOutputTokens {
+		return false, nil
+	}
+	if tokenUsage != "" {
+		return false, fmt.Errorf(
+			"message usage target %s/%d already has different usage",
+			sessionID, update.Ordinal,
+		)
+	}
+
+	result, err := tx.Exec(
+		`UPDATE messages
+		 SET token_usage = ?, context_tokens = ?, output_tokens = ?,
+		     has_context_tokens = ?, has_output_tokens = ?
+		 WHERE session_id = ? AND ordinal = ? AND token_usage = ''`,
+		incomingUsage,
+		update.ContextTokens,
+		update.OutputTokens,
+		update.HasContextTokens,
+		update.HasOutputTokens,
+		sessionID,
+		update.Ordinal,
+	)
+	if err != nil {
+		return false, fmt.Errorf(
+			"updating message usage target %s/%d: %w",
+			sessionID, update.Ordinal, err,
+		)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf(
+			"reading message usage update result %s/%d: %w",
+			sessionID, update.Ordinal, err,
+		)
+	}
+	if rows != 1 {
+		return false, fmt.Errorf(
+			"message usage target %s/%d changed concurrently",
+			sessionID, update.Ordinal,
+		)
+	}
+	return true, nil
+}
+
 func (db *DB) WriteSessionIncremental(
 	sessionID string, msgs []Message, update IncrementalSessionUpdate,
 ) (bool, error) {
@@ -1385,6 +1516,22 @@ func (db *DB) WriteSessionIncremental(
 		return false, err
 	}
 	transcriptChanged := len(msgs) > 0
+	var updatedMessageUsageOrdinals map[int]struct{}
+	for _, usageUpdate := range update.MessageTokenUsageUpdates {
+		changed, err := applyMessageTokenUsageUpdateTx(
+			tx, sessionID, usageUpdate,
+		)
+		if err != nil {
+			return false, err
+		}
+		if changed {
+			if updatedMessageUsageOrdinals == nil {
+				updatedMessageUsageOrdinals = make(map[int]struct{})
+			}
+			updatedMessageUsageOrdinals[usageUpdate.Ordinal] = struct{}{}
+		}
+		transcriptChanged = transcriptChanged || changed
+	}
 	for _, link := range update.SubagentLinks {
 		changed, err := applyToolCallSubagentLinkTx(
 			tx, sessionID, link, update.BlockedResultCategories,
@@ -1394,7 +1541,7 @@ func (db *DB) WriteSessionIncremental(
 		}
 		transcriptChanged = transcriptChanged || changed
 	}
-	var insertedResultEvents map[string][]ToolResultEvent
+	var insertedResultEvents map[ToolCallPosition][]ToolResultEvent
 	for _, resultUpdate := range update.ToolCallResultUpdates {
 		changed, inserted, err := applyToolCallResultUpdateTx(
 			tx, sessionID, resultUpdate,
@@ -1406,9 +1553,9 @@ func (db *DB) WriteSessionIncremental(
 		transcriptChanged = transcriptChanged || changed
 		if len(inserted) > 0 {
 			if insertedResultEvents == nil {
-				insertedResultEvents = make(map[string][]ToolResultEvent)
+				insertedResultEvents = make(map[ToolCallPosition][]ToolResultEvent)
 			}
-			key := strings.TrimSpace(resultUpdate.ToolUseID)
+			key := resultUpdate.Position
 			insertedResultEvents[key] = append(
 				insertedResultEvents[key], inserted...,
 			)
@@ -1436,9 +1583,10 @@ func (db *DB) WriteSessionIncremental(
 	if update.SignalMaintainer != nil {
 		delta, err := update.SignalMaintainer.MaintainTx(
 			context.Background(), signalTxQuery{
-				tx:                   tx,
-				sessionID:            sessionID,
-				insertedResultEvents: insertedResultEvents,
+				tx:                          tx,
+				sessionID:                   sessionID,
+				insertedResultEvents:        insertedResultEvents,
+				updatedMessageUsageOrdinals: updatedMessageUsageOrdinals,
 			},
 		)
 		if err != nil {
@@ -1459,6 +1607,7 @@ func (db *DB) WriteSessionIncremental(
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("committing incremental write tx: %w", err)
 	}
+	db.notifyUsageSessions([]string{sessionID})
 	return signalsMaintained, nil
 }
 
@@ -1626,8 +1775,10 @@ func (db *DB) ReplaceSessionMessages(
 	// clear them and reset the scan state (empty version => secrets scan
 	// --backfill re-scans). ReplaceSessionContent does not call this method; it
 	// supplies fresh findings via replaceSecretFindingsTx directly.
-	if err := replaceSecretFindingsTx(tx, sessionID, nil, 0, ""); err != nil {
-		return err
+	if transcriptChanged {
+		if err := replaceSecretFindingsTx(tx, sessionID, nil, 0, ""); err != nil {
+			return err
+		}
 	}
 	if err := invalidateSessionSignalsTx(tx, sessionID); err != nil {
 		return err
@@ -1640,6 +1791,7 @@ func (db *DB) ReplaceSessionMessages(
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	db.notifyUsageSessions([]string{sessionID})
 	pendingRecallRevocations.flush()
 	return nil
 }
@@ -1679,22 +1831,46 @@ func replaceSessionMessagesTx(
 	return restorePinsTx(tx, sessionID, pins)
 }
 
-func bumpTranscriptRevisionTx(tx *sql.Tx, sessionID string) error {
+// bumpTranscriptRevisionTx advances the transcript revision for a
+// mutated existing session. Touching local_modified_at fires the
+// sync_marker trigger so push targets re-select the session.
+func bumpTranscriptRevisionTx(tx transactionQueries, sessionID string) error {
+	return bumpTranscriptRevision(tx, sessionID, true)
+}
+
+// bumpInsertedTranscriptRevisionTx advances the revision for a session
+// inserted in this same transaction. The INSERT trigger already stamped
+// sync_marker, so skipping the local_modified_at touch avoids a
+// redundant trigger recompute on every bulk-loaded session.
+func bumpInsertedTranscriptRevisionTx(tx transactionQueries, sessionID string) error {
+	return bumpTranscriptRevision(tx, sessionID, false)
+}
+
+func bumpTranscriptRevision(
+	tx transactionQueries, sessionID string, touchModified bool,
+) error {
 	// Advancing the revision also revokes secret-scan freshness in the same
 	// transaction: the mutated transcript has content the recorded scan
 	// never saw, and consumers that require a current scan (extraction's
 	// privacy boundary) must fail closed until a rescan re-stamps it. The
 	// incremental sync path re-scans in a separate later write; the atomic
 	// replace path re-stamps inside this same transaction.
-	result, err := tx.Exec(
-		`UPDATE sessions
+	query := `UPDATE sessions
+		 SET transcript_revision = CAST(
+			CAST(transcript_revision AS INTEGER) + 1 AS TEXT
+		 ),
+		     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+		     secrets_rules_version = ''
+		 WHERE id = ?`
+	if !touchModified {
+		query = `UPDATE sessions
 		 SET transcript_revision = CAST(
 			CAST(transcript_revision AS INTEGER) + 1 AS TEXT
 		 ),
 		     secrets_rules_version = ''
-		 WHERE id = ?`,
-		sessionID,
-	)
+		 WHERE id = ?`
+	}
+	result, err := tx.Exec(query, sessionID)
 	if err != nil {
 		return fmt.Errorf(
 			"bumping transcript revision for %s: %w", sessionID, err,
@@ -1715,7 +1891,7 @@ func bumpTranscriptRevisionTx(tx *sql.Tx, sessionID string) error {
 	return nil
 }
 
-func sessionHasFTSTx(tx *sql.Tx) (bool, error) {
+func sessionHasFTSTx(tx transactionQueries) (bool, error) {
 	var ftsCount int
 	if err := tx.QueryRow(
 		`SELECT count(*) FROM sqlite_master
@@ -1727,7 +1903,7 @@ func sessionHasFTSTx(tx *sql.Tx) (bool, error) {
 }
 
 func deleteSessionMessageRowsTx(
-	tx *sql.Tx, sessionID string,
+	tx transactionQueries, sessionID string,
 ) error {
 	hasFTS, err := sessionHasFTSTx(tx)
 	if err != nil {
@@ -1764,7 +1940,7 @@ func deleteSessionMessageRowsTx(
 	return nil
 }
 
-func deleteSessionMessagesTx(tx *sql.Tx, sessionID string) error {
+func deleteSessionMessagesTx(tx transactionQueries, sessionID string) error {
 	if _, err := tx.Exec(
 		"DELETE FROM tool_calls WHERE session_id = ?",
 		sessionID,
@@ -1789,7 +1965,7 @@ func deleteSessionMessagesTx(tx *sql.Tx, sessionID string) error {
 		"DELETE FROM parser_checkpoints WHERE session_id = ?",
 		"DELETE FROM parser_checkpoint_blobs WHERE session_id = ?",
 		"DELETE FROM session_signal_state WHERE session_id = ?",
-		"DELETE FROM tool_call_agent_state WHERE session_id = ?",
+		"DELETE FROM tool_call_occurrence_agent_state WHERE session_id = ?",
 	} {
 		if _, err := tx.Exec(stmt, sessionID); err != nil {
 			return fmt.Errorf("deleting session side rows: %w", err)
@@ -1900,7 +2076,14 @@ func (db *DB) replaceSessionContent(
 	); err != nil {
 		return err
 	}
-	if cp != nil {
+	if cp == nil || blobs == nil {
+		// A full replacement without safe resume state invalidates any
+		// checkpoint for the previous projection. Leaving it behind would
+		// pair a newer committed transcript with an older cursor and hash.
+		if err := deleteParserCheckpointTx(tx, sessionID); err != nil {
+			return err
+		}
+	} else {
 		c := *cp
 		b := *blobs
 		// The checkpoint row is keyed by session id just like the blobs.
@@ -1918,12 +2101,13 @@ func (db *DB) replaceSessionContent(
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	db.notifyUsageSessions([]string{sessionID})
 	pendingRecallRevocations.flush()
 	return nil
 }
 
 func updateSessionAutomationFromMessagesTx(
-	tx *sql.Tx, sessionID string,
+	tx transactionQueries, sessionID string,
 ) error {
 	want, rowAutomated, ok, err := sessionAutomationStateTx(
 		tx, sessionID,
@@ -1938,7 +2122,7 @@ func updateSessionAutomationFromMessagesTx(
 }
 
 func setSessionAutomationFromMessagesTx(
-	tx *sql.Tx, sessionID string,
+	tx transactionQueries, sessionID string,
 ) error {
 	want, rowAutomated, ok, err := sessionAutomationStateTx(
 		tx, sessionID,
@@ -1950,7 +2134,7 @@ func setSessionAutomationFromMessagesTx(
 }
 
 func sessionAutomationStateTx(
-	tx *sql.Tx, sessionID string,
+	tx transactionQueries, sessionID string,
 ) (want, rowAutomated, ok bool, err error) {
 	var (
 		firstMessage     sql.NullString
@@ -1996,7 +2180,7 @@ func sessionAutomationStateTx(
 }
 
 func setSessionAutomationTx(
-	tx *sql.Tx, sessionID string, isAutomated bool,
+	tx transactionQueries, sessionID string, isAutomated bool,
 ) error {
 	if _, err := tx.Exec(`
 		UPDATE sessions
@@ -2013,7 +2197,7 @@ func setSessionAutomationTx(
 	return nil
 }
 
-func savePinsTx(tx *sql.Tx, sessionID string) ([]savedPin, error) {
+func savePinsTx(tx transactionQueries, sessionID string) ([]savedPin, error) {
 	// Save existing pins before deletion. The ON DELETE CASCADE on
 	// pinned_messages.message_id would otherwise wipe them when
 	// messages are deleted below. source_uuid comes from the joined
@@ -2099,7 +2283,7 @@ func savePinsTx(tx *sql.Tx, sessionID string) ([]savedPin, error) {
 }
 
 func restorePinsTx(
-	tx *sql.Tx, sessionID string, pins []savedPin,
+	tx transactionQueries, sessionID string, pins []savedPin,
 ) error {
 	// Re-attach saved pins only when the old and new message identities
 	// are both unambiguous. A unique source_uuid may move to another
@@ -2127,7 +2311,7 @@ func restorePinsTx(
 }
 
 func restorePinBySourceUUIDTx(
-	tx *sql.Tx, sessionID string, sp savedPin,
+	tx transactionQueries, sessionID string, sp savedPin,
 ) error {
 	if sp.sourceUUIDCount == 1 {
 		res, err := tx.Exec(`
@@ -2216,7 +2400,7 @@ func restorePinBySourceUUIDTx(
 // edit to the pinned message itself — means the pinned message can no
 // longer be identified and the pin is dropped.
 func restoreLegacyPinByRankTx(
-	tx *sql.Tx, sessionID string, sp savedPin,
+	tx transactionQueries, sessionID string, sp savedPin,
 ) error {
 	_, err := tx.Exec(`
 		INSERT OR IGNORE INTO pinned_messages
@@ -2498,6 +2682,7 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 			&m.IsSystem,
 			&m.Model, &tokenUsage,
 			&m.ContextTokens, &m.OutputTokens,
+			&m.ProviderID,
 			&m.HasContextTokens, &m.HasOutputTokens,
 			&m.ClaudeMessageID, &m.ClaudeRequestID,
 			&m.SourceType, &m.SourceSubtype, &m.PromptSource, &m.SourceUUID,
@@ -2507,7 +2692,7 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 			return nil, fmt.Errorf("scanning message: %w", err)
 		}
 		if tokenUsage != "" {
-			m.TokenUsage = json.RawMessage(tokenUsage)
+			m.TokenUsage = jsontext.Value(tokenUsage)
 		}
 		msgs = append(msgs, m)
 	}
@@ -2589,7 +2774,7 @@ func isStrippableControl(r rune) bool {
 // metadata-only changes invalidate the fast path.
 func (db *DB) MessageTokenFingerprint(sessionID string) (string, error) {
 	rows, err := db.getReader().Query(
-		`SELECT ordinal, model, token_usage, context_tokens,
+		`SELECT ordinal, model, provider_id, token_usage, context_tokens,
 			output_tokens, has_context_tokens, has_output_tokens,
 			claude_message_id, claude_request_id,
 			source_type, source_subtype, prompt_source, source_uuid,
@@ -2608,7 +2793,7 @@ func (db *DB) MessageTokenFingerprint(sessionID string) (string, error) {
 	for rows.Next() {
 		var r tokenFingerprintRow
 		if err := rows.Scan(
-			&r.ordinal, &r.model, &r.tokenUsage, &r.contextTokens,
+			&r.ordinal, &r.model, &r.providerID, &r.tokenUsage, &r.contextTokens,
 			&r.outputTokens, &r.hasContextTokens, &r.hasOutputTokens,
 			&r.claudeMessageID, &r.claudeRequestID,
 			&r.sourceType, &r.sourceSubtype, &r.promptSource, &r.sourceUUID,
@@ -2846,24 +3031,14 @@ func (db *DB) SetToolCallSubagentSession(
 		if err := bumpTranscriptRevisionTx(tx, sessionID); err != nil {
 			return err
 		}
-		// Bump local_modified_at so the sync_marker trigger fires and push
-		// targets re-select the session: the linkage lands in mirrored
-		// data (tool_calls.subagent_session_id and transcript_revision)
-		// but touches no sync_marker signal on its own (see
-		// LinkSubagentSessions for the same pattern).
-		if _, err := tx.Exec(
-			`UPDATE sessions
-			    SET local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-			  WHERE id = ?`,
-			sessionID,
-		); err != nil {
-			return fmt.Errorf(
-				"bumping local_modified_at for %s after subagent link: %w",
-				sessionID, err,
-			)
-		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if changed {
+		db.notifyUsageSessions([]string{sessionID})
+	}
+	return nil
 }
 
 func applyToolCallSubagentLinkTx(
@@ -2936,15 +3111,19 @@ func applyToolCallResultUpdateTx(
 		return false, nil, nil
 	}
 
-	var messageOrdinal, callIndex int
+	position := update.Position
+	var toolCallID int64
 	var category string
 	if err := tx.QueryRow(
-		`SELECT m.ordinal, COALESCE(tc.call_index, 0), tc.category
+		`SELECT tc.id, tc.category
 		 FROM tool_calls tc
 		 JOIN messages m ON m.id = tc.message_id
-		 WHERE tc.session_id = ? AND tc.tool_use_id = ?`,
-		sessionID, update.ToolUseID,
-	).Scan(&messageOrdinal, &callIndex, &category); err != nil {
+		 WHERE tc.session_id = ? AND m.ordinal = ?
+		   AND COALESCE(tc.call_index, 0) = ?
+		   AND COALESCE(tc.tool_use_id, '') = ?`,
+		sessionID, position.MessageOrdinal, position.CallIndex,
+		update.ToolUseID,
+	).Scan(&toolCallID, &category); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil, nil
 		}
@@ -2962,9 +3141,10 @@ func applyToolCallResultUpdateTx(
 	// result; every later update stays O(delta).
 	var stateExists int
 	err := tx.QueryRow(
-		`SELECT 1 FROM tool_call_agent_state
-		 WHERE session_id = ? AND tool_use_id = ? LIMIT 1`,
-		sessionID, update.ToolUseID,
+		`SELECT 1 FROM tool_call_occurrence_agent_state
+		 WHERE session_id = ? AND message_ordinal = ? AND call_index = ?
+		 LIMIT 1`,
+		sessionID, position.MessageOrdinal, position.CallIndex,
 	).Scan(&stateExists)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, nil, fmt.Errorf(
@@ -2974,7 +3154,7 @@ func applyToolCallResultUpdateTx(
 	}
 	if err != nil {
 		if err := backfillToolCallAgentStateTx(
-			tx, sessionID, update.ToolUseID, messageOrdinal, callIndex,
+			tx, sessionID, position,
 		); err != nil {
 			return false, nil, err
 		}
@@ -2985,7 +3165,7 @@ func applyToolCallResultUpdateTx(
 		 FROM tool_result_events
 		 WHERE session_id = ? AND tool_call_message_ordinal = ?
 		   AND call_index = ?`,
-		sessionID, messageOrdinal, callIndex,
+		sessionID, position.MessageOrdinal, position.CallIndex,
 	).Scan(&nextEventIndex); err != nil {
 		return false, nil, fmt.Errorf(
 			"reading next event index for %s/%s: %w",
@@ -3002,11 +3182,20 @@ func applyToolCallResultUpdateTx(
 			incoming[i].ContentLength = len(incoming[i].Content)
 		}
 	}
-	toolCall := ToolCall{ResultEvents: incoming}
-	_ = SanitizeToolCall(&toolCall)
-	incoming = toolCall.ResultEvents
 
 	blocked := blockedResultCategories[category]
+	// Blocked-category content is blanked below and never stored, so it
+	// must skip sanitization: sanitizing first (like the full-parse
+	// pairToolResultEventSummaries path avoids by blanking before its
+	// central validation pass runs) would shrink ContentLength by the
+	// stripped-byte count before the blank overwrites Content, losing the
+	// original result length the full and staged paths both preserve.
+	if !blocked {
+		toolCall := ToolCall{ResultEvents: incoming}
+		_ = SanitizeToolCall(&toolCall)
+		incoming = toolCall.ResultEvents
+	}
+
 	insertRows := make([]toolResultEventRow, 0, len(incoming))
 	var inserted []ToolResultEvent
 	for _, candidate := range incoming {
@@ -3014,20 +3203,27 @@ func applyToolCallResultUpdateTx(
 		if blocked {
 			stored.Content = ""
 		}
-		// Mirror hasEquivalentToolResultEvent: same agent and status
-		// with either identical content, or — for blocked categories,
-		// whose stored content is blanked — identical content length.
+		// Equivalence mirrors the parser's raw dedup as closely as the
+		// stored columns allow: same agent and status, plus identical
+		// (sanitized) content for storable categories, or identical
+		// original length for blocked categories. The two arms are
+		// exclusive on purpose: every stored blocked row has an empty
+		// content column, so a content comparison there would match any
+		// earlier blocked event of the same agent/status and collapse
+		// distinct outputs; and the raw blocked content is never bound.
 		var exists int
 		err := tx.QueryRow(
 			`SELECT 1 FROM tool_result_events
 			 WHERE session_id = ? AND tool_call_message_ordinal = ?
 			   AND call_index = ? AND COALESCE(agent_id, '') IS ?
 			   AND status IS ?
-			   AND (content IS ? OR (? = 1 AND content_length = ?))
+			   AND ((? = 0 AND content IS ?)
+			        OR (? = 1 AND content_length = ?))
 			 LIMIT 1`,
-			sessionID, messageOrdinal, callIndex,
-			candidate.AgentID, candidate.Status, candidate.Content,
-			blocked, candidate.ContentLength,
+			sessionID, position.MessageOrdinal, position.CallIndex,
+			stored.AgentID, stored.Status,
+			blocked, stored.Content,
+			blocked, stored.ContentLength,
 		).Scan(&exists)
 		if err == nil {
 			continue // equivalent event already stored
@@ -3043,8 +3239,8 @@ func applyToolCallResultUpdateTx(
 		inserted = append(inserted, stored)
 		insertRows = append(insertRows, toolResultEventRow{
 			SessionID:      sessionID,
-			MessageOrdinal: messageOrdinal,
-			CallIndex:      callIndex,
+			MessageOrdinal: position.MessageOrdinal,
+			CallIndex:      position.CallIndex,
 			Event:          stored,
 		})
 	}
@@ -3056,13 +3252,13 @@ func applyToolCallResultUpdateTx(
 	}
 
 	summary, err := summarizeToolCallFromStateTx(
-		tx, sessionID, update.ToolUseID,
+		tx, sessionID, position,
 	)
 	if err != nil {
 		return false, nil, err
 	}
 	resultLength, err := summarizeToolCallLengthFromStateTx(
-		tx, sessionID, update.ToolUseID,
+		tx, sessionID, position,
 	)
 	if err != nil {
 		return false, nil, err
@@ -3074,8 +3270,8 @@ func applyToolCallResultUpdateTx(
 	if _, err := tx.Exec(
 		`UPDATE tool_calls
 		 SET result_content_length = ?, result_content = ?
-		 WHERE session_id = ? AND tool_use_id = ?`,
-		resultLength, storedSummary, sessionID, update.ToolUseID,
+		 WHERE id = ?`,
+		resultLength, storedSummary, toolCallID,
 	); err != nil {
 		return false, nil, fmt.Errorf(
 			"updating tool result summary for %s/%s: %w",
@@ -3083,22 +3279,6 @@ func applyToolCallResultUpdateTx(
 		)
 	}
 	return true, inserted, nil
-}
-
-func hasEquivalentToolResultEvent(
-	events []ToolResultEvent, candidate ToolResultEvent, blocked bool,
-) bool {
-	for _, existing := range events {
-		if existing.AgentID != candidate.AgentID ||
-			existing.Status != candidate.Status {
-			continue
-		}
-		if existing.Content == candidate.Content ||
-			(blocked && existing.ContentLength == candidate.ContentLength) {
-			return true
-		}
-	}
-	return false
 }
 
 // SystemMessageFingerprint returns the ordered, comma-separated list of
@@ -3235,6 +3415,7 @@ func (db *DB) GetMessageByOrdinal(
 		&m.IsSystem,
 		&m.Model, &tokenUsage,
 		&m.ContextTokens, &m.OutputTokens,
+		&m.ProviderID,
 		&m.HasContextTokens, &m.HasOutputTokens,
 		&m.ClaudeMessageID, &m.ClaudeRequestID,
 		&m.SourceType, &m.SourceSubtype, &m.PromptSource, &m.SourceUUID,
@@ -3247,7 +3428,7 @@ func (db *DB) GetMessageByOrdinal(
 		return nil, err
 	}
 	if tokenUsage != "" {
-		m.TokenUsage = json.RawMessage(tokenUsage)
+		m.TokenUsage = jsontext.Value(tokenUsage)
 	}
 	return &m, nil
 }

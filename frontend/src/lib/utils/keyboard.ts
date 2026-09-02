@@ -11,6 +11,18 @@ import { configureGeneratedClient } from "../api/runtime.js";
 import { supportsResume, buildResumeCommand, formatResumeResponseCommand } from "./resume.js";
 import { copyToClipboard } from "./clipboard.js";
 import { toggleSidebarWithFocus } from "./sidebar-toggle.js";
+import {
+  getSessionListElement,
+  navigateRegisteredSessionList,
+  resolveArrowTarget,
+  type ArrowInteractionTarget,
+} from "./arrow-target.js";
+
+function starredSessionFilter(): ((s: { id: string }) => boolean) | undefined {
+  return starred.filterOnly
+    ? (s: { id: string }) => starred.isStarred(s.id)
+    : undefined;
+}
 
 function isInputFocused(): boolean {
   const el = document.activeElement;
@@ -57,6 +69,22 @@ function activeResumeModel(sessionId: string): string {
  * Returns a cleanup function to remove the listener.
  */
 export function registerShortcuts(opts: ShortcutOptions): () => void {
+  let lastArrowInteraction: ArrowInteractionTarget | null = null;
+
+  function rememberArrowInteraction(e: PointerEvent | FocusEvent) {
+    if (!(e.target instanceof Element)) return;
+    const sessionList = getSessionListElement();
+    const sessionSidebar = sessionList?.closest("#session-sidebar");
+    if (
+      sessionList?.contains(e.target) ||
+      sessionSidebar?.contains(e.target)
+    ) {
+      lastArrowInteraction = "sessionList";
+    } else if (e.target.closest(".message-list-scroll")) {
+      lastArrowInteraction = "message";
+    }
+  }
+
   function handler(e: KeyboardEvent) {
     const meta = e.metaKey || e.ctrlKey;
 
@@ -144,20 +172,36 @@ export function registerShortcuts(opts: ShortcutOptions): () => void {
 
     const keyActions: Record<string, () => void> = {
       j: () => opts.navigateMessage(1),
-      ArrowDown: () => opts.navigateMessage(1),
+      ArrowDown: () => {
+        const target = resolveArrowTarget(
+          document.activeElement,
+          getSessionListElement(),
+          lastArrowInteraction,
+        );
+        if (target === "sessionList") {
+          navigateRegisteredSessionList(1);
+        } else if (target === "message") {
+          opts.navigateMessage(1);
+        }
+      },
       k: () => opts.navigateMessage(-1),
-      ArrowUp: () => opts.navigateMessage(-1),
+      ArrowUp: () => {
+        const target = resolveArrowTarget(
+          document.activeElement,
+          getSessionListElement(),
+          lastArrowInteraction,
+        );
+        if (target === "sessionList") {
+          navigateRegisteredSessionList(-1);
+        } else if (target === "message") {
+          opts.navigateMessage(-1);
+        }
+      },
       "]": () => {
-        const filter = starred.filterOnly
-          ? (s: { id: string }) => starred.isStarred(s.id)
-          : undefined;
-        sessions.navigateSession(1, filter);
+        sessions.navigateSession(1, starredSessionFilter());
       },
       "[": () => {
-        const filter = starred.filterOnly
-          ? (s: { id: string }) => starred.isStarred(s.id)
-          : undefined;
-        sessions.navigateSession(-1, filter);
+        sessions.navigateSession(-1, starredSessionFilter());
       },
       o: () => ui.toggleSort(),
       l: () => ui.cycleLayout(),
@@ -245,6 +289,12 @@ export function registerShortcuts(opts: ShortcutOptions): () => void {
     }
   }
 
+  document.addEventListener("pointerdown", rememberArrowInteraction, true);
+  document.addEventListener("focusin", rememberArrowInteraction, true);
   document.addEventListener("keydown", handler);
-  return () => document.removeEventListener("keydown", handler);
+  return () => {
+    document.removeEventListener("pointerdown", rememberArrowInteraction, true);
+    document.removeEventListener("focusin", rememberArrowInteraction, true);
+    document.removeEventListener("keydown", handler);
+  };
 }

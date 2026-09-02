@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"slices"
+	"sort"
 	"strings"
 	"syscall"
 	"testing"
@@ -297,6 +298,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 		engine = sync.NewEngine(database, sync.EngineConfig{
 			AgentDirs:               cfg.AgentDirs,
 			SourceMachines:          cfg.SourceMachines,
+			DisabledAgents:          cfg.DisabledAgents,
 			IncludeCwdPrefixes:      cfg.SyncIncludeCwdPrefixes,
 			ScanProtectedPaths:      cfg.ScanProtectedPaths,
 			Machine:                 cfg.LocalMachineName,
@@ -538,6 +540,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 		idleTracker.Touch()
 		go idleTracker.Run(ctx)
 	}
+	startDaemonUsageCacheBackfill(ctx, database, idleTracker)
 	if engine != nil && opts.SkipInitialSync {
 		go func() {
 			timer := time.NewTimer(deferredStartupSyncGracePeriod)
@@ -601,6 +604,34 @@ func runServe(cfg config.Config, opts serveOptions) {
 
 	if err := waitForServerRuntime(ctx, srv, rt); err != nil {
 		fatal("%v", err)
+	}
+}
+
+type usageCacheBackfiller interface {
+	StartUsageCacheBackfill(context.Context) error
+	WaitUsageCacheBackfill(context.Context) error
+	SetUsageCacheBackfillStarted(func())
+}
+
+func startDaemonUsageCacheBackfill(
+	ctx context.Context, backfiller usageCacheBackfiller,
+	idleTracker *server.IdleTracker,
+) {
+	backfiller.SetUsageCacheBackfillStarted(func() {
+		done, ok := idleTracker.BeginWork()
+		if !ok {
+			return
+		}
+		go func() {
+			defer done()
+			if err := backfiller.WaitUsageCacheBackfill(ctx); err != nil &&
+				ctx.Err() == nil {
+				log.Printf("usage cache backfill: %v", err)
+			}
+		}()
+	})
+	if err := backfiller.StartUsageCacheBackfill(ctx); err != nil && ctx.Err() == nil {
+		log.Printf("usage cache backfill: %v", err)
 	}
 }
 
@@ -752,14 +783,18 @@ func deferStartupMaintenance(skipInitialSync, workerSyncDone bool) bool {
 func statsFromWorkerResult(r workerResult) sync.SyncStats {
 	if r.Stats != nil {
 		stats := *r.Stats
+		if r.Tombstoned > stats.Tombstoned {
+			stats.Tombstoned = r.Tombstoned
+		}
 		stats.Aborted = !r.DiscoveryComplete
 		return stats
 	}
 	return sync.SyncStats{
-		Synced:  r.Synced,
-		Skipped: r.Skipped,
-		Failed:  r.Failed,
-		Aborted: !r.DiscoveryComplete,
+		Synced:     r.Synced,
+		Skipped:    r.Skipped,
+		Failed:     r.Failed,
+		Tombstoned: r.Tombstoned,
+		Aborted:    !r.DiscoveryComplete,
 	}
 }
 
@@ -782,23 +817,6 @@ func reconcileRootPaths(cfg config.Config) []string {
 type watchRecoveryScope struct {
 	available []string
 	deferred  map[string]struct{}
-}
-
-// coversProviderRoot reports whether a configured provider root is currently
-// available for authoritative reconciliation: no deferred scope overlaps the
-// root's engine-side expansion, and at least one probed available path lies
-// at or under the root.
-func (s watchRecoveryScope) coversProviderRoot(root string) bool {
-	root = filepath.Clean(root)
-	if overlapsDeferredScope(root, s.deferred) {
-		return false
-	}
-	for _, path := range s.available {
-		if path == root || pathWithinRoot(path, root) {
-			return true
-		}
-	}
-	return false
 }
 
 // probeWatchRecoveryScope computes the probed reconciliation scope backing
@@ -954,8 +972,8 @@ func newForegroundSyncRunner(
 			// closes before the exclusive lock is released, and last-sync
 			// state plus the "sync" emit fire after it, so /sync/status and
 			// SSE subscribers observe the worker-backed pass.
-			stats, _, err := runWorkerSyncPass(
-				ctx, daemonCtx, cfg, engine, database, lock, false, onLine,
+			stats, _, err := runForegroundWorkerSyncPass(
+				ctx, daemonCtx, cfg, engine, database, lock, onLine,
 			)
 			if err == nil || !workerNeverRan(err) {
 				return stats, err
@@ -1057,15 +1075,23 @@ func runWorkerResyncBuild(
 	database *db.DB,
 	progress func(sync.Progress),
 ) (workerResult, error, bool) {
-	relay := func(l workerLine) {
-		if l.Progress != nil && progress != nil {
-			progress(*l.Progress)
-		}
-	}
 	var result workerResult
 	var launchErr error
 	var doneStats sync.SyncStats
 	barrierErr := engine.RunExclusive(func() error {
+		engine.UpdateProgress(sync.Progress{
+			Phase:  sync.PhasePreparingResync,
+			Detail: "Starting resync worker",
+		})
+		defer engine.FinishProgress()
+		relay := func(line workerLine) {
+			if line.Progress != nil {
+				engine.UpdateProgress(*line.Progress)
+			}
+			if progress != nil && line.Progress != nil {
+				progress(*line.Progress)
+			}
+		}
 		if cerr := closeWriterForPass(
 			recoveryCtx, database, "resync build",
 		); cerr != nil {
@@ -1085,7 +1111,17 @@ func runWorkerResyncBuild(
 			}
 			return launchErr
 		}
-		if serr := engine.SwapResyncDatabase(engine.ResyncTempPath()); serr != nil {
+		installed, serr := engine.SwapResyncDatabase(engine.ResyncTempPath())
+		if serr != nil {
+			if !installed {
+				// The replacement was discarded, so its tombstones never
+				// reached the archive. A post-install failure keeps them:
+				// the replacement is the live archive there.
+				result.Tombstoned = 0
+				if result.Stats != nil {
+					result.Stats.Tombstoned = 0
+				}
+			}
 			// Swap failures happen at or after CloseConnections closed the
 			// reader pool, so when the swap's own recovery did not restore
 			// the archive only a full Reopen brings reads back; ReopenWriter
@@ -1435,7 +1471,11 @@ func mustOpenWriteDB(
 	return database, lock
 }
 
-func applyCursorSecret(database *db.DB, cfg config.Config) error {
+type cursorSecretStore interface {
+	SetCursorSecret(secret []byte)
+}
+
+func applyCursorSecret(database cursorSecretStore, cfg config.Config) error {
 	if cfg.CursorSecret != "" {
 		secret, err := base64.StdEncoding.DecodeString(cfg.CursorSecret)
 		if err != nil {
@@ -1444,6 +1484,13 @@ func applyCursorSecret(database *db.DB, cfg config.Config) error {
 		database.SetCursorSecret(secret)
 	}
 	return nil
+}
+
+func applyRequiredCursorSecret(database cursorSecretStore, cfg config.Config) error {
+	if cfg.CursorSecret == "" {
+		return errors.New("cursor secret is not configured")
+	}
+	return applyCursorSecret(database, cfg)
 }
 
 // fatal prints a formatted error to stderr and exits.
@@ -2189,41 +2236,7 @@ func accountRegisteredWatchRoots(
 	})
 }
 
-type watchSyncer interface {
-	SyncPathsContext(context.Context, []string) error
-	HasActiveSessionSourceBelow(agent, path string) (bool, error)
-	ReconciliationRootsForAgent(agent string) []string
-	ReconcileWatchRoots(context.Context, []string, bool) error
-	ReconcileWatchRootsAfterLostEvents(context.Context, []string, bool) error
-}
-
-type watchReconciliationError struct {
-	cause error
-	retry sync.WatchBatch
-}
-
-func newWatchReconciliationError(
-	cause error, roots []string, full, lostEvents bool,
-) error {
-	var scoped interface{ ReconciliationRetryRoots() []string }
-	if errors.As(cause, &scoped) {
-		if failedRoots := deduplicateStrings(scoped.ReconciliationRetryRoots()); len(failedRoots) > 0 {
-			return &watchReconciliationError{
-				cause: cause,
-				retry: sync.WatchBatch{
-					ReconcileRoots: failedRoots,
-					LostEvents:     lostEvents,
-				},
-			}
-		}
-	}
-	retry := sync.WatchBatch{FullSync: full}
-	retry.LostEvents = lostEvents
-	if !full {
-		retry.ReconcileRoots = append([]string(nil), roots...)
-	}
-	return &watchReconciliationError{cause: cause, retry: retry}
-}
+type watchSyncer = sync.WatchBatchSyncer
 
 // gapReconciliationRetryBatch classifies a failed worker-to-watcher gap
 // reconciliation the same way the watcher callback path does: scoped retry
@@ -2231,24 +2244,23 @@ func newWatchReconciliationError(
 // The daemon queues the batch on the watcher before opening dispatch so the
 // affected roots re-reconcile with backoff.
 func gapReconciliationRetryBatch(gapErr error) sync.WatchBatch {
-	var scoped interface{ ReconciliationRetryRoots() []string }
-	if errors.As(gapErr, &scoped) {
-		if roots := deduplicateStrings(scoped.ReconciliationRetryRoots()); len(roots) > 0 {
-			return sync.WatchBatch{ReconcileRoots: roots}
-		}
+	var pathsSource interface{ ReconciliationRetryPaths() []string }
+	var rootsSource interface{ ReconciliationRetryRoots() []string }
+	var overflowSource interface{ ReconciliationRetryOverflow() bool }
+	var paths, roots []string
+	if errors.As(gapErr, &pathsSource) {
+		paths = deduplicateStrings(pathsSource.ReconciliationRetryPaths())
+	}
+	if errors.As(gapErr, &rootsSource) {
+		roots = deduplicateStrings(rootsSource.ReconciliationRetryRoots())
+	}
+	if errors.As(gapErr, &overflowSource) && overflowSource.ReconciliationRetryOverflow() {
+		return sync.WatchBatch{FullSync: true}
+	}
+	if len(paths) > 0 || len(roots) > 0 {
+		return sync.WatchBatch{Paths: paths, ReconcileRoots: roots}
 	}
 	return sync.WatchBatch{FullSync: true}
-}
-
-func (e *watchReconciliationError) Error() string { return e.cause.Error() }
-
-func (e *watchReconciliationError) Unwrap() error { return e.cause }
-
-func (e *watchReconciliationError) WatchRetryBatch() sync.WatchBatch {
-	retry := e.retry
-	retry.Paths = append([]string(nil), retry.Paths...)
-	retry.ReconcileRoots = append([]string(nil), retry.ReconcileRoots...)
-	return retry
 }
 
 // syncWatchBatch applies one watcher batch to the engine. recoveryScope
@@ -2264,140 +2276,20 @@ func syncWatchBatch(
 	batch sync.WatchBatch,
 	recoveryScope func() watchRecoveryScope,
 ) error {
-	paths := append([]string(nil), batch.Paths...)
-	full := batch.FullSync
-	reconcileRoots := append([]string(nil), batch.ReconcileRoots...)
-	lostEvents := batch.LostEvents
-	type renameOwner struct {
-		path  string
-		agent string
-	}
-	var scope watchRecoveryScope
-	scopeProbed := false
-	probeScope := func() watchRecoveryScope {
-		if !scopeProbed {
-			scope = recoveryScope()
-			scopeProbed = true
+	var recovery *sync.WatchRecoveryScope
+	if batch.FullSync || len(batch.Renames) > 0 {
+		probed := recoveryScope()
+		deferred := make([]string, 0, len(probed.deferred))
+		for root := range probed.deferred {
+			deferred = append(deferred, root)
 		}
-		return scope
-	}
-	authoritativePaths := make(map[string]struct{})
-	authoritativeRenames := make(map[renameOwner]struct{})
-	promoteDirectoryRename := func(rename sync.WatchRename) {
-		roots := engine.ReconciliationRootsForAgent(rename.Agent)
-		if rename.Agent == "" || len(roots) == 0 {
-			full = true
-			return
-		}
-		// FSEvents may report only one endpoint of a cross-root move, so
-		// the promotion covers every currently available root of the owning
-		// provider. Unavailable siblings are deferred to their polling
-		// probes: reconciling them would read an unmounted volume as an
-		// empty discovery and tombstone every baselined session beneath it.
-		for _, root := range roots {
-			if probeScope().coversProviderRoot(root) {
-				reconcileRoots = append(reconcileRoots, root)
-			}
+		sort.Strings(deferred)
+		recovery = &sync.WatchRecoveryScope{
+			AvailableRoots: append([]string(nil), probed.available...),
+			DeferredRoots:  deferred,
 		}
 	}
-	for _, rename := range batch.Renames {
-		owner := renameOwner{path: rename.Path, agent: rename.Agent}
-		if _, authoritative := authoritativeRenames[owner]; authoritative {
-			continue
-		}
-		switch rename.ItemType {
-		case sync.ItemIsFile:
-			paths = appendUniqueString(paths, rename.Path)
-		case sync.ItemIsDir:
-			promoteDirectoryRename(rename)
-			authoritativePaths[rename.Path] = struct{}{}
-			authoritativeRenames[owner] = struct{}{}
-			paths = removeString(paths, rename.Path)
-		default:
-			info, err := os.Stat(rename.Path)
-			if err == nil {
-				if info.IsDir() {
-					promoteDirectoryRename(rename)
-					authoritativePaths[rename.Path] = struct{}{}
-					authoritativeRenames[owner] = struct{}{}
-					paths = removeString(paths, rename.Path)
-				} else {
-					paths = appendUniqueString(paths, rename.Path)
-				}
-				continue
-			}
-			if !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("classifying watcher rename %q: %w", rename.Path, err)
-			}
-			hasDescendant, err := engine.HasActiveSessionSourceBelow(rename.Agent, rename.Path)
-			if err != nil {
-				return err
-			}
-			if hasDescendant {
-				promoteDirectoryRename(rename)
-				authoritativePaths[rename.Path] = struct{}{}
-				authoritativeRenames[owner] = struct{}{}
-				paths = removeString(paths, rename.Path)
-			} else {
-				if _, authoritative := authoritativePaths[rename.Path]; !authoritative {
-					paths = appendUniqueString(paths, rename.Path)
-				}
-			}
-		}
-	}
-	if len(paths) > 0 {
-		if err := engine.SyncPathsContext(ctx, paths); err != nil {
-			retry := sync.WatchBatch{FullSync: full, LostEvents: lostEvents}
-			if !full {
-				retry.Paths = append([]string(nil), paths...)
-				retry.ReconcileRoots = deduplicateStrings(reconcileRoots)
-			}
-			return &watchReconciliationError{
-				cause: err,
-				retry: retry,
-			}
-		}
-	}
-	if full {
-		// Scope the recovery to the currently available roots, exactly like
-		// the startup gap reconciliation and the archive audit. An engine-side
-		// full pass would expand to every configured dir without probing, read
-		// an unmounted volume or missing provider subtree as an empty
-		// discovery, and tombstone every baselined session beneath it.
-		// Unavailable scopes are deferred to their polling probes instead; a
-		// failed recovery retries as a full batch so availability is re-probed.
-		fullRoots := probeScope().available
-		if len(fullRoots) == 0 {
-			return nil
-		}
-		var err error
-		if lostEvents {
-			err = engine.ReconcileWatchRootsAfterLostEvents(ctx, fullRoots, false)
-		} else {
-			err = engine.ReconcileWatchRoots(ctx, fullRoots, false)
-		}
-		if err != nil {
-			return newWatchReconciliationError(err, nil, true, lostEvents)
-		}
-		return nil
-	}
-	roots := deduplicateStrings(reconcileRoots)
-	if len(roots) > 0 {
-		var err error
-		if lostEvents {
-			err = engine.ReconcileWatchRootsAfterLostEvents(ctx, roots, false)
-		} else {
-			err = engine.ReconcileWatchRoots(ctx, roots, false)
-		}
-		if err != nil {
-			return newWatchReconciliationError(err, roots, false, lostEvents)
-		}
-	}
-	return nil
-}
-
-func removeString(values []string, remove string) []string {
-	return slices.DeleteFunc(values, func(value string) bool { return value == remove })
+	return sync.ApplyWatchBatch(ctx, engine, batch, recovery)
 }
 
 func deduplicateStrings(values []string) []string {
@@ -2534,12 +2426,12 @@ func collectWatchRoots(cfg config.Config) (
 			scopes:    []watchScope{scope},
 		})
 	}
-	for _, def := range parser.Registry {
+	for _, factory := range cfg.LocalProviderFactories() {
+		def := factory.Definition()
 		for _, d := range cfg.ResolveDirs(def.Type) {
 			addAgentRoot := func(dir, root string, recursive, exists bool) {
 				addRoot(def.Type, dir, root, recursive, exists)
 			}
-			_, hasProvider := parser.ProviderFactoryByType(def.Type)
 			if providerWatched, polling := collectProviderWatchRoots(def, d, addAgentRoot); providerWatched {
 				if polling.persistent {
 					addPersistent(def.Type, d)
@@ -2563,9 +2455,7 @@ func collectWatchRoots(cfg config.Config) (
 				continue
 			}
 			if !def.FileBased {
-				if hasProvider {
-					addPersistent(def.Type, d)
-				}
+				addPersistent(def.Type, d)
 				continue
 			}
 			fallbackUnwatched := collectLegacyWatchRoots(def, d, addAgentRoot)
@@ -2889,10 +2779,21 @@ func runArchiveAudit(
 	result, err := runWorkerWritePass(
 		ctx, ctx, cfg, engine, database, lock, "audit", nil,
 	)
-	if (result.Synced > 0 || result.Tombstoned > 0) && emitter != nil {
+	if workerResultHasSessionChanges(result) && emitter != nil {
 		emitter.Emit("sessions")
 	}
 	return err
+}
+
+// workerResultHasSessionChanges reports whether a worker pass changed rows
+// clients must refetch. Cwd-only reconciliations ride the serialized
+// SyncStats payload rather than the summary counters, so the audit emit
+// must consult it or a cwd-only pass would leave the UI stale.
+func workerResultHasSessionChanges(result workerResult) bool {
+	if result.Synced > 0 || result.Tombstoned > 0 {
+		return true
+	}
+	return result.Stats != nil && result.Stats.CwdUpdated > 0
 }
 
 // scheduledSyncEngine is the reconciliation surface the scheduled pass needs.

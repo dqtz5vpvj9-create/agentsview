@@ -15,11 +15,11 @@ Recall is an experimental layer for durable, provenance-linked knowledge from
 past agent sessions. It stores compact facts, procedures, preferences, and
 warnings as entries that can be listed, queried, and packed into a task brief.
 
-This is different from [semantic search](/semantic-search/). Semantic search
-finds relevant passages in the transcript archive. Recall searches a separate
-set of distilled entries and keeps the transcript region supporting each entry
-as evidence. Recall queries support lexical, vector, and hybrid retrieval; the
-default remains lexical while this feature is experimental.
+This is different from [semantic search](/docs/semantic-search/). Semantic
+search finds relevant passages in the transcript archive. Recall searches a
+separate set of distilled entries and keeps the transcript region supporting
+each entry as evidence. Recall queries support lexical, vector, and hybrid
+retrieval; the default remains lexical while this feature is experimental.
 
 ## Current surface
 
@@ -49,15 +49,38 @@ The top-level **Recall** page has two tabs:
 Open Recall from the header or navigate directly to `/recall`. Generated-report
 links use `/recall?tab=generated&insight=<id>`.
 
-![Recall corpus browser](/assets/generated/screenshots/recall-corpus.png)
+![Recall corpus browser](/docs/assets/generated/screenshots/recall-corpus.png)
 
-![Generated insights](/assets/generated/screenshots/recall-generated-insights.png)
+![Generated insights](/docs/assets/generated/screenshots/recall-generated-insights.png)
 
-Generated insights run through the selected agent CLI on your machine. The CLI
-receives content from sessions matching the visible scope, and the completed
-markdown is saved in the local SQLite archive. AgentsView does not manage the
-CLI's provider credentials; review that agent's privacy behavior before
-generating a report.
+Generated insights use the configured OpenAI-compatible endpoint when
+`[insights]` has both an `endpoint` and `model`; when `[insights]` is absent,
+they use the selected agent CLI on your machine. Partial endpoint configuration
+is rejected during configuration validation. Endpoint mode sends one
+non-streaming `POST /chat/completions` request with the generated prompt as a
+user message. It accepts the first choice's `assistant` message with string
+`message.content` and optional response `model`. It does not support streaming,
+`/responses`, legacy completions, tool calls, or content-part arrays. An
+endpoint failure returns an error and does not retry through a CLI.
+
+```toml
+[insights]
+endpoint = "http://127.0.0.1:11434/v1"
+model = "llama3.1"
+api_key_env = "OPENAI_API_KEY" # optional; the value is read at runtime
+# allow_http = true            # required for non-loopback HTTP endpoints
+```
+
+Loopback HTTP endpoints are allowed for local models. Remote endpoints must use
+HTTPS unless `allow_http = true` explicitly opts into plaintext transport. The
+endpoint receives transcript-derived content, so review the provider's privacy
+and retention behavior. API keys stay in the environment and are sent only as a
+bearer header; they are not stored in the AgentsView configuration. Canned
+insight cache keys include the effective backend, model, and a safe endpoint
+identity, so changing `[insights]` after restarting the server selects a
+separate cached report. Changes to credentials or transport opt-ins do not
+change that identity; use force refresh when those changes should regenerate a
+report under the same endpoint and model.
 
 ### Configuring agent binaries
 
@@ -122,8 +145,8 @@ one-time consent for that invocation.
 Vector and hybrid queries fail closed when the active Recall corpus is newer
 than its last completed vector build. Rebuild the Recall store, or continue
 using lexical mode while an automatic refresh catches up. See
-[Semantic Search](/semantic-search/#enabling-vector) for the shared embedding
-configuration and endpoint privacy considerations.
+[Semantic Search](/docs/semantic-search/#enabling-vector) for the shared
+embedding configuration and endpoint privacy considerations.
 
 ## Automatic extraction
 
@@ -162,7 +185,8 @@ Optional keys: `deployment` (labels which serving instance produced the corpus),
 `server` (selects among multiple named servers), `quiet_period` (default `"30m"`
 — how long a session must have been ended before extraction),
 `backstop_interval` (default `"1h"`), `failure_backoff` (default `"1h"`),
-`max_window_chars` (default 50000), `max_tokens`, per-server `api_key_env`, a
+`max_window_chars` (default 50000), `max_tokens`, `candidate_findings`
+(`"block"` default, or `"allow"` — see below), per-server `api_key_env`, a
 `[recall.extract.prompts]` table (`profile`, `dir`), and a
 `[recall.extract.request]` table (`temperature`, `extra_body`).
 
@@ -175,11 +199,22 @@ names, and even a same-origin allowance can be steered elsewhere by re-resolving
 the hostname. Configure the endpoint with its final URL.
 
 Sessions are only ever extracted when they are not automated, not trashed, and
-have a clean, current **full** secret scan — a session with secret findings of
-any confidence, one never scanned, or one covered only by the fast inline sync
-scan never reaches the model. Run `agentsview secrets scan --backfill` to make
-sessions eligible. These filters are not configurable. Session content is sent
-only to the endpoints you configure.
+have a clean, current **full** secret scan. By default, a session with secret
+findings of any confidence, one never scanned, or one covered only by the fast
+inline sync scan never reaches the model. Run
+`agentsview secrets scan --backfill` to make sessions eligible. Session content
+is sent only to the endpoints you configure.
+
+One knob narrows that boundary deliberately: `candidate_findings = "allow"`
+under `[recall.extract]`. Candidate-confidence findings — the false-positive-
+prone heuristics (`high-entropy-assignment`, JWT-shaped tokens, basic-auth URLs)
+that `secrets list` hides unless asked — then stay recorded for review but no
+longer exclude a session; only definite findings do, in discovery, in the
+pre-send transcript check, at commit, and in reconciliation. The default,
+`"block"`, keeps every recorded finding blocking. Consider `"allow"` when the
+endpoint is a machine you own and the archive is full of paths and identifiers
+that trip the entropy heuristic; keep the default for any endpoint you would not
+send a suspected secret to.
 
 Each distillation configuration (model, prompts, segmentation, request shape) is
 fingerprinted as a *generation*; changing the configuration builds a new corpus

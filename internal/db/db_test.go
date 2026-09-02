@@ -5,7 +5,8 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -677,6 +678,17 @@ func TestOpenCreatesFile(t *testing.T) {
 	require.NoError(t, err, "db file not created")
 }
 
+func TestOpenIsolatedStartsNoWALCheckpointLoop(t *testing.T) {
+	d, err := OpenIsolated(filepath.Join(t.TempDir(), "capture.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, d.Close()) })
+
+	d.checkpointMu.Lock()
+	stop := d.checkpointStop
+	d.checkpointMu.Unlock()
+	assert.Nil(t, stop)
+}
+
 func TestOpenDataVersionBump_PreservesData(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
@@ -1008,10 +1020,40 @@ func TestMigration_ToolResultEventsTable(t *testing.T) {
 		"expected tool_result_events table after reopen")
 }
 
-func TestCurrentDataVersionClaudeIDEEnvelopeSplit(t *testing.T) {
-	assert.Equal(t, 88, CurrentDataVersion(),
-		"version 88 splits Claude IDE envelopes off mixed prompts after "+
-			"the Codex fork replay boundary reparse")
+func TestCurrentDataVersionIncludesOpenCodeProjectMetadataChange(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 89,
+		"version 89 is the data-version boundary for file-backed OpenCode metadata changes")
+	t.Logf("CurrentDataVersion=%d", CurrentDataVersion())
+}
+
+func TestCurrentDataVersionGrokMessageTimestamps(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 90,
+		"version 90 is the data-version boundary for Grok message timestamps")
+}
+
+func TestCurrentDataVersionPositAssistantCacheAccounting(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 91,
+		"version 91 is the data-version boundary for Posit Assistant cache accounting")
+}
+
+func TestCurrentDataVersionPositAssistantUsageEventsSidecar(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 93,
+		"version 93 is the data-version boundary for Posit Assistant usage-events")
+}
+
+func TestCurrentDataVersionDevinMessageNodeTokenUsage(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 94,
+		"Devin message_nodes token usage requires re-parsing fallback sessions")
+}
+
+func TestCurrentDataVersionPositAssistantProviderIdentity(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 95,
+		"Posit Assistant provider identity requires re-parsing usage rows")
+}
+
+func TestCurrentDataVersionAntigravityCLICwdAndWorktreeProject(t *testing.T) {
+	assert.Equal(t, 96, CurrentDataVersion(),
+		"Antigravity CLI cwd and worktree project recovery require a sequential backfill")
 }
 
 func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {
@@ -4054,6 +4096,7 @@ func TestWriteSessionIncrementalToolCallResultUpdate(t *testing.T) {
 		NextOrdinal: 1,
 		ToolCallResultUpdates: []ToolCallResultUpdate{{
 			ToolUseID: "call_cmd",
+			Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
 			Events: []ToolResultEvent{{
 				ToolUseID:     "call_cmd",
 				Source:        "function_call_output",
@@ -4108,6 +4151,152 @@ func TestWriteSessionIncrementalToolCallResultUpdate(t *testing.T) {
 		"idempotent replay must not bump the transcript revision")
 }
 
+func TestWriteSessionIncrementalTargetsDuplicateCallIDOccurrence(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	for ordinal := range 2 {
+		insertMessages(t, d, Message{
+			SessionID:  "s1",
+			Ordinal:    ordinal,
+			Role:       "assistant",
+			HasToolUse: true,
+			ToolCalls: []ToolCall{{
+				SessionID: "s1",
+				ToolName:  "exec_command",
+				Category:  "Bash",
+				ToolUseID: "reused-call",
+			}},
+		})
+	}
+
+	write := func(position ToolCallPosition, content string) {
+		t.Helper()
+		_, err := d.WriteSessionIncremental("s1", nil, IncrementalSessionUpdate{
+			MsgCount:    2,
+			NextOrdinal: 2,
+			ToolCallResultUpdates: []ToolCallResultUpdate{{
+				ToolUseID: "reused-call",
+				Position:  position,
+				Events: []ToolResultEvent{{
+					ToolUseID:     "reused-call",
+					Source:        "function_call_output",
+					Content:       content,
+					ContentLength: len(content),
+				}},
+			}},
+		})
+		require.NoError(t, err)
+	}
+
+	write(ToolCallPosition{MessageOrdinal: 1, CallIndex: 0}, "second")
+
+	rows, err := d.Reader().Query(`
+		SELECT m.ordinal, COALESCE(tc.result_content, '')
+		FROM tool_calls tc JOIN messages m ON m.id = tc.message_id
+		WHERE tc.session_id = ? AND tc.tool_use_id = ?
+		ORDER BY m.ordinal, tc.call_index`, "s1", "reused-call")
+	require.NoError(t, err)
+	defer rows.Close()
+	got := make(map[int]string)
+	for rows.Next() {
+		var ordinal int
+		var content string
+		require.NoError(t, rows.Scan(&ordinal, &content))
+		got[ordinal] = content
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, map[int]string{0: "", 1: "second"}, got)
+
+	var eventCount int
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT COUNT(*) FROM tool_result_events
+		WHERE session_id = ? AND tool_call_message_ordinal = ?
+		  AND call_index = ?`, "s1", 1, 0).Scan(&eventCount))
+	assert.Equal(t, 1, eventCount)
+
+	write(ToolCallPosition{MessageOrdinal: 0, CallIndex: 0}, "first")
+	var stateOccurrences int
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT COUNT(DISTINCT printf('%d/%d', message_ordinal, call_index))
+		FROM tool_call_occurrence_agent_state
+		WHERE session_id = ?`, "s1").Scan(&stateOccurrences))
+	assert.Equal(t, 2, stateOccurrences,
+		"reused provider IDs must keep independent per-occurrence state")
+}
+
+func TestWriteSessionIncrementalLateResultAndCommittedUsageAreAtomic(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			ToolUseID: "call_cmd",
+		}},
+	})
+
+	update := IncrementalSessionUpdate{
+		MsgCount:    1,
+		NextOrdinal: 1,
+		ToolCallResultUpdates: []ToolCallResultUpdate{{
+			ToolUseID: "call_cmd",
+			Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
+			Events: []ToolResultEvent{{
+				ToolUseID:     "call_cmd",
+				Source:        "function_call_output",
+				Content:       "command finished",
+				ContentLength: len("command finished"),
+			}},
+		}},
+		MessageTokenUsageUpdates: []MessageTokenUsageUpdate{{
+			Ordinal:          0,
+			TokenUsage:       jsontext.Value(`{"input_tokens":100000,"output_tokens":250}`),
+			ContextTokens:    100000,
+			OutputTokens:     250,
+			HasContextTokens: true,
+			HasOutputTokens:  true,
+		}},
+	}
+	_, werr := d.WriteSessionIncremental("s1", nil, update)
+	require.NoError(t, werr)
+
+	var tokenUsage, result string
+	var contextTokens, outputTokens int
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT token_usage, context_tokens, output_tokens
+		FROM messages WHERE session_id = ? AND ordinal = ?`,
+		"s1", 0,
+	).Scan(&tokenUsage, &contextTokens, &outputTokens))
+	assert.JSONEq(t, `{"input_tokens":100000,"output_tokens":250}`, tokenUsage)
+	assert.Equal(t, 100000, contextTokens)
+	assert.Equal(t, 250, outputTokens)
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT COALESCE(result_content, '') FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "call_cmd",
+	).Scan(&result))
+	assert.Equal(t, "command finished", result)
+
+	sess, err := d.GetSession(context.Background(), "s1")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TranscriptRevision)
+	assert.Equal(t, "2", *sess.TranscriptRevision)
+
+	_, werr = d.WriteSessionIncremental("s1", nil, update)
+	require.NoError(t, werr, "identical late-result usage replay must be idempotent")
+	sess, err = d.GetSession(context.Background(), "s1")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TranscriptRevision)
+	assert.Equal(t, "2", *sess.TranscriptRevision)
+}
+
 func TestWriteSessionIncrementalResultEventIndexesAreMonotonic(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "s1", "proj")
@@ -4130,6 +4319,7 @@ func TestWriteSessionIncrementalResultEventIndexesAreMonotonic(t *testing.T) {
 			NextOrdinal: 1,
 			ToolCallResultUpdates: []ToolCallResultUpdate{{
 				ToolUseID: "call_cmd",
+				Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
 				Events: []ToolResultEvent{{
 					ToolUseID:     "call_cmd",
 					Source:        "function_call_output",
@@ -4152,9 +4342,10 @@ func TestWriteSessionIncrementalResultEventIndexesAreMonotonic(t *testing.T) {
 
 	var latestIndex int
 	require.NoError(t, d.Reader().QueryRow(`
-		SELECT latest_event_index FROM tool_call_agent_state
-		WHERE session_id = ? AND tool_use_id = ? AND agent_id = ''`,
-		"s1", "call_cmd",
+		SELECT latest_event_index FROM tool_call_occurrence_agent_state
+		WHERE session_id = ? AND message_ordinal = ? AND call_index = ?
+		  AND agent_id = ''`,
+		"s1", 0, 0,
 	).Scan(&latestIndex))
 	assert.Equal(t, 1, latestIndex,
 		"the agent state must point at the newest event")
@@ -4190,6 +4381,7 @@ func TestWriteSessionIncrementalBlockedResultKeepsLength(t *testing.T) {
 		BlockedResultCategories: map[string]bool{"Bash": true},
 		ToolCallResultUpdates: []ToolCallResultUpdate{{
 			ToolUseID: "call_cmd",
+			Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
 			Events: []ToolResultEvent{
 				{
 					AgentID:       "a",
@@ -4224,6 +4416,146 @@ func TestWriteSessionIncrementalBlockedResultKeepsLength(t *testing.T) {
 			"\"a:\\nx\\n\\nb:\\nyy\"")
 }
 
+// TestWriteSessionIncrementalBlockedResultKeepsRawLengthWithControlChars
+// pins the length invariant blocked categories keep on the full-parse and
+// staged paths: sanitizing (which strips control/NUL bytes) must never run
+// against content this path is about to blank, or the stored length would
+// come up short by however many bytes sanitize removed instead of
+// reflecting the original raw output size.
+func TestWriteSessionIncrementalBlockedResultKeepsRawLengthWithControlChars(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			ToolUseID: "call_cmd",
+		}},
+	})
+
+	const raw = "before\x00after\x1b[31mred\u0085done"
+	_, werr := d.WriteSessionIncremental("s1", nil, IncrementalSessionUpdate{
+		MsgCount:                1,
+		NextOrdinal:             1,
+		BlockedResultCategories: map[string]bool{"Bash": true},
+		ToolCallResultUpdates: []ToolCallResultUpdate{{
+			ToolUseID: "call_cmd",
+			Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
+			Events: []ToolResultEvent{{
+				ToolUseID:     "call_cmd",
+				Source:        "function_call_output",
+				Content:       raw,
+				ContentLength: len(raw),
+			}},
+		}},
+	})
+	require.NoError(t, werr)
+
+	var storedContent string
+	var storedLen int
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT COALESCE(result_content, ''), result_content_length
+		FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "call_cmd",
+	).Scan(&storedContent, &storedLen))
+	assert.Empty(t, storedContent, "blocked result content stays blank")
+	assert.Equal(t, len(raw), storedLen,
+		"blocked result length must be the original raw byte count, "+
+			"not the sanitized (control-stripped) count")
+
+	var eventLen int
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT content_length FROM tool_result_events
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "call_cmd",
+	).Scan(&eventLen))
+	assert.Equal(t, len(raw), eventLen,
+		"the stored event's content_length must also be the raw byte count")
+}
+
+// TestWriteSessionIncrementalBlockedResultsDedupByLengthAcrossBatches pins
+// the blocked-category equivalence rule for late results arriving in
+// separate incremental writes. Every stored blocked row has an empty
+// content column, so equivalence must be decided by original length: two
+// outputs of different length for the same agent and status are distinct
+// events (the full parse keeps both), while a replay of the same length is
+// the same event and must not be stored twice.
+func TestWriteSessionIncrementalBlockedResultsDedupByLengthAcrossBatches(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID: "s1",
+			ToolName:  "exec_command",
+			Category:  "Bash",
+			ToolUseID: "call_cmd",
+		}},
+	})
+	write := func(content string) {
+		t.Helper()
+		_, err := d.WriteSessionIncremental("s1", nil, IncrementalSessionUpdate{
+			MsgCount:                1,
+			NextOrdinal:             1,
+			BlockedResultCategories: map[string]bool{"Bash": true},
+			ToolCallResultUpdates: []ToolCallResultUpdate{{
+				ToolUseID: "call_cmd",
+				Position:  ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
+				Events: []ToolResultEvent{{
+					ToolUseID:     "call_cmd",
+					Source:        "function_call_output",
+					Content:       content,
+					ContentLength: len(content),
+				}},
+			}},
+		})
+		require.NoError(t, err)
+	}
+	countEvents := func() int {
+		t.Helper()
+		var n int
+		require.NoError(t, d.Reader().QueryRow(`
+			SELECT COUNT(*) FROM tool_result_events
+			WHERE session_id = ? AND tool_use_id = ?`,
+			"s1", "call_cmd",
+		).Scan(&n))
+		return n
+	}
+
+	write("x")
+	write("yy")
+	assert.Equal(t, 2, countEvents(),
+		"blocked events of different length are distinct and must both be stored")
+
+	write("zz")
+	assert.Equal(t, 2, countEvents(),
+		"a blocked replay of an already-stored length is the same event")
+
+	var lengths []int
+	rows, err := d.Reader().Query(`
+		SELECT content_length FROM tool_result_events
+		WHERE session_id = ? AND tool_use_id = ? ORDER BY event_index`,
+		"s1", "call_cmd")
+	require.NoError(t, err)
+	defer rows.Close()
+	for rows.Next() {
+		var n int
+		require.NoError(t, rows.Scan(&n))
+		lengths = append(lengths, n)
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, []int{1, 2}, lengths)
+}
+
 func TestBackfillToolCallAgentStateTracksFirstAndLatest(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "s1", "proj")
@@ -4255,16 +4587,17 @@ func TestBackfillToolCallAgentStateTracksFirstAndLatest(t *testing.T) {
 		require.NoError(t, err)
 	}
 	require.NoError(t, backfillToolCallAgentStateTx(
-		tx, "s1", "call_cmd", 0, 0,
+		tx, "s1", ToolCallPosition{MessageOrdinal: 0, CallIndex: 0},
 	))
 	require.NoError(t, tx.Commit())
 
 	var first, latest int
 	require.NoError(t, d.Reader().QueryRow(`
 		SELECT first_event_index, latest_event_index
-		FROM tool_call_agent_state
-		WHERE session_id = ? AND tool_use_id = ? AND agent_id = 'agent-a'`,
-		"s1", "call_cmd",
+		FROM tool_call_occurrence_agent_state
+		WHERE session_id = ? AND message_ordinal = ? AND call_index = ?
+		  AND agent_id = 'agent-a'`,
+		"s1", 0, 0,
 	).Scan(&first, &latest))
 	assert.Equal(t, 0, first)
 	assert.Equal(t, 2, latest,
@@ -4313,9 +4646,9 @@ func TestReplaceSessionContentDiffClearsStaleAgentState(t *testing.T) {
 
 	var before int
 	require.NoError(t, d.Reader().QueryRow(
-		`SELECT COUNT(*) FROM tool_call_agent_state
-		 WHERE session_id = ? AND tool_use_id = ?`,
-		"s1", "call_1",
+		`SELECT COUNT(*) FROM tool_call_occurrence_agent_state
+		 WHERE session_id = ? AND message_ordinal = ? AND call_index = ?`,
+		"s1", 0, 0,
 	).Scan(&before))
 	require.Equal(t, 2, before)
 
@@ -4331,9 +4664,9 @@ func TestReplaceSessionContentDiffClearsStaleAgentState(t *testing.T) {
 	))
 
 	rows, err := d.Reader().Query(
-		`SELECT agent_id FROM tool_call_agent_state
-		 WHERE session_id = ? AND tool_use_id = ?`,
-		"s1", "call_1",
+		`SELECT agent_id FROM tool_call_occurrence_agent_state
+		 WHERE session_id = ? AND message_ordinal = ? AND call_index = ?`,
+		"s1", 0, 0,
 	)
 	require.NoError(t, err)
 	agents := make(map[string]bool)
@@ -5541,6 +5874,7 @@ func TestCopyOrphanedDataFromReconcilesTranscriptRevisions(t *testing.T) {
 	ids := []string{
 		"unchanged", "changed", "tool-changed",
 		"compact-changed", "subtype-changed",
+		"usage-changed", "claude-identity-changed", "source-identity-changed",
 	}
 	for _, id := range ids {
 		insertSession(t, srcDB, id, "proj")
@@ -5551,11 +5885,23 @@ func TestCopyOrphanedDataFromReconcilesTranscriptRevisions(t *testing.T) {
 		asstMsg("tool-changed", 0, "tool"),
 		userMsg("compact-changed", 0, "boundary"),
 		userMsg("subtype-changed", 0, "system event"),
+		asstMsg("usage-changed", 0, "same response"),
+		asstMsg("claude-identity-changed", 0, "same response"),
+		asstMsg("source-identity-changed", 0, "same response"),
 	)
 	_, err := srcDB.getWriter().Exec(`
 		UPDATE messages SET is_system = 1
 		WHERE session_id = 'subtype-changed'`)
 	requireNoError(t, err, "mark source system message")
+	_, err = srcDB.getWriter().Exec(`
+		UPDATE messages SET token_usage = '{"input_tokens":10}'
+		WHERE session_id = 'usage-changed';
+		UPDATE messages
+		SET claude_message_id = 'msg-old', claude_request_id = 'req-old'
+		WHERE session_id = 'claude-identity-changed';
+		UPDATE messages SET source_uuid = 'source-old'
+		WHERE session_id = 'source-identity-changed'`)
+	requireNoError(t, err, "seed source usage identities")
 	_, err = srcDB.getWriter().Exec(`
 		INSERT INTO tool_calls
 			(message_id, session_id, tool_name, category, input_json, call_index)
@@ -5580,6 +5926,9 @@ func TestCopyOrphanedDataFromReconcilesTranscriptRevisions(t *testing.T) {
 		asstMsg("tool-changed", 0, "tool"),
 		userMsg("compact-changed", 0, "boundary"),
 		userMsg("subtype-changed", 0, "system event"),
+		asstMsg("usage-changed", 0, "same response"),
+		asstMsg("claude-identity-changed", 0, "same response"),
+		asstMsg("source-identity-changed", 0, "same response"),
 	)
 	_, err = dstDB.getWriter().Exec(`
 		UPDATE messages
@@ -5587,7 +5936,14 @@ func TestCopyOrphanedDataFromReconcilesTranscriptRevisions(t *testing.T) {
 		WHERE session_id = 'compact-changed';
 		UPDATE messages
 		SET is_system = 1, source_subtype = 'resume'
-		WHERE session_id = 'subtype-changed'`)
+		WHERE session_id = 'subtype-changed';
+		UPDATE messages SET token_usage = '{"input_tokens":20}'
+		WHERE session_id = 'usage-changed';
+		UPDATE messages
+		SET claude_message_id = 'msg-new', claude_request_id = 'req-new'
+		WHERE session_id = 'claude-identity-changed';
+		UPDATE messages SET source_uuid = 'source-new'
+		WHERE session_id = 'source-identity-changed'`)
 	requireNoError(t, err, "change destination display fields")
 	_, err = dstDB.getWriter().Exec(`
 		INSERT INTO tool_calls
@@ -5620,7 +5976,10 @@ func TestCopyOrphanedDataFromReconcilesTranscriptRevisions(t *testing.T) {
 	require.NotNil(t, toolChanged.TranscriptRevision)
 	assert.Equal(t, "8", *toolChanged.TranscriptRevision)
 
-	for _, id := range []string{"compact-changed", "subtype-changed"} {
+	for _, id := range []string{
+		"compact-changed", "subtype-changed", "usage-changed",
+		"claude-identity-changed", "source-identity-changed",
+	} {
 		session, err := dstDB.GetSession(context.Background(), id)
 		requireNoError(t, err, "GetSession "+id)
 		require.NotNil(t, session)
@@ -5692,7 +6051,7 @@ func TestCopyOrphanedDataFrom_PreservesCopiedDetails(t *testing.T) {
 	})
 	tokenMsg := asstMsg("token", 0, "response")
 	tokenMsg.Model = "claude-opus-4-20250514"
-	tokenMsg.TokenUsage = json.RawMessage(`{"output_tokens":500}`)
+	tokenMsg.TokenUsage = jsontext.Value(`{"output_tokens":500}`)
 	tokenMsg.ContextTokens = 80000
 	tokenMsg.OutputTokens = 500
 	tokenMsg.HasContextTokens = true
@@ -6364,6 +6723,48 @@ func TestCopyExcludedSessionsFrom(t *testing.T) {
 	})
 	assert.ErrorIs(t, err, ErrSessionExcluded,
 		"UpsertSession = %v, want ErrSessionExcluded", err)
+}
+
+// TestCopyOrphanedDataFromClearsCopiedSelfParent covers an archive rebuild
+// whose source predates the self-edge guard: the fresh archive has already
+// run its one-time self-parent repair, so the copy itself must clear the
+// self-parented rows it brings over.
+func TestCopyOrphanedDataFromClearsCopiedSelfParent(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "src.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	insertSession(t, srcDB, "child", "p")
+	insertMessages(t, srcDB, spawnEdgeTo("child", "child", "legacy self spawn"))
+	insertSession(t, srcDB, "path-derived", "p", func(s *Session) {
+		s.ParentSessionID = Ptr("main")
+		s.RelationshipType = "subagent"
+	})
+	insertSession(t, srcDB, "kept", "p", func(s *Session) {
+		s.ParentSessionID = Ptr("real")
+		s.RelationshipType = "subagent"
+	})
+	forceSelfParent(t, srcDB, "child")
+	forceSelfParent(t, srcDB, "path-derived")
+	require.NoError(t, srcDB.Close(), "Close src")
+
+	dstDB := testDBAtPath(t, filepath.Join(dir, "dst.db"), "dst")
+	defer dstDB.Close()
+	require.NoError(t, dstDB.LinkSubagentSessions(),
+		"fresh archive linking pass runs before orphans are copied")
+	copied, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	require.NoError(t, err, "CopyOrphanedDataFrom")
+	assert.Equal(t, 3, copied)
+	require.NoError(t, dstDB.LinkSubagentSessions(), "post-copy relink")
+
+	child, err := dstDB.GetSession(context.Background(), "child")
+	requireNoError(t, err, "GetSession child")
+	assert.Nil(t, child.ParentSessionID,
+		"copied self-parent must be cleared even after the one-time repair ran")
+	assert.Equal(t, "subagent", child.RelationshipType)
+	assert.Equal(t, "main", parentOfSession(t, dstDB, "path-derived"),
+		"copied self-parent must fall back to the parser parent")
+	assert.Equal(t, "real", parentOfSession(t, dstDB, "kept"),
+		"copied real parents must survive")
 }
 
 func TestCopySyncStateFrom_NoSourceTable(t *testing.T) {
@@ -7183,7 +7584,7 @@ func TestSoftDeleteSessions(t *testing.T) {
 	assert.Equal(t, 0, n, "empty: rows=")
 }
 
-func TestSoftDeleteConvertsSourceMissingTombstonesToUserTrash(t *testing.T) {
+func TestSoftDeleteKeepsSourceMissingStateIndependent(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
 	paths := map[string]string{
@@ -7196,7 +7597,7 @@ func TestSoftDeleteConvertsSourceMissingTombstonesToUserTrash(t *testing.T) {
 			s.FilePath = &path
 		})
 		baselineSessionSource(t, d, defaultMachine, "claude", path)
-		changed, err := d.SoftDeleteSessionSourceOwnership(
+		changed, err := d.MarkSessionSourceMissing(
 			ctx, defaultMachine, "claude", id, path,
 		)
 		require.NoError(t, err)
@@ -7212,8 +7613,8 @@ func TestSoftDeleteConvertsSourceMissingTombstonesToUserTrash(t *testing.T) {
 		full, err := d.GetSessionFull(ctx, id)
 		require.NoError(t, err)
 		require.NotNil(t, full)
-		assert.Nil(t, full.DeletionCause,
-			"an explicit user deletion must replace the recoverable source tombstone")
+		assert.NotNil(t, full.SourceMissingAt)
+		assert.Nil(t, full.DeletionCause)
 		assert.True(t, d.IsSessionTrashed(id))
 	}
 }
@@ -8695,7 +9096,7 @@ func TestSessionsTerminationStatusIndex(t *testing.T) {
 		count)
 }
 
-func TestMessagesUsageCoveringIndex(t *testing.T) {
+func TestMessagesUsageIndexes(t *testing.T) {
 	d := testDB(t)
 
 	var count int
@@ -8705,17 +9106,17 @@ func TestMessagesUsageCoveringIndex(t *testing.T) {
 	).Scan(&count)
 	requireNoError(t, err, "probing idx_messages_usage_covering")
 
-	require.Equal(t, 1, count,
-		"expected idx_messages_usage_covering to exist, got count=%d",
+	require.Equal(t, 0, count,
+		"expected superseded idx_messages_usage_covering to be absent, got count=%d",
 		count)
 
 	err = d.getReader().QueryRow(
 		`SELECT count(*) FROM sqlite_master
 		 WHERE type = 'index' AND name = 'idx_messages_usage_timestamp'`,
 	).Scan(&count)
-	requireNoError(t, err, "probing legacy idx_messages_usage_timestamp")
-	require.Equal(t, 0, count,
-		"expected idx_messages_usage_timestamp to be dropped")
+	requireNoError(t, err, "probing idx_messages_usage_timestamp")
+	require.Equal(t, 1, count,
+		"expected idx_messages_usage_timestamp to exist")
 }
 
 // TestMigration_TerminationStatusColumn simulates upgrading from a

@@ -1,34 +1,36 @@
 package parser
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"sort"
 
 	"github.com/tidwall/gjson"
 )
 
-// codexCollectingSink is the in-memory codexSessionSink implementation
+// CodexCollectingSink is the in-memory CodexSessionSink implementation
 // that reproduces the pre-streaming decoder behavior byte for byte: all
 // messages stay in a slice, call ids index into it, and deferred updates
 // accumulate in memory. It exists so the slice-based parser remains
 // available to tests and other providers while the streaming sink lands.
-type codexCollectingSink struct {
+type CodexCollectingSink struct {
 	messages             []ParsedMessage
 	callRefs             map[string]codexToolCallRef
+	callRefsByPosition   map[ParsedToolCallPosition]codexToolCallRef
 	toolCallUpdates      []ParsedToolCallUpdate
 	orphanNotificationIx map[string]int
 	nextOrdinal          int
 }
 
-func newCodexCollectingSink(startOrdinal int) *codexCollectingSink {
-	return &codexCollectingSink{
+func NewCodexCollectingSink(startOrdinal int) *CodexCollectingSink {
+	return &CodexCollectingSink{
 		callRefs:             make(map[string]codexToolCallRef),
+		callRefsByPosition:   make(map[ParsedToolCallPosition]codexToolCallRef),
 		orphanNotificationIx: make(map[string]int),
 		nextOrdinal:          startOrdinal,
 	}
 }
 
-func (s *codexCollectingSink) AppendMessage(m ParsedMessage) {
+func (s *CodexCollectingSink) AppendMessage(m ParsedMessage) int {
 	m.Ordinal = s.nextOrdinal
 	s.nextOrdinal++
 	s.messages = append(s.messages, m)
@@ -37,20 +39,26 @@ func (s *codexCollectingSink) AppendMessage(m ParsedMessage) {
 		if callID == "" {
 			continue
 		}
-		s.callRefs[callID] = codexToolCallRef{
+		ref := codexToolCallRef{
 			messageIndex: len(s.messages) - 1,
 			callIndex:    callIdx,
 		}
+		s.callRefs[callID] = ref
+		s.callRefsByPosition[ParsedToolCallPosition{
+			MessageOrdinal: m.Ordinal,
+			CallIndex:      callIdx,
+		}] = ref
 	}
+	return m.Ordinal
 }
 
-func (s *codexCollectingSink) ReserveOrdinal() int {
+func (s *CodexCollectingSink) ReserveOrdinal() int {
 	ord := s.nextOrdinal
 	s.nextOrdinal++
 	return ord
 }
 
-func (s *codexCollectingSink) InsertMessage(m ParsedMessage) int {
+func (s *CodexCollectingSink) InsertMessage(m ParsedMessage) int {
 	idx := len(s.messages)
 	for i, existing := range s.messages {
 		if existing.Ordinal > m.Ordinal ||
@@ -71,22 +79,28 @@ func (s *codexCollectingSink) InsertMessage(m ParsedMessage) int {
 			s.callRefs[callID] = ref
 		}
 	}
+	for position, ref := range s.callRefsByPosition {
+		if ref.messageIndex >= idx {
+			ref.messageIndex++
+			s.callRefsByPosition[position] = ref
+		}
+	}
 	return idx
 }
 
-func (s *codexCollectingSink) AppendToolResultEvent(
-	callID string, ev ParsedToolResultEvent,
+func (s *CodexCollectingSink) AppendToolResultEvent(
+	callID string, target *ParsedToolCallPosition, ev ParsedToolResultEvent,
 ) {
 	if callID == "" {
 		return
 	}
-	ref, ok := s.callRefs[callID]
-	if !ok ||
-		ref.messageIndex < 0 || ref.messageIndex >= len(s.messages) {
-		s.appendToolCallUpdate(callID, ev)
+	ref, ok := s.callRef(callID, target)
+	if !ok {
+		s.appendToolCallUpdate(callID, target, ev)
 		return
 	}
-	if ref.callIndex < 0 ||
+	if ref.messageIndex < 0 || ref.messageIndex >= len(s.messages) ||
+		ref.callIndex < 0 ||
 		ref.callIndex >= len(s.messages[ref.messageIndex].ToolCalls) {
 		return
 	}
@@ -103,15 +117,34 @@ func (s *codexCollectingSink) AppendToolResultEvent(
 	tc.ResultEvents = append(tc.ResultEvents, ev)
 }
 
-func (s *codexCollectingSink) appendToolCallUpdate(
-	callID string, ev ParsedToolResultEvent,
+func (s *CodexCollectingSink) callRef(
+	callID string, target *ParsedToolCallPosition,
+) (codexToolCallRef, bool) {
+	if target == nil {
+		ref, ok := s.callRefs[callID]
+		return ref, ok
+	}
+	ref, ok := s.callRefsByPosition[*target]
+	if !ok || ref.messageIndex < 0 || ref.messageIndex >= len(s.messages) ||
+		ref.callIndex < 0 || ref.callIndex >= len(s.messages[ref.messageIndex].ToolCalls) {
+		return codexToolCallRef{}, false
+	}
+	if s.messages[ref.messageIndex].ToolCalls[ref.callIndex].ToolUseID != callID {
+		return codexToolCallRef{}, false
+	}
+	return ref, true
+}
+
+func (s *CodexCollectingSink) appendToolCallUpdate(
+	callID string, target *ParsedToolCallPosition, ev ParsedToolResultEvent,
 ) {
 	if ev.ToolUseID == "" {
 		ev.ToolUseID = callID
 	}
 	for i := range s.toolCallUpdates {
 		update := &s.toolCallUpdates[i]
-		if update.ToolUseID != callID {
+		if update.ToolUseID != callID ||
+			!sameParsedToolCallTarget(update, target) {
 			continue
 		}
 		if hasEquivalentCallResultEvent(update.ResultEvents, ev) {
@@ -120,24 +153,38 @@ func (s *codexCollectingSink) appendToolCallUpdate(
 		update.ResultEvents = append(update.ResultEvents, ev)
 		return
 	}
-	s.toolCallUpdates = append(s.toolCallUpdates, ParsedToolCallUpdate{
+	update := ParsedToolCallUpdate{
 		ToolUseID:    callID,
 		ResultEvents: []ParsedToolResultEvent{ev},
-	})
+	}
+	if target != nil {
+		update.MessageOrdinal = target.MessageOrdinal
+		update.CallIndex = target.CallIndex
+		update.TargetKnown = true
+	}
+	s.toolCallUpdates = append(s.toolCallUpdates, update)
 }
 
-func (s *codexCollectingSink) SetCallSubagentSessionID(
-	callID, sessionID string,
+func sameParsedToolCallTarget(
+	update *ParsedToolCallUpdate, target *ParsedToolCallPosition,
+) bool {
+	if target == nil {
+		return !update.TargetKnown
+	}
+	return update.TargetKnown &&
+		update.MessageOrdinal == target.MessageOrdinal &&
+		update.CallIndex == target.CallIndex
+}
+
+func (s *CodexCollectingSink) SetCallSubagentSessionID(
+	callID string, target *ParsedToolCallPosition, sessionID string,
 ) {
 	if callID == "" || sessionID == "" {
 		return
 	}
-	ref, ok := s.callRefs[callID]
-	if !ok ||
-		ref.messageIndex < 0 || ref.messageIndex >= len(s.messages) {
-		return
-	}
-	if ref.callIndex < 0 ||
+	ref, ok := s.callRef(callID, target)
+	if !ok || ref.messageIndex < 0 || ref.messageIndex >= len(s.messages) ||
+		ref.callIndex < 0 ||
 		ref.callIndex >= len(s.messages[ref.messageIndex].ToolCalls) {
 		return
 	}
@@ -148,7 +195,7 @@ func (s *codexCollectingSink) SetCallSubagentSessionID(
 // ApplyTokenUsageToLastAssistant applies normalized token usage to the
 // last assistant message without usage, scanning back to the current
 // turn's user boundary. Returns false when no target exists.
-func (s *codexCollectingSink) ApplyTokenUsageToLastAssistant(
+func (s *CodexCollectingSink) ApplyTokenUsageToLastAssistant(
 	raw string,
 ) bool {
 	for i := len(s.messages) - 1; i >= 0; i-- {
@@ -164,7 +211,7 @@ func (s *codexCollectingSink) ApplyTokenUsageToLastAssistant(
 	return false
 }
 
-func (s *codexCollectingSink) InsertOrphanMessage(
+func (s *CodexCollectingSink) InsertOrphanMessage(
 	key string, m ParsedMessage,
 ) bool {
 	if _, ok := s.orphanNotificationIx[key]; ok {
@@ -174,7 +221,7 @@ func (s *codexCollectingSink) InsertOrphanMessage(
 	return true
 }
 
-func (s *codexCollectingSink) Finalize() {
+func (s *CodexCollectingSink) Finalize() {
 	sort.SliceStable(s.messages, func(i, j int) bool {
 		if s.messages[i].Ordinal == s.messages[j].Ordinal {
 			return i < j
@@ -186,11 +233,11 @@ func (s *codexCollectingSink) Finalize() {
 	}
 }
 
-func (s *codexCollectingSink) Messages() []ParsedMessage {
+func (s *CodexCollectingSink) Messages() []ParsedMessage {
 	return s.messages
 }
 
-func (s *codexCollectingSink) ToolCallUpdates() []ParsedToolCallUpdate {
+func (s *CodexCollectingSink) ToolCallUpdates() []ParsedToolCallUpdate {
 	return s.toolCallUpdates
 }
 
@@ -233,7 +280,7 @@ func applyCodexTokenUsage(msg *ParsedMessage, raw string) {
 		"output_tokens":           output,
 		"cache_read_input_tokens": cached,
 	}
-	j, err := json.Marshal(normalized)
+	j, err := json.Marshal(normalized, json.Deterministic(true))
 	if err != nil {
 		return
 	}

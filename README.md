@@ -9,11 +9,15 @@ accounts, everything local.
 
 ## Install
 
-```bash
-# macOS / Linux
-curl -fsSL https://agentsview.io/install.sh | bash
+**macOS and Linux:**
 
-# Windows
+```bash
+curl -fsSL https://agentsview.io/install.sh | bash
+```
+
+**Windows (PowerShell):**
+
+```powershell
 powershell -ExecutionPolicy ByPass -c "irm https://agentsview.io/install.ps1 | iex"
 ```
 
@@ -183,11 +187,9 @@ reverse proxy.
 
 ## Token Usage and Cost Tracking
 
-`agentsview usage` is a fast, local replacement for ccusage and similar tools.
-It tracks token consumption and compute costs across **all** your coding agents
--- not just Claude Code. Because session data is already indexed in SQLite,
-queries are over 100x faster than tools that re-parse raw session files on every
-run.
+`agentsview usage` tracks token consumption and compute costs across **all**
+your coding agents -- not just Claude Code. Reports read from the same local
+SQLite archive that powers the UI.
 
 ```bash
 # Daily cost summary (default: last 30 days)
@@ -206,7 +208,7 @@ agentsview usage statusline
 
 Features:
 
-- Automatic pricing via LiteLLM rates (with offline fallback)
+- Automatic pricing via LiteLLM and OpenRouter rates (with offline fallback)
 - Authoritative Copilot CLI billing totals when session logs provide them
 - Prompt-caching-aware cost calculation (cache creation / read tokens)
 - Per-model breakdown with `--breakdown`
@@ -249,6 +251,12 @@ return `404`.
 
 The deprecated alias `agentsview token-use <id>` remains available for
 compatibility and now also reports cost estimates.
+
+For one exact non-interactive `claude -p` or `codex exec --json` execution in
+CI, use `agentsview capture run`. It preserves the child streams and exit
+outcome, writes a separate versioned usage result, and starts no daemon, web
+server, or watcher. See
+[One-shot CI capture](https://agentsview.io/one-shot-capture/).
 
 ## Session Stats
 
@@ -334,6 +342,7 @@ thread JSON files.
 | Cortex Code           | `~/.snowflake/cortex/conversations/`                                                                                                                                                                                                                 |
 | Cursor                | `~/.cursor/projects/`                                                                                                                                                                                                                                |
 | DeepSeek TUI          | `~/.codewhale/sessions/`, `~/.deepseek/sessions/`                                                                                                                                                                                                    |
+| DeepSeek Harness      | `~/.dsh/sessions/` (or `$DSH_HOME/sessions/`)                                                                                                                                                                                                        |
 | Forge                 | `~/.forge/`                                                                                                                                                                                                                                          |
 | Gemini CLI            | `~/.gemini/`                                                                                                                                                                                                                                         |
 | Goose                 | `~/.local/share/goose/sessions/` (macOS and Linux), `%APPDATA%\\Block\\goose\\data\\sessions\\` (Windows)                                                                                                                                            |
@@ -676,7 +685,7 @@ ______________________________________________________________________
 
 ## Development
 
-Requires Go 1.26+ (CGO), Node.js 22+.
+Requires Go 1.27+ (CGO), Node.js 22+.
 
 ```bash
 make dev            # Go server (dev mode)

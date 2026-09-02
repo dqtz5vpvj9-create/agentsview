@@ -20,6 +20,7 @@ package signals
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 )
 
@@ -27,8 +28,8 @@ const (
 	// IncrementalStateCodecVersion is the wire version for IncrementalState.
 	// Bump when the struct or any detector semantics change; a mismatch
 	// makes the caller fall back to a full recompute.
-	// The codec has had a single released shape.
-	IncrementalStateCodecVersion = 1
+	// v3 added LastValidTokensOrdinal.
+	IncrementalStateCodecVersion = 3
 
 	// TrailingFactCount is the size of the trailing facts window. It must
 	// cover every window any delta can affect: a modified call in the last
@@ -103,7 +104,7 @@ type IncrementalState struct {
 	EditLast map[string]EditChurnState `json:"edit_last,omitempty"`
 
 	// Runaway loop: RunawayHistorical latches hasRunawayToolWindow over
-	// every 12-window that has fully left the trailing facts window.
+	// every 12-window that has fully left the mutable late-result region.
 	RunawayHistorical bool `json:"runaway_historical"`
 
 	// Exact failing run crossing into the trailing window. ExactRunSig is
@@ -115,12 +116,19 @@ type IncrementalState struct {
 	ExactHistorical  bool   `json:"exact_historical"`
 
 	// Message-derived aggregates not stored on the sessions row.
-	LastRole        string         `json:"last_role,omitempty"`
-	LastContent     string         `json:"last_content,omitempty"`
-	MsgIndex        int            `json:"msg_index"`
-	LastValidTokens int            `json:"last_valid_tokens"`
-	ModelCounts     map[string]int `json:"model_counts,omitempty"`
-	ModelFirstSeen  map[string]int `json:"model_first_seen,omitempty"`
+	LastRole    string `json:"last_role,omitempty"`
+	LastContent string `json:"last_content,omitempty"`
+	MsgIndex    int    `json:"msg_index"`
+	// LastValidTokens is the most recent assistant context-token
+	// measurement folded so far; LastValidTokensOrdinal is the ordinal of
+	// the message it was measured from (meaningless when LastValidTokens
+	// is 0). A late usage update targeting an ordinal at or before this one
+	// arrived chronologically out of order -- a later assistant already
+	// contributed a newer measurement -- and must not be folded forward.
+	LastValidTokens        int            `json:"last_valid_tokens"`
+	LastValidTokensOrdinal int            `json:"last_valid_tokens_ordinal"`
+	ModelCounts            map[string]int `json:"model_counts,omitempty"`
+	ModelFirstSeen         map[string]int `json:"model_first_seen,omitempty"`
 
 	// TotalCalls counts calls folded so far; used for window arithmetic.
 	TotalCalls int `json:"total_calls"`
@@ -167,26 +175,31 @@ type ToolHealthResult struct {
 // order extractToolCallRows produces. boundaries must be ascending
 // compact-boundary ordinals. modelCounts/modelFirstSeen/msgIndex mirror
 // extractMostCommonModel's inputs; lastValidTokens is the last assistant
-// context-token measurement (0 when none).
+// context-token measurement (0 when none) and lastValidTokensOrdinal is
+// the ordinal of the message it came from (meaningless when
+// lastValidTokens is 0).
 func SeedIncrementalState(
 	calls []ToolCallRow,
 	boundaries []int,
 	lastRole, lastContent string,
 	modelCounts, modelFirstSeen map[string]int,
 	msgIndex int,
-	lastValidTokens int,
+	lastValidTokens, lastValidTokensOrdinal int,
 ) IncrementalState {
+	modelCounts = writableIntMap(modelCounts)
+	modelFirstSeen = writableIntMap(modelFirstSeen)
 	s := IncrementalState{
-		CodecVersion:          IncrementalStateCodecVersion,
-		EditLast:              map[string]EditChurnState{},
-		LastRole:              lastRole,
-		LastContent:           lastContent,
-		LastValidTokens:       lastValidTokens,
-		MsgIndex:              msgIndex,
-		ModelCounts:           modelCounts,
-		ModelFirstSeen:        modelFirstSeen,
-		TotalCalls:            len(calls),
-		HasExplicitBoundaries: len(boundaries) > 0,
+		CodecVersion:           IncrementalStateCodecVersion,
+		EditLast:               map[string]EditChurnState{},
+		LastRole:               lastRole,
+		LastContent:            lastContent,
+		LastValidTokens:        lastValidTokens,
+		LastValidTokensOrdinal: lastValidTokensOrdinal,
+		MsgIndex:               msgIndex,
+		ModelCounts:            modelCounts,
+		ModelFirstSeen:         modelFirstSeen,
+		TotalCalls:             len(calls),
+		HasExplicitBoundaries:  len(boundaries) > 0,
 	}
 	cut := max(0, len(calls)-TrailingFactCount)
 	s.Trailing = factsFor(calls[cut:])
@@ -263,8 +276,12 @@ func SeedIncrementalState(
 	s.ExactRunLen = crossing.len
 	s.ExactRunFailures = crossing.failures
 
-	// Runaway window detector: latch every 12-window fully before the cut.
-	for i := 0; i+12 <= cut; i++ {
+	// Runaway window detector: latch every qualifying 12-call window that
+	// can no longer be changed by a late result. Only the final
+	// ModifiedWindowSize calls remain mutable, which can be substantially
+	// smaller than the retained facts window.
+	immutableEnd := max(0, len(calls)-ModifiedWindowSize)
+	for i := 0; i+12 <= immutableEnd; i++ {
 		if windowFactsQualify(factsFor(calls[i : i+12])) {
 			s.RunawayHistorical = true
 		}
@@ -293,6 +310,14 @@ func SeedIncrementalState(
 		})
 	}
 	return s
+}
+
+func writableIntMap(in map[string]int) map[string]int {
+	out := maps.Clone(in)
+	if out == nil {
+		out = make(map[string]int)
+	}
+	return out
 }
 
 func factsFor(calls []ToolCallRow) []ToolFact {
@@ -390,6 +415,9 @@ func (s *IncrementalState) FoldToolHealth(
 
 	// Full tail facts: old window + appended, then overlay modifications.
 	fullTail := mergeFacts(s.Trailing, factsFor(appended))
+	if fullTail == nil {
+		fullTail = []ToolFact{}
+	}
 	for pos, newFact := range modified {
 		idx := slices.IndexFunc(fullTail, func(f ToolFact) bool {
 			return f.CallPos == pos
@@ -404,12 +432,8 @@ func (s *IncrementalState) FoldToolHealth(
 	// fullTail[0] sits at absolute position oldCut, so the window offset
 	// is the difference between the two cuts.
 	newCut := newCutAbs - oldCut
-	if newCut < 0 {
-		newCut = 0
-	}
-	if newCut > len(fullTail) {
-		newCut = len(fullTail)
-	}
+	newCut = max(newCut, 0)
+	newCut = min(newCut, len(fullTail))
 	next.Trailing = append([]ToolFact(nil), fullTail[newCut:]...)
 
 	// Failure count: flips plus appended failures.
@@ -487,9 +511,9 @@ func (s *IncrementalState) FoldToolHealth(
 
 	// Edit churn: only appends add edit calls; a file counts once.
 	out.EditChurnCount = row.EditChurnCount
-	editLast := make(map[string]EditChurnState, len(s.EditLast))
-	for path, st := range s.EditLast {
-		editLast[path] = st
+	editLast := maps.Clone(s.EditLast)
+	if editLast == nil {
+		editLast = make(map[string]EditChurnState)
 	}
 	for _, c := range appended {
 		if c.Category != "Edit" && c.Category != "Write" {
@@ -541,17 +565,16 @@ func (s *IncrementalState) FoldToolHealth(
 	}
 	next.PendingBoundaries = kept
 
-	// Runaway loop: latch only windows that have fully exited the trailing
-	// facts window — their facts can no longer be changed by a late result.
-	// Windows still intersecting the trailing window are mutable and only
-	// contribute to the current output, so a later delta that heals them
-	// clears the signal exactly as an authoritative recompute would.
+	// Runaway loop: latch windows once every call in the 12-call window is
+	// older than the mutable late-result region. The retained facts window is
+	// intentionally wider than that region, so boundary-crossing qualifying
+	// windows must be preserved even while some of their facts remain retained.
 	runaway := s.RunawayHistorical
 	currentRunaway := false
 	windowStart := max(0, s.TotalCalls-TrailingFactCount)
 	for i := windowStart; i+12 <= next.TotalCalls; i++ {
 		if windowAt(fullTail, windowStart, i) {
-			if i+12 <= next.TotalCalls-TrailingFactCount {
+			if i+12 <= next.TotalCalls-ModifiedWindowSize {
 				runaway = true
 			} else {
 				currentRunaway = true
@@ -843,6 +866,18 @@ func (s *IncrementalState) UnmarshalBinary(data []byte) error {
 			"incremental signal state codec %d != %d",
 			s.CodecVersion, IncrementalStateCodecVersion,
 		)
+	}
+	// Empty mutable maps are omitted by the JSON codec. Normalize decoded
+	// state before any fold mutates it so the first edit or model append cannot
+	// panic on assignment to a nil map.
+	if s.EditLast == nil {
+		s.EditLast = make(map[string]EditChurnState)
+	}
+	if s.ModelCounts == nil {
+		s.ModelCounts = make(map[string]int)
+	}
+	if s.ModelFirstSeen == nil {
+		s.ModelFirstSeen = make(map[string]int)
 	}
 	return nil
 }

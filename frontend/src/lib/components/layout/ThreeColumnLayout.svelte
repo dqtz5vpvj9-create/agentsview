@@ -1,12 +1,20 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
+  import {
+    SplitResizeHandle,
+    type SplitResizeEvent,
+  } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
   import {
     SIDEBAR_DESKTOP_BREAKPOINT,
     SIDEBAR_WIDTH_DEFAULT,
     SIDEBAR_WIDTH_MIN,
     SIDEBAR_WIDTH_STORAGE_MAX,
+    VITALS_WIDTH_DEFAULT,
+    VITALS_WIDTH_MIN,
+    VITALS_WIDTH_STORAGE_MAX,
     clampSidebarWidthForLayout,
+    clampVitalsWidthForLayout,
     isDesktopSidebarLayout,
   } from "./sidebar-width.js";
   import { ui } from "../../stores/ui.svelte.js";
@@ -32,25 +40,20 @@
     vitals?: Snippet;
   }
 
-  const RESIZE_HANDLE_WIDTH = 12;
+  // Rendered width of kit-ui's .kit-split-resize-handle.
+  const RESIZE_HANDLE_WIDTH = 4;
   const SIDEBAR_BORDER_WIDTH = 1;
 
   let { sidebar, content, vitals }: Props = $props();
   let layoutElement = $state<HTMLElement | null>(null);
-  let resizeHandleElement = $state<HTMLElement | null>(null);
   let layoutWidth = $state<number | null>(null);
   let viewportWidth = $state(
     typeof window === "undefined"
       ? SIDEBAR_DESKTOP_BREAKPOINT
       : window.innerWidth,
   );
-  let isResizing = $state(false);
-  let dragState = $state<{
-    startX: number;
-    startWidth: number;
-  } | null>(null);
-  let didDragMove = $state(false);
-  let activePointerId = $state<number | null>(null);
+  let resizeStartWidth = 0;
+  let vitalsResizeStartWidth = 0;
 
   const isDesktop = $derived(
     isDesktopSidebarLayout(viewportWidth),
@@ -58,24 +61,76 @@
   const currentLayoutWidth = $derived(
     layoutWidth ?? viewportWidth,
   );
-  const clampedLayoutWidth = $derived(
-    isDesktop
-      ? Math.max(
-          0,
-          currentLayoutWidth -
-            RESIZE_HANDLE_WIDTH -
-            SIDEBAR_BORDER_WIDTH,
-        )
-      : currentLayoutWidth,
+  const vitalsVisible = $derived(
+    Boolean(vitals) &&
+      isDesktop &&
+      ui.vitalsOpen &&
+      sessions.activeSessionId !== null,
   );
+  // The two panes share one width budget with the content column. When space
+  // runs out, pane minimums win, then the content minimum, then preferred
+  // widths: the sidebar clamp reserves the vitals panel's minimum footprint,
+  // and the vitals clamp yields whatever the actual sidebar leaves over.
+  function sidebarLayoutWidth(layoutWidthNow: number): number {
+    const vitalsReservedWidth = vitalsVisible
+      ? VITALS_WIDTH_MIN + RESIZE_HANDLE_WIDTH + SIDEBAR_BORDER_WIDTH
+      : 0;
+
+    return Math.max(
+      0,
+      layoutWidthNow -
+        RESIZE_HANDLE_WIDTH -
+        SIDEBAR_BORDER_WIDTH -
+        vitalsReservedWidth,
+    );
+  }
   const sidebarWidth = $derived(
     isDesktop
       ? clampSidebarWidthForLayout(
           ui.sidebarWidth,
-          clampedLayoutWidth,
+          sidebarLayoutWidth(currentLayoutWidth),
         )
       : SIDEBAR_WIDTH_DEFAULT,
   );
+  const sidebarMaxWidth = $derived(
+    clampSidebarWidthForLayout(
+      SIDEBAR_WIDTH_STORAGE_MAX,
+      sidebarLayoutWidth(currentLayoutWidth),
+    ),
+  );
+  const vitalsAvailableWidth = $derived(
+    vitalsLayoutWidth(currentLayoutWidth),
+  );
+  const vitalsWidth = $derived(
+    isDesktop
+      ? clampVitalsWidthForLayout(
+          ui.vitalsWidth,
+          vitalsAvailableWidth,
+        )
+      : VITALS_WIDTH_DEFAULT,
+  );
+  const vitalsMaxWidth = $derived(
+    clampVitalsWidthForLayout(
+      VITALS_WIDTH_STORAGE_MAX,
+      vitalsAvailableWidth,
+    ),
+  );
+
+  // Width left for the content column and vitals panel once the sidebar,
+  // its handle, and the pane borders are spoken for.
+  function vitalsLayoutWidth(layoutWidthNow: number): number {
+    const sidebarTotalWidth = ui.sidebarOpen
+      ? sidebarWidth + RESIZE_HANDLE_WIDTH + SIDEBAR_BORDER_WIDTH
+      : 0;
+
+    return Math.max(
+      0,
+      layoutWidthNow -
+        sidebarTotalWidth -
+        RESIZE_HANDLE_WIDTH -
+        SIDEBAR_BORDER_WIDTH,
+    );
+  }
   function handleBackdropClick() {
     ui.closeSidebar();
   }
@@ -100,137 +155,36 @@
     return nextLayoutWidth;
   }
 
-  function updateSidebarWidth(clientX: number) {
-    if (!dragState) return;
+  function handleResizeStart() {
+    resizeStartWidth = sidebarWidth;
+  }
 
-    const desiredWidth =
-      dragState.startWidth + (clientX - dragState.startX);
+  function handleResize(event: SplitResizeEvent) {
     const clampedWidth = clampSidebarWidthForLayout(
-      desiredWidth,
-      Math.max(
-        0,
-        measureLayoutWidth() -
-          RESIZE_HANDLE_WIDTH -
-          SIDEBAR_BORDER_WIDTH,
-      ),
+      resizeStartWidth + event.delta,
+      sidebarLayoutWidth(measureLayoutWidth()),
     );
 
+    // Skip persisting when the clamp lands on the rendered width so a wider
+    // stored preference survives drags inside the same clamp.
     if (clampedWidth === sidebarWidth) return;
     ui.setSidebarWidth(clampedWidth);
   }
 
-  function isActiveDragPointer(event: PointerEvent) {
-    return (
-      activePointerId === null ||
-      event.pointerId === activePointerId
+  function handleVitalsResizeStart() {
+    vitalsResizeStartWidth = vitalsWidth;
+  }
+
+  function handleVitalsResize(event: SplitResizeEvent) {
+    // The handle sits on the panel's left edge, so moving it left (negative
+    // delta) widens the panel.
+    const clampedWidth = clampVitalsWidthForLayout(
+      vitalsResizeStartWidth - event.delta,
+      vitalsLayoutWidth(measureLayoutWidth()),
     );
-  }
 
-  function stopResizing() {
-    if (
-      resizeHandleElement &&
-      activePointerId !== null &&
-      typeof resizeHandleElement.releasePointerCapture ===
-        "function"
-    ) {
-      try {
-        resizeHandleElement.releasePointerCapture(
-          activePointerId,
-        );
-      } catch {
-        // Ignore release failures when capture is absent.
-      }
-    }
-
-    if (typeof window !== "undefined") {
-      window.removeEventListener(
-        "pointermove",
-        handlePointerMove,
-      );
-      window.removeEventListener(
-        "pointerup",
-        handlePointerUp,
-      );
-      window.removeEventListener(
-        "pointercancel",
-        handlePointerCancel,
-      );
-    }
-
-    isResizing = false;
-    dragState = null;
-    didDragMove = false;
-    activePointerId = null;
-  }
-
-  function handlePointerMove(event: PointerEvent) {
-    if (!dragState) return;
-    if (!isActiveDragPointer(event)) return;
-
-    if (event.buttons === 0) {
-      stopResizing();
-      return;
-    }
-
-    const hasMoved =
-      didDragMove || event.clientX !== dragState.startX;
-    if (!hasMoved) return;
-
-    event.preventDefault();
-    didDragMove = true;
-    updateSidebarWidth(event.clientX);
-  }
-
-  function handlePointerUp(event: PointerEvent) {
-    if (!dragState || !isActiveDragPointer(event)) return;
-
-    if (didDragMove) {
-      updateSidebarWidth(event.clientX);
-    }
-
-    stopResizing();
-  }
-
-  function handlePointerCancel(event: PointerEvent) {
-    if (!dragState || !isActiveDragPointer(event)) return;
-    stopResizing();
-  }
-
-  function handlePointerDown(event: PointerEvent) {
-    if (!isDesktop || !ui.sidebarOpen || dragState || event.button !== 0) {
-      return;
-    }
-
-    event.preventDefault();
-    dragState = {
-      startX: event.clientX,
-      startWidth: sidebarWidth,
-    };
-    didDragMove = false;
-    activePointerId =
-      typeof event.pointerId === "number"
-        ? event.pointerId
-        : null;
-    isResizing = true;
-
-    if (
-      resizeHandleElement &&
-      activePointerId !== null &&
-      typeof resizeHandleElement.setPointerCapture ===
-        "function"
-    ) {
-      try {
-        resizeHandleElement.setPointerCapture(
-          activePointerId,
-        );
-      } catch {
-        // Ignore capture failures and keep window listeners as fallback.
-      }
-    }
-
-    window.addEventListener("pointermove", handlePointerMove);
-    window.addEventListener("pointerup", handlePointerUp);
-    window.addEventListener("pointercancel", handlePointerCancel);
+    if (clampedWidth === vitalsWidth) return;
+    ui.setVitalsWidth(clampedWidth);
   }
 
   $effect(() => {
@@ -258,39 +212,11 @@
     };
   });
 
-  $effect(() => {
-    return () => {
-      stopResizing();
-    };
-  });
-
-  $effect(() => {
-    if ((!isDesktop || !ui.sidebarOpen) && isResizing) {
-      stopResizing();
-    }
-  });
-
-  $effect(() => {
-    if (typeof document === "undefined") return;
-
-    document.body.classList.toggle(
-      "sidebar-resizing",
-      isResizing,
-    );
-
-    return () => {
-      document.body.classList.remove("sidebar-resizing");
-    };
-  });
 </script>
 
 <svelte:window bind:innerWidth={viewportWidth} />
 
-<div
-  class="layout"
-  class:is-resizing={isResizing}
-  bind:this={layoutElement}
->
+<div class="layout" bind:this={layoutElement}>
   {#if ui.isMobileViewport && ui.sidebarOpen}
     <button
       class="sidebar-backdrop"
@@ -391,28 +317,33 @@
   </aside>
 
   {#if isDesktop && ui.sidebarOpen}
-    <div
-      class="resize-handle"
-      bind:this={resizeHandleElement}
-      data-testid="sidebar-resize-handle"
-      role="separator"
-      aria-label={m.nav_resize_sidebar()}
-      aria-orientation="vertical"
-      aria-valuemin={SIDEBAR_WIDTH_MIN}
-      aria-valuemax={SIDEBAR_WIDTH_STORAGE_MAX}
-      aria-valuenow={sidebarWidth}
-      onpointerdown={handlePointerDown}
-      style:width={`${RESIZE_HANDLE_WIDTH}px`}
-    ></div>
+    <SplitResizeHandle
+      ariaLabel={m.nav_resize_sidebar()}
+      ariaValueMin={SIDEBAR_WIDTH_MIN}
+      ariaValueMax={sidebarMaxWidth}
+      ariaValueNow={sidebarWidth}
+      onResizeStart={handleResizeStart}
+      onResize={handleResize}
+      onResizeEnd={handleResize}
+    />
   {/if}
 
   <main class="content">
     {@render content()}
   </main>
 
-  {#if vitals && isDesktop && ui.vitalsOpen && sessions.activeSessionId}
-    <aside class="vitals">
-      {@render vitals()}
+  {#if vitalsVisible}
+    <SplitResizeHandle
+      ariaLabel={m.session_vitals_resize()}
+      ariaValueMin={VITALS_WIDTH_MIN}
+      ariaValueMax={vitalsMaxWidth}
+      ariaValueNow={vitalsWidth}
+      onResizeStart={handleVitalsResizeStart}
+      onResize={handleVitalsResize}
+      onResizeEnd={handleVitalsResize}
+    />
+    <aside class="vitals" style:width={`${vitalsWidth}px`}>
+      {@render vitals?.()}
     </aside>
   {/if}
 </div>
@@ -441,54 +372,6 @@
     display: none;
   }
 
-  .resize-handle {
-    position: relative;
-    flex-shrink: 0;
-    /* kit-ui-check-ignore: pointer-capture resizer with persisted width and test contract predates kit-ui SplitResizeHandle; swapping (and gaining keyboard resize) is tracked as a follow-up */
-    cursor: col-resize;
-    touch-action: none;
-    transition: background-color 120ms ease;
-  }
-
-  .resize-handle::before {
-    content: "";
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: 50%;
-    width: 1px;
-    background: var(--border-default);
-    transform: translateX(-50%);
-  }
-
-  .resize-handle::after {
-    content: "";
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    width: 3px;
-    height: 52px;
-    border-radius: 999px;
-    background: var(--text-muted);
-    opacity: 0.6;
-    transform: translate(-50%, -50%);
-    transition: opacity 120ms ease;
-  }
-
-  .resize-handle:hover,
-  .layout.is-resizing .resize-handle {
-    background: color-mix(
-      in srgb,
-      var(--accent-blue) 10%,
-      transparent
-    );
-  }
-
-  .resize-handle:hover::after,
-  .layout.is-resizing .resize-handle::after {
-    opacity: 1;
-  }
-
   .content {
     flex: 1;
     min-width: 0;
@@ -498,7 +381,6 @@
   }
 
   .vitals {
-    width: 320px;
     flex-shrink: 0;
     border-left: 1px solid var(--border-default);
     overflow: hidden;
@@ -515,13 +397,6 @@
 
   .mobile-nav {
     display: none;
-  }
-
-  :global(body.sidebar-resizing) {
-    /* kit-ui-check-ignore: body-level drag cursor for the sidebar resizer above */
-    cursor: col-resize;
-    user-select: none;
-    -webkit-user-select: none;
   }
 
   @media (max-width: 760px) {

@@ -75,7 +75,7 @@ func TestCodexProviderSourceMethods(t *testing.T) {
 	assert.Equal(t, sourcePath, fingerprint.Key)
 	assert.Equal(t, info.Size(), fingerprint.Size)
 	assert.Equal(t, newer.UnixNano(), fingerprint.MTimeNS)
-	wantInode, wantDevice := sourceFileIdentity(info)
+	wantInode, wantDevice := sourceFileIdentityForPath(sourcePath, info)
 	assert.Equal(t, wantInode, fingerprint.Inode)
 	assert.Equal(t, wantDevice, fingerprint.Device)
 	assert.NotEmpty(t, fingerprint.Hash)
@@ -122,6 +122,109 @@ func TestCodexProviderUnresolvedParentNeedsRetry(t *testing.T) {
 	result := outcome.Results[0]
 	assert.Equal(t, DataVersionNeedsRetry, result.DataVersion)
 	assert.Contains(t, result.RetryReason, "parent turns")
+	require.Len(t, result.Result.Messages, 2)
+	assert.Equal(t, "child task", result.Result.Messages[0].Content)
+	assert.Equal(t, "child answer", result.Result.Messages[1].Content)
+}
+
+func TestCodexProviderReadableParentWithoutTurnsRetriesUntilParentAdvances(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	const childID = "22222222-2222-4222-8222-222222222223"
+	const parentID = "11111111-1111-4111-8111-111111111112"
+	const parentTurnID = "parent-turn-later"
+	const childTurnID = "child-turn"
+
+	parentPath := writeCodexProviderSessionContent(t, root, parentID,
+		testjsonl.JoinJSONL(testjsonl.CodexSessionMetaJSON(
+			parentID, "/workspace/project", "codex_cli_rs", tsEarly,
+		)),
+	)
+	childContent := testjsonl.JoinJSONL(
+		testjsonl.CodexForkedSessionMetaJSON(
+			childID, parentID, "/workspace/project", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexSessionMetaJSON(
+			parentID, "/workspace/project", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexTurnContextWithIDJSON(
+			"gpt-5.4", parentTurnID, tsEarlyS1,
+		),
+		testjsonl.CodexMsgJSON("user", "replayed task", tsEarlyS1),
+		testjsonl.CodexMsgJSON("assistant", "replayed answer", "2024-01-01T10:00:02Z"),
+		testjsonl.CodexTurnContextWithIDJSON(
+			"gpt-5.4", childTurnID, "2024-01-01T10:00:03Z",
+		),
+		testjsonl.CodexMsgJSON("user", "child task", "2024-01-01T10:00:03Z"),
+		testjsonl.CodexMsgJSON("assistant", "child answer", tsEarlyS5),
+	)
+	writeCodexProviderSessionContent(t, root, childID, childContent)
+
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	source := requireCodexProviderSource(t, provider, childID)
+
+	first, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+	require.NoError(t, err)
+	require.Len(t, first.Results, 1)
+	require.Equal(t, DataVersionNeedsRetry, first.Results[0].DataVersion,
+		"a readable parent with no turn IDs is still unresolved")
+	require.Contains(t, first.Results[0].RetryReason, "parent turns")
+	require.Len(t, first.Results[0].Result.Messages, 4,
+		"unresolved parsing fails open until the parent becomes usable")
+
+	f, err := os.OpenFile(parentPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(testjsonl.JoinJSONL(
+		testjsonl.CodexTurnContextWithIDJSON(
+			"gpt-5.4", parentTurnID, tsEarlyS1,
+		),
+	))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	second, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+	require.NoError(t, err)
+	require.Len(t, second.Results, 1)
+	require.Equal(t, DataVersionCurrent, second.Results[0].DataVersion)
+	require.Empty(t, second.Results[0].RetryReason)
+	require.Len(t, second.Results[0].Result.Messages, 2)
+	require.Equal(t, "child task", second.Results[0].Result.Messages[0].Content)
+	require.Equal(t, "child answer", second.Results[0].Result.Messages[1].Content)
+}
+
+func TestCodexProviderTurnlessParentResolvesWithoutRetry(t *testing.T) {
+	// Codex Desktop writes a rollout when a thread opens; forking before the
+	// first prompt produces a parent holding only session_meta and settings
+	// events. Such a parent is present and fully readable, so the fork must
+	// parse as current instead of being marked for a retry that can never
+	// succeed and blocking every later reconciliation page behind it.
+	root := t.TempDir()
+	const childID = "22222222-2222-4222-8222-222222222222"
+	const parentID = "11111111-1111-4111-8111-111111111111"
+	writeCodexProviderSessionContent(t, root, parentID, testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(parentID, "/workspace/project", "codex_cli_rs", tsEarly),
+	))
+	writeCodexProviderSessionContent(t, root, childID, testjsonl.JoinJSONL(
+		testjsonl.CodexForkedSessionMetaJSON(
+			childID, parentID, "/workspace/project", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", "child-turn", tsEarlyS1),
+		testjsonl.CodexMsgJSON("user", "child task", tsEarlyS1),
+		testjsonl.CodexMsgJSON("assistant", "child answer", tsEarlyS5),
+	))
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	source := requireCodexProviderSource(t, provider, childID)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	result := outcome.Results[0]
+	assert.Equal(t, DataVersionCurrent, result.DataVersion)
+	assert.Empty(t, result.RetryReason)
 	require.Len(t, result.Result.Messages, 2)
 	assert.Equal(t, "child task", result.Result.Messages[0].Content)
 	assert.Equal(t, "child answer", result.Result.Messages[1].Content)
@@ -310,7 +413,7 @@ func TestCodexProviderFactoryScopesCursorCache(t *testing.T) {
 	require.NotNil(t, sess)
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	inode, device := sourceFileIdentity(info)
+	inode, device := sourceFileIdentityForPath(path, info)
 
 	_, siblingHit := siblingProvider.cursorCache.Get(
 		path, info.Size(), inode, device,
@@ -362,7 +465,7 @@ func TestCodexProviderFullParseSnapshotExcludesLaterGrowth(t *testing.T) {
 	require.Len(t, messages, 1)
 	assert.Equal(t, RoleUser, messages[0].Role)
 	assert.Equal(t, "captured request", messages[0].Content)
-	inode, device := sourceFileIdentity(capturedInfo)
+	inode, device := sourceFileIdentityForFile(snapshot, capturedInfo)
 	seed, seeded := concrete.cursorCache.Get(
 		path, int64(len(initial)), inode, device,
 	)
@@ -391,6 +494,28 @@ func TestCodexProviderFullParseSnapshotExcludesLaterGrowth(t *testing.T) {
 	assert.Equal(t, 1, outcome.Messages[0].Ordinal)
 	assert.Equal(t, "gpt-5.5", outcome.Messages[0].Model)
 	assert.Equal(t, int64(len(tail)), outcome.ConsumedBytes)
+}
+
+func TestCodexFullParseHonorsContextBetweenLines(t *testing.T) {
+	root := t.TempDir()
+	uuid := "019eb791-cf7d-75c1-8439-9ed74c1229ed"
+	path := writeCodexProviderSession(t, root, uuid, "question")
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	concrete, ok := provider.(*codexProvider)
+	require.True(t, ok)
+	snapshot, err := os.Open(path)
+	require.NoError(t, err)
+	defer snapshot.Close()
+	info, err := snapshot.Stat()
+	require.NoError(t, err)
+	ctx := newCancelOnErrCheckContext(t, 4)
+
+	_, _, err = concrete.parseSessionSnapshotContext(
+		ctx, path, "local", false, snapshot, info,
+	)
+
+	require.ErrorIs(t, err, context.Canceled)
 }
 
 func TestCodexProviderFullParseSnapshotKeepsDescriptorIdentityAfterReplacement(
@@ -424,14 +549,14 @@ func TestCodexProviderFullParseSnapshotKeepsDescriptorIdentityAfterReplacement(
 	defer snapshot.Close()
 	snapshotInfo, err := snapshot.Stat()
 	require.NoError(t, err)
-	oldInode, oldDevice := sourceFileIdentity(snapshotInfo)
+	oldInode, oldDevice := sourceFileIdentityForFile(snapshot, snapshotInfo)
 
 	replacementPath := path + ".replacement"
 	require.NoError(t, os.WriteFile(replacementPath, []byte(replacement), 0o644))
 	require.NoError(t, os.Rename(replacementPath, path))
 	currentInfo, err := os.Stat(path)
 	require.NoError(t, err)
-	newInode, newDevice := sourceFileIdentity(currentInfo)
+	newInode, newDevice := sourceFileIdentityForPath(path, currentInfo)
 
 	sess, messages, err := concrete.parseSessionSnapshot(
 		path, "local", false, snapshot, snapshotInfo,
@@ -870,6 +995,71 @@ func TestCodexProviderIncrementalCustomToolOutputUpdatesStoredCall(t *testing.T)
 	}
 }
 
+func TestCodexProviderIncrementalLateOutputAttachesCommittedUsage(t *testing.T) {
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229f8"
+	prefix := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/workspace/project-a", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexTurnContextJSON("gpt-5.4", tsEarlyS1),
+		testjsonl.CodexMsgJSON("user", "inspect the repository", tsEarlyS1),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"shell", "call_late", map[string]any{"cmd": "git status"}, tsEarlyS5,
+		),
+	)
+	tail := testjsonl.JoinJSONL(
+		testjsonl.CodexFunctionCallOutputJSON(
+			"call_late", "working tree clean", tsLate,
+		),
+		testjsonl.CodexTokenCountJSON(tsLateS5, 100_000, 250, 64_000),
+	)
+
+	root := t.TempDir()
+	path := writeCodexProviderSessionContent(t, root, uuid, prefix)
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	source := requireCodexProviderSource(t, provider, uuid)
+	prefixFingerprint, err := provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+	full, err := provider.Parse(context.Background(), ParseRequest{
+		Source: source, Fingerprint: prefixFingerprint,
+	})
+	require.NoError(t, err)
+	require.Len(t, full.Results, 1)
+	require.Len(t, full.Results[0].Result.Messages, 2)
+	assert.Equal(t, RoleAssistant, full.Results[0].Result.Messages[1].Role)
+
+	appendCodexProviderContent(t, path, tail)
+	fingerprint, err := provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+	pendingUsageOrdinal := 1
+	outcome, status, err := provider.ParseIncremental(
+		context.Background(), IncrementalRequest{
+			Source:                    source,
+			Fingerprint:               fingerprint,
+			SessionID:                 "codex:" + uuid,
+			Offset:                    prefixFingerprint.Size,
+			StartOrdinal:              2,
+			StoredPendingUsageOrdinal: &pendingUsageOrdinal,
+		},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, IncrementalApplied, status)
+	assert.False(t, outcome.ForceReplace)
+	assert.Empty(t, outcome.Messages)
+	require.Len(t, outcome.ToolCallUpdates, 1)
+	assert.Equal(t, "call_late", outcome.ToolCallUpdates[0].ToolUseID)
+	require.Len(t, outcome.MessageTokenUsageUpdates, 1)
+	usage := outcome.MessageTokenUsageUpdates[0]
+	assert.Equal(t, 1, usage.Ordinal)
+	assert.Equal(t, 100_000, usage.ContextTokens)
+	assert.Equal(t, 250, usage.OutputTokens)
+	assert.True(t, usage.HasContextTokens)
+	assert.True(t, usage.HasOutputTokens)
+	assert.NotEmpty(t, usage.TokenUsage)
+}
+
 func TestCodexProviderColdIncrementalStagesRetryCursorVersions(t *testing.T) {
 	root := t.TempDir()
 	uuid := "019eb791-cf7d-75c1-8439-9ed74c1229ed"
@@ -1074,7 +1264,6 @@ func TestCodexProviderTokenCountCursorParity(t *testing.T) {
 				testjsonl.CodexMsgJSON("assistant", "tail answer", "2024-01-01T10:00:05Z"),
 				tc.tailToken,
 			)
-
 			fullRoot := t.TempDir()
 			writeCodexProviderSessionContent(
 				t, fullRoot, tc.uuid, prefix+tail,
@@ -1672,7 +1861,7 @@ func TestCodexProviderParseIncrementalHonorsContext(t *testing.T) {
 	assert.Equal(t, IncrementalUnsupported, status)
 }
 
-func TestCodexProviderDiscoverDedupesLiveAndArchivedByUUID(t *testing.T) {
+func TestCodexProviderRawDiscoveryKeepsLiveAndArchivedPhysicalSources(t *testing.T) {
 	base := t.TempDir()
 	liveRoot := filepath.Join(base, "sessions")
 	archivedRoot := filepath.Join(base, "archived_sessions")
@@ -1681,6 +1870,16 @@ func TestCodexProviderDiscoverDedupesLiveAndArchivedByUUID(t *testing.T) {
 	archivedPath := writeCodexProviderArchivedSession(
 		t, archivedRoot, uuid, "archived",
 	)
+	sharedMeta := testjsonl.CodexSessionMetaJSON(
+		uuid, "/home/user/code/api", "codex_cli_rs", "2026-06-11T12:44:06Z",
+	) + "\n"
+	require.NoError(t, os.WriteFile(livePath, []byte(sharedMeta), 0o644))
+	require.NoError(t, os.WriteFile(archivedPath, []byte(sharedMeta), 0o644))
+	renamedArchivedPath := filepath.Join(
+		archivedRoot, "rollout-2026-06-12T08-00-00-"+uuid+".jsonl",
+	)
+	require.NoError(t, os.Rename(archivedPath, renamedArchivedPath))
+	archivedPath = renamedArchivedPath
 
 	provider, ok := NewProvider(AgentCodex, ProviderConfig{
 		Roots: []string{archivedRoot, liveRoot},
@@ -1691,6 +1890,13 @@ func TestCodexProviderDiscoverDedupesLiveAndArchivedByUUID(t *testing.T) {
 	require.Len(t, discovered, 1)
 	assert.Equal(t, livePath, discovered[0].DisplayPath)
 	assert.NotEqual(t, archivedPath, discovered[0].DisplayPath)
+
+	rawDiscovery, err := DiscoverRawCaptureSources(t.Context(), provider)
+	require.NoError(t, err)
+	require.True(t, rawDiscovery.Complete)
+	require.Len(t, rawDiscovery.Sources, 2)
+	assert.ElementsMatch(t, []string{archivedPath, livePath},
+		sourceDisplayPaths(rawDiscovery.Sources))
 }
 
 func TestCodexProviderDiscoverEachYieldsDuplicateCandidates(t *testing.T) {
@@ -1714,6 +1920,35 @@ func TestCodexProviderDiscoverEachYieldsDuplicateCandidates(t *testing.T) {
 	}))
 
 	assert.ElementsMatch(t, []string{archivedPath, livePath}, paths)
+}
+
+func TestCodexRawCaptureDiscoveryContinuesAfterIncompleteRoot(t *testing.T) {
+	unreadableRoot := t.TempDir()
+	healthyRoot := t.TempDir()
+	uuid := "019eb791-cf7d-75c1-8439-9ed74c1229e5"
+	healthyPath := writeCodexProviderSession(t, healthyRoot, uuid, "healthy")
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{
+		Roots: []string{unreadableRoot, healthyRoot},
+	})
+	require.True(t, ok)
+	ctx := withStreamingDirectoryReader(t.Context(), func(
+		ctx context.Context,
+		dir string,
+		yield func(os.DirEntry) error,
+	) error {
+		if dir == unreadableRoot {
+			return os.ErrPermission
+		}
+		return streamDirectoryEntriesDirect(ctx, dir, yield)
+	})
+
+	discovery, err := DiscoverRawCaptureSources(ctx, provider)
+	require.Error(t, err)
+	_, incomplete := errors.AsType[DiscoveryIncompleteError](err)
+	require.True(t, incomplete)
+	assert.False(t, discovery.Complete)
+	require.Len(t, discovery.Sources, 1)
+	assert.Equal(t, healthyPath, discovery.Sources[0].DisplayPath)
 }
 
 func TestCodexProviderDiscoverEachIncludesNoncanonicalRollout(t *testing.T) {
@@ -1951,6 +2186,14 @@ func TestCodexProviderChangedPathPinsArchivedDuplicate(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, changed, 1)
 	assert.Equal(t, archivedPath, changed[0].DisplayPath)
+
+	rawChanged, err := RawCaptureSourcesForChangedPath(
+		t.Context(), provider,
+		ChangedPathRequest{Path: archivedPath, EventKind: "write"},
+	)
+	require.NoError(t, err)
+	require.Len(t, rawChanged, 1)
+	assert.Equal(t, archivedPath, rawChanged[0].DisplayPath)
 }
 
 func TestCodexProviderChangedPathClassifiesRemovedTranscript(t *testing.T) {
@@ -1991,6 +2234,30 @@ func TestCodexProviderIndexPathClassifiesAllSiblingSources(t *testing.T) {
 	)
 	require.NoError(t, err)
 	assert.Equal(t, []string{firstPath, secondPath}, sourceDisplayPaths(changed))
+}
+
+func TestCodexProviderRawIndexPathDefersToBoundedAudit(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "sessions")
+	writeCodexProviderSession(
+		t, root, "019eb791-cf7d-75c1-8439-9ed74c1229e9", "first",
+	)
+	writeCodexProviderSession(
+		t, root, "019eb791-cf7d-75c1-8439-9ed74c1229ea", "second",
+	)
+	indexPath := filepath.Join(base, CodexSessionIndexFilename)
+	require.NoError(t, os.WriteFile(indexPath, []byte("{}\n"), 0o644))
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+
+	changed, err := RawCaptureSourcesForChangedPath(
+		t.Context(), provider, ChangedPathRequest{
+			Path: indexPath, EventKind: "write", WatchRoot: base,
+		},
+	)
+
+	require.NoError(t, err)
+	assert.Empty(t, changed)
 }
 
 func writeCodexProviderSession(
@@ -2059,4 +2326,87 @@ func appendCodexProviderContent(t *testing.T, path, content string) {
 	_, err = f.WriteString(content)
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
+}
+
+func TestCodexProviderIncrementalUserBoundaryDoesNotBackfillCommittedUsage(t *testing.T) {
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229f9"
+	prefix := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/workspace/project-a", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexTurnContextJSON("gpt-5.4", tsEarlyS1),
+		testjsonl.CodexMsgJSON("user", "first request", tsEarlyS1),
+		testjsonl.CodexMsgJSON("assistant", "first response", tsEarlyS5),
+	)
+
+	t.Run("user without a new assistant blocks committed target", func(t *testing.T) {
+		root := t.TempDir()
+		path := writeCodexProviderSessionContent(t, root, uuid, prefix)
+		provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+		require.True(t, ok)
+		source := requireCodexProviderSource(t, provider, uuid)
+		prefixFingerprint, err := provider.Fingerprint(context.Background(), source)
+		require.NoError(t, err)
+
+		tail := testjsonl.JoinJSONL(
+			testjsonl.CodexMsgJSON("user", "second request", tsLate),
+			testjsonl.CodexTokenCountJSON(tsLateS5, 100_000, 250, 64_000),
+		)
+		appendCodexProviderContent(t, path, tail)
+		fingerprint, err := provider.Fingerprint(context.Background(), source)
+		require.NoError(t, err)
+		pendingUsageOrdinal := 1
+		outcome, status, err := provider.ParseIncremental(
+			context.Background(), IncrementalRequest{
+				Source:                    source,
+				Fingerprint:               fingerprint,
+				SessionID:                 "codex:" + uuid,
+				Offset:                    prefixFingerprint.Size,
+				StartOrdinal:              2,
+				StoredPendingUsageOrdinal: &pendingUsageOrdinal,
+			},
+		)
+		require.NoError(t, err)
+		assert.Equal(t, IncrementalApplied, status)
+		require.Len(t, outcome.Messages, 1)
+		assert.Equal(t, RoleUser, outcome.Messages[0].Role)
+		assert.Empty(t, outcome.MessageTokenUsageUpdates,
+			"usage after a real user boundary must not update the prior turn")
+	})
+
+	t.Run("new assistant after the user receives usage", func(t *testing.T) {
+		root := t.TempDir()
+		path := writeCodexProviderSessionContent(t, root, uuid, prefix)
+		provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+		require.True(t, ok)
+		source := requireCodexProviderSource(t, provider, uuid)
+		prefixFingerprint, err := provider.Fingerprint(context.Background(), source)
+		require.NoError(t, err)
+
+		tail := testjsonl.JoinJSONL(
+			testjsonl.CodexMsgJSON("user", "second request", tsLate),
+			testjsonl.CodexMsgJSON("assistant", "second response", tsLateS5),
+			testjsonl.CodexTokenCountJSON("2026-08-02T09:00:06Z", 100_000, 250, 64_000),
+		)
+		appendCodexProviderContent(t, path, tail)
+		fingerprint, err := provider.Fingerprint(context.Background(), source)
+		require.NoError(t, err)
+		pendingUsageOrdinal := 1
+		outcome, status, err := provider.ParseIncremental(
+			context.Background(), IncrementalRequest{
+				Source:                    source,
+				Fingerprint:               fingerprint,
+				SessionID:                 "codex:" + uuid,
+				Offset:                    prefixFingerprint.Size,
+				StartOrdinal:              2,
+				StoredPendingUsageOrdinal: &pendingUsageOrdinal,
+			},
+		)
+		require.NoError(t, err)
+		assert.Equal(t, IncrementalApplied, status)
+		require.Len(t, outcome.Messages, 2)
+		assert.Equal(t, RoleAssistant, outcome.Messages[1].Role)
+		assert.NotEmpty(t, outcome.Messages[1].TokenUsage)
+		assert.Empty(t, outcome.MessageTokenUsageUpdates)
+	})
 }

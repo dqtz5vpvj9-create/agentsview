@@ -3,6 +3,7 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -23,7 +24,7 @@ func messageInsertArgs(m Message) []any {
 		m.Timestamp, m.HasThinking, m.HasToolUse,
 		m.ContentLength, m.IsSystem,
 		m.Model, string(m.TokenUsage),
-		m.ContextTokens, m.OutputTokens,
+		m.ContextTokens, m.OutputTokens, m.ProviderID,
 		m.HasContextTokens, m.HasOutputTokens,
 		m.ClaudeMessageID, m.ClaudeRequestID,
 		m.SourceType, m.SourceSubtype, m.PromptSource, m.SourceUUID,
@@ -47,11 +48,24 @@ var messageUpdateSetClause = func() string {
 // Both sides go through the same resolve helpers the insert path
 // uses, so equality is defined on exactly the persisted tuples.
 func messageRowEqual(a, b Message) bool {
-	aArgs, bArgs := messageInsertArgs(a), messageInsertArgs(b)
-	for i := range aArgs {
-		if aArgs[i] != bArgs[i] {
-			return false
-		}
+	if a.SessionID != b.SessionID || a.Ordinal != b.Ordinal ||
+		a.Role != b.Role || a.Content != b.Content ||
+		a.ThinkingText != b.ThinkingText || a.Timestamp != b.Timestamp ||
+		a.HasThinking != b.HasThinking || a.HasToolUse != b.HasToolUse ||
+		a.ContentLength != b.ContentLength || a.IsSystem != b.IsSystem ||
+		a.Model != b.Model || !bytes.Equal(a.TokenUsage, b.TokenUsage) ||
+		a.ContextTokens != b.ContextTokens || a.OutputTokens != b.OutputTokens ||
+		a.ProviderID != b.ProviderID ||
+		a.HasContextTokens != b.HasContextTokens ||
+		a.HasOutputTokens != b.HasOutputTokens ||
+		a.ClaudeMessageID != b.ClaudeMessageID ||
+		a.ClaudeRequestID != b.ClaudeRequestID ||
+		a.SourceType != b.SourceType || a.SourceSubtype != b.SourceSubtype ||
+		a.PromptSource != b.PromptSource || a.SourceUUID != b.SourceUUID ||
+		a.SourceParentUUID != b.SourceParentUUID ||
+		a.IsSidechain != b.IsSidechain ||
+		a.IsCompactBoundary != b.IsCompactBoundary {
+		return false
 	}
 
 	aCalls := resolveToolCalls([]Message{a}, []int64{0})
@@ -151,11 +165,7 @@ func transcriptMessageEqual(a, b Message) bool {
 	comparableTranscriptMessage := func(msg Message) Message {
 		msg.ID = 0
 		msg.ContentLength = 0
-		msg.TokenUsage = nil
-		msg.ClaudeMessageID = ""
-		msg.ClaudeRequestID = ""
 		msg.SourceType = ""
-		msg.SourceUUID = ""
 		msg.SourceParentUUID = ""
 		msg.IsSidechain = false
 		msg.ToolCalls = append([]ToolCall(nil), msg.ToolCalls...)
@@ -383,20 +393,18 @@ func deleteToolRowsForMessagesTx(
 		for _, id := range ids[start:end] {
 			idArgs = append(idArgs, id)
 		}
-		// Agent-state rows are keyed by tool_use_id and carry event
-		// coordinates. Clear them while the tool_calls rows still exist,
-		// then rebuild from the surviving events: a removed agent or a
-		// recreated call must not leave stale coordinates that a later
-		// incremental update could resolve to a reused event index.
+		// Agent-state rows use stable message/call coordinates. Clear every
+		// occurrence owned by the messages being rebuilt so removed agents and
+		// reused provider IDs cannot leave stale summary state.
 		if _, err := tx.Exec(
-			"DELETE FROM tool_call_agent_state WHERE session_id = ?"+
-				" AND tool_use_id IN ("+
-				"SELECT COALESCE(tool_use_id, '') FROM tool_calls"+
-				" WHERE message_id IN ("+placeholderList(len(idArgs))+"))",
+			"DELETE FROM tool_call_occurrence_agent_state WHERE session_id = ?"+
+				" AND message_ordinal IN ("+
+				"SELECT ordinal FROM messages WHERE id IN ("+
+				placeholderList(len(idArgs))+"))",
 			append([]any{sessionID}, idArgs...)...,
 		); err != nil {
 			return fmt.Errorf(
-				"deleting stale tool_call_agent_state: %w", err,
+				"deleting stale tool-call occurrence state: %w", err,
 			)
 		}
 		if _, err := tx.Exec(

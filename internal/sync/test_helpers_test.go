@@ -3,7 +3,7 @@ package sync_test
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"maps"
 	"os"
@@ -54,6 +54,16 @@ func assertSessionProject(t *testing.T, database *db.DB, sessionID string, want 
 	t.Helper()
 	assertSessionState(t, database, sessionID, func(sess *db.Session) {
 		assert.Equal(t, want, sess.Project, "session %q project", sessionID)
+	})
+}
+
+func assertSessionProjectAndCwd(
+	t *testing.T, database *db.DB, sessionID, wantProject, wantCwd string,
+) {
+	t.Helper()
+	assertSessionState(t, database, sessionID, func(sess *db.Session) {
+		assert.Equal(t, wantProject, sess.Project, "session %q project", sessionID)
+		assert.Equal(t, wantCwd, sess.Cwd, "session %q cwd", sessionID)
 	})
 }
 

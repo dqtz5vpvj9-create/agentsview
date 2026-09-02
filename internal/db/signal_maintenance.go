@@ -57,6 +57,42 @@ type SessionSignalState struct {
 	UpdatedAt          string
 }
 
+// SessionSignalInputSnapshot is the complete session-row input set consumed
+// by the full signal recompute. TranscriptRevision protects message and tool
+// rows; the remaining fields protect metadata that can change without a
+// transcript rewrite. A full recompute may publish only while every field
+// still matches the snapshot it computed from.
+type SessionSignalInputSnapshot struct {
+	TranscriptRevision   string
+	MessageCount         int
+	IsAutomated          bool
+	EndedAt              string
+	HasEndedAt           bool
+	PeakContextTokens    int
+	HasPeakContextTokens bool
+}
+
+// SignalInputSnapshot returns the signal-driving session-row inputs from s.
+func SignalInputSnapshot(s Session) (SessionSignalInputSnapshot, error) {
+	if s.TranscriptRevision == nil {
+		return SessionSignalInputSnapshot{}, fmt.Errorf(
+			"session %s has no transcript revision", s.ID,
+		)
+	}
+	snapshot := SessionSignalInputSnapshot{
+		TranscriptRevision:   *s.TranscriptRevision,
+		MessageCount:         s.MessageCount,
+		IsAutomated:          s.IsAutomated,
+		PeakContextTokens:    s.PeakContextTokens,
+		HasPeakContextTokens: s.HasPeakContextTokens,
+	}
+	if s.EndedAt != nil {
+		snapshot.EndedAt = *s.EndedAt
+		snapshot.HasEndedAt = true
+	}
+	return snapshot, nil
+}
+
 // SignalMaintainer computes the incremental signal delta inside the
 // incremental write transaction, after messages and result updates are
 // applied but before the transaction commits. It may return a nil delta to
@@ -77,30 +113,33 @@ type SignalQuery interface {
 	// TrailingToolCalls returns the last n tool-call facts in
 	// (message ordinal, call index) order, oldest first.
 	TrailingToolCalls(ctx context.Context, n int) ([]ToolCallSignalFact, error)
-	// ToolCallsByUseID returns the facts of the named calls after the
-	// transaction's result updates, keyed by tool_use_id.
-	ToolCallsByUseID(
-		ctx context.Context, toolUseIDs []string,
+	// ToolCallsByPosition returns the facts of the exact call occurrences
+	// after the transaction's result updates.
+	ToolCallsByPosition(
+		ctx context.Context, positions []ToolCallPosition,
 	) ([]ToolCallSignalFact, error)
 	// CallResultEvents returns the stored result events of one call in
 	// event_index order, after the transaction's updates.
 	CallResultEvents(
 		ctx context.Context, messageOrdinal, callIndex int,
 	) ([]ToolResultEvent, error)
-	// InsertedResultEvents returns only the result events this
-	// transaction just inserted for the named call, with their assigned
-	// event indexes. Late-result maintenance must scan exactly these rows:
-	// previously stored events already carry findings, and rescanning the
-	// call's whole history makes repeated updates quadratic.
-	InsertedResultEvents(toolUseID string) []ToolResultEvent
+	// InsertedResultEvents returns only the result events this transaction
+	// just inserted for the exact call occurrence, with their assigned event
+	// indexes. Previously stored events already carry findings.
+	InsertedResultEvents(position ToolCallPosition) []ToolResultEvent
+	// MessageTokenUsageUpdated reports whether this transaction actually
+	// changed the token metadata of the named committed message. Identical
+	// replays must not fold the same token-drop compaction twice.
+	MessageTokenUsageUpdated(ordinal int) bool
 }
 
 // signalTxQuery implements SignalQuery over the incremental write
 // transaction.
 type signalTxQuery struct {
-	tx                   *sql.Tx
-	sessionID            string
-	insertedResultEvents map[string][]ToolResultEvent
+	tx                          *sql.Tx
+	sessionID                   string
+	insertedResultEvents        map[ToolCallPosition][]ToolResultEvent
+	updatedMessageUsageOrdinals map[int]struct{}
 }
 
 func (q signalTxQuery) Session(
@@ -244,7 +283,7 @@ func (q signalTxQuery) TrailingToolCalls(
 		)
 	}
 	defer rows.Close()
-	var facts []ToolCallSignalFact
+	var facts = make([]ToolCallSignalFact, 0)
 	for rows.Next() {
 		var f ToolCallSignalFact
 		if err := rows.Scan(
@@ -264,18 +303,18 @@ func (q signalTxQuery) TrailingToolCalls(
 	return facts, rows.Err()
 }
 
-func (q signalTxQuery) ToolCallsByUseID(
-	ctx context.Context, toolUseIDs []string,
+func (q signalTxQuery) ToolCallsByPosition(
+	ctx context.Context, positions []ToolCallPosition,
 ) ([]ToolCallSignalFact, error) {
-	if len(toolUseIDs) == 0 {
+	if len(positions) == 0 {
 		return nil, nil
 	}
-	placeholders := make([]string, len(toolUseIDs))
-	args := make([]any, 0, len(toolUseIDs)+1)
+	clauses := make([]string, len(positions))
+	args := make([]any, 0, 1+2*len(positions))
 	args = append(args, q.sessionID)
-	for i, id := range toolUseIDs {
-		placeholders[i] = "?"
-		args = append(args, id)
+	for i, position := range positions {
+		clauses[i] = "(m.ordinal = ? AND COALESCE(tc.call_index, 0) = ?)"
+		args = append(args, position.MessageOrdinal, position.CallIndex)
 	}
 	rows, err := q.tx.QueryContext(ctx, `
 		SELECT m.ordinal, COALESCE(tc.call_index, 0),
@@ -292,8 +331,7 @@ func (q signalTxQuery) ToolCallsByUseID(
 		       ), '')
 		FROM tool_calls tc
 		JOIN messages m ON m.id = tc.message_id
-		WHERE tc.session_id = ? AND tc.tool_use_id IN (`+
-		strings.Join(placeholders, ",")+`)`,
+		WHERE tc.session_id = ? AND (`+strings.Join(clauses, " OR ")+")",
 		args...,
 	)
 	if err != nil {
@@ -356,11 +394,16 @@ func (q signalTxQuery) CallResultEvents(
 }
 
 // InsertedResultEvents returns the result events this transaction inserted
-// for one call, keyed by the call's tool_use_id.
+// for one exact call occurrence.
 func (q signalTxQuery) InsertedResultEvents(
-	toolUseID string,
+	position ToolCallPosition,
 ) []ToolResultEvent {
-	return q.insertedResultEvents[toolUseID]
+	return q.insertedResultEvents[position]
+}
+
+func (q signalTxQuery) MessageTokenUsageUpdated(ordinal int) bool {
+	_, ok := q.updatedMessageUsageOrdinals[ordinal]
+	return ok
 }
 
 // TranscriptRevision returns a session's stored transcript revision. The
@@ -436,6 +479,167 @@ func (db *DB) UpsertSessionSignalState(st SessionSignalState) error {
 	}
 	return tx.Commit()
 }
+
+// UpsertSessionSignalStateIfRevision stores compact signal state only while
+// the session still has the transcript revision represented by st.State.
+// The boolean is false when the snapshot became stale before publication.
+func (db *DB) UpsertSessionSignalStateIfRevision(
+	st SessionSignalState,
+) (bool, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tx, err := db.getWriter().Begin()
+	if err != nil {
+		return false, fmt.Errorf("beginning conditional signal state tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	matches, err := sessionTranscriptRevisionMatchesTx(
+		tx, st.SessionID, st.TranscriptRevision,
+	)
+	if err != nil || !matches {
+		return false, err
+	}
+	if err := upsertSessionSignalStateTx(tx, st); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf(
+			"committing conditional signal state %s: %w", st.SessionID, err,
+		)
+	}
+	return true, nil
+}
+
+// ReplaceSessionSignalsIfInputsMatch atomically publishes findings, aggregate
+// columns, and compact incremental state for one coherent signal-input
+// snapshot. It returns false without modifying any rows when a concurrent
+// writer changes either the transcript or metadata consumed by the recompute.
+func (db *DB) ReplaceSessionSignalsIfInputsMatch(
+	sessionID string,
+	expected SessionSignalInputSnapshot,
+	findings []SecretFinding,
+	update SessionSignalUpdate,
+	state SessionSignalState,
+) (bool, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tx, err := db.getWriter().Begin()
+	if err != nil {
+		return false, fmt.Errorf("beginning conditional signal recompute tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	matches, err := sessionSignalInputSnapshotMatchesTx(
+		tx, sessionID, expected,
+	)
+	if err != nil || !matches {
+		return false, err
+	}
+	if err := replaceSecretFindingsTx(
+		tx, sessionID, findings, update.SecretLeakCount,
+		update.SecretsRulesVersion,
+	); err != nil {
+		return false, err
+	}
+	if err := updateSessionSignalsTx(tx, sessionID, update); err != nil {
+		return false, err
+	}
+	state.SessionID = sessionID
+	state.TranscriptRevision = expected.TranscriptRevision
+	if err := upsertSessionSignalStateTx(tx, state); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf(
+			"committing conditional signal recompute %s: %w", sessionID, err,
+		)
+	}
+	return true, nil
+}
+
+// ReplaceSessionSignalsIfRevision is retained for callers that only have a
+// transcript token. New full-recompute code should use
+// ReplaceSessionSignalsIfInputsMatch so metadata-only races are rejected too.
+func (db *DB) ReplaceSessionSignalsIfRevision(
+	sessionID, expectedRevision string,
+	findings []SecretFinding,
+	update SessionSignalUpdate,
+	state SessionSignalState,
+) (bool, error) {
+	sess, err := db.GetSessionFull(context.Background(), sessionID)
+	if err != nil {
+		return false, err
+	}
+	if sess == nil || sess.TranscriptRevision == nil ||
+		*sess.TranscriptRevision != expectedRevision {
+		return false, nil
+	}
+	snapshot, err := SignalInputSnapshot(*sess)
+	if err != nil {
+		return false, err
+	}
+	return db.ReplaceSessionSignalsIfInputsMatch(
+		sessionID, snapshot, findings, update, state,
+	)
+}
+
+func sessionSignalInputSnapshotMatchesTx(
+	tx *sql.Tx, sessionID string,
+	expected SessionSignalInputSnapshot,
+) (bool, error) {
+	var (
+		currentRevision string
+		messageCount    int
+		isAutomated     int
+		endedAt         sql.NullString
+		peakTokens      int
+		hasPeak         int
+	)
+	err := tx.QueryRow(`
+		SELECT transcript_revision, message_count, is_automated, ended_at,
+		       peak_context_tokens, has_peak_context_tokens
+		FROM sessions WHERE id = ?`, sessionID,
+	).Scan(
+		&currentRevision, &messageCount, &isAutomated, &endedAt,
+		&peakTokens, &hasPeak,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf(
+			"loading signal input snapshot %s: %w", sessionID, err,
+		)
+	}
+	current := SessionSignalInputSnapshot{
+		TranscriptRevision:   currentRevision,
+		MessageCount:         messageCount,
+		IsAutomated:          isAutomated != 0,
+		EndedAt:              endedAt.String,
+		HasEndedAt:           endedAt.Valid,
+		PeakContextTokens:    peakTokens,
+		HasPeakContextTokens: hasPeak != 0,
+	}
+	return current == expected, nil
+}
+
+func sessionTranscriptRevisionMatchesTx(
+	tx *sql.Tx, sessionID, expectedRevision string,
+) (bool, error) {
+	var current string
+	err := tx.QueryRow(
+		`SELECT transcript_revision FROM sessions WHERE id = ?`, sessionID,
+	).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf(
+			"loading transcript revision %s: %w", sessionID, err,
+		)
+	}
+	return current == expectedRevision, nil
+}
+
 func applySignalDeltaTx(
 	tx *sql.Tx, sessionID string, d SignalDelta,
 ) error {
@@ -534,9 +738,7 @@ func applySignalDeltaTx(
 		)
 	}
 	newLeak := currentLeak - deletedDefinite + addedDefinite
-	if newLeak < 0 {
-		newLeak = 0
-	}
+	newLeak = max(newLeak, 0)
 
 	if err := updateSessionSignalsTx(tx, sessionID, d.Update); err != nil {
 		return err

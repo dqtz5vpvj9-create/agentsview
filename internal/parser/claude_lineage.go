@@ -3,6 +3,7 @@
 package parser
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sort"
@@ -72,13 +73,19 @@ var (
 	claudeSniffCache = map[string]claudeSniffCacheEntry{}
 )
 
-// claudeParseOptions gates opt-in parse behaviors that only the local
-// Claude provider enables. Uploads, Cowork, and Qoder reuse the Claude
-// parse body and must keep every option off.
+// claudeParseOptions gates opt-in parse behaviors for providers that reuse the
+// Claude transcript pipeline.
 type claudeParseOptions struct {
+	ctx                         context.Context
+	persistedOutputPathResolver func(string) (string, bool)
 	// siblingLineage enables background-fork lineage resolution
 	// against sibling transcripts in the same directory.
 	siblingLineage bool
+	// uploadIdentity enables adoption of explicit rooted transcript IDs.
+	uploadIdentity bool
+	// compatibleTitleEvents enables the sessionName, custom-title, and
+	// ai-title fields written by compatible transcript producers.
+	compatibleTitleEvents bool
 }
 
 // claudeLineagePlan describes an established fork lineage: the leading
@@ -92,20 +99,31 @@ type claudeLineagePlan struct {
 	dropUUIDs map[string]struct{}
 }
 
-func claudeSniffHead(path string) claudeHeadSniff {
+func claudeSniffHead(
+	ctx context.Context, path string,
+) (claudeHeadSniff, error) {
+	if err := ctx.Err(); err != nil {
+		return claudeHeadSniff{}, err
+	}
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
-		return claudeHeadSniff{}
+		return claudeHeadSniff{}, nil
 	}
 	claudeSniffMu.Lock()
 	if e, ok := claudeSniffCache[path]; ok &&
 		e.size == info.Size() && e.mtimeNS == info.ModTime().UnixNano() {
 		claudeSniffMu.Unlock()
-		return e.sniff
+		return e.sniff, nil
 	}
 	claudeSniffMu.Unlock()
 
-	sniff := claudeSniffHeadUncached(path)
+	sniff, err := claudeSniffHeadUncached(ctx, path)
+	if err != nil {
+		return claudeHeadSniff{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return claudeHeadSniff{}, err
+	}
 
 	claudeSniffMu.Lock()
 	if len(claudeSniffCache) >= claudeSniffCacheMaxEntries {
@@ -117,21 +135,31 @@ func claudeSniffHead(path string) claudeHeadSniff {
 		sniff:   sniff,
 	}
 	claudeSniffMu.Unlock()
-	return sniff
+	return sniff, nil
 }
 
-func claudeSniffHeadUncached(path string) claudeHeadSniff {
+func claudeSniffHeadUncached(
+	ctx context.Context, path string,
+) (claudeHeadSniff, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return claudeHeadSniff{}
+		return claudeHeadSniff{}, nil
 	}
 	defer f.Close()
-	lr := newLineReader(f, maxLineSize)
+	lr := newLineReaderContext(ctx, f, maxLineSize)
 	defer releaseLineReader(lr)
 	for range claudeLineageSniffMaxLines {
+		if err := ctx.Err(); err != nil {
+			return claudeHeadSniff{}, err
+		}
 		lineBytes, ok := lr.nextBytes()
 		if !ok {
-			return claudeHeadSniff{}
+			if lr.Err() != nil {
+				if err := ctx.Err(); err != nil {
+					return claudeHeadSniff{}, err
+				}
+			}
+			return claudeHeadSniff{}, nil
 		}
 		if !gjson.ValidBytes(lineBytes) {
 			continue
@@ -144,15 +172,18 @@ func claudeSniffHeadUncached(path string) claudeHeadSniff {
 		// replayed copy, which starts at the conversation root) has no
 		// parentUuid. Any other head shape is unexpected: fail open.
 		if gjson.GetBytes(lineBytes, "parentUuid").Str != "" {
-			return claudeHeadSniff{}
+			return claudeHeadSniff{}, nil
 		}
 		return claudeHeadSniff{
 			rootUUID: uuid,
 			rootIsBG: gjson.GetBytes(lineBytes, "sessionKind").Str == "bg",
 			ok:       true,
-		}
+		}, nil
 	}
-	return claudeHeadSniff{}
+	if err := ctx.Err(); err != nil {
+		return claudeHeadSniff{}, err
+	}
+	return claudeHeadSniff{}, nil
 }
 
 // claudeForkLine is one uuid-bearing line of a fork transcript.
@@ -168,15 +199,20 @@ type claudeForkLine struct {
 // claudeScanUUIDs streams every uuid-bearing line of a transcript in
 // order. Errors and malformed lines are skipped; lineage resolution
 // fails open on incomplete data.
-func claudeScanUUIDs(path string, visit func(line claudeForkLine)) bool {
+func claudeScanUUIDs(
+	ctx context.Context, path string, visit func(line claudeForkLine),
+) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return false
+		return false, nil
 	}
 	defer f.Close()
-	lr := newLineReader(f, maxLineSize)
+	lr := newLineReaderContext(ctx, f, maxLineSize)
 	defer releaseLineReader(lr)
 	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		lineBytes, ok := lr.nextBytes()
 		if !ok {
 			break
@@ -195,7 +231,7 @@ func claudeScanUUIDs(path string, visit func(line claudeForkLine)) bool {
 			chainEntry: entryType == "user" || entryType == "assistant",
 		})
 	}
-	return lr.Err() == nil
+	return lr.Err() == nil, nil
 }
 
 // claudeResolveSiblingLineage establishes the background-fork lineage
@@ -203,15 +239,20 @@ func claudeScanUUIDs(path string, visit func(line claudeForkLine)) bool {
 // Sibling discovery is head-sniff only (memoized per size and mtime);
 // the qualifying candidates' full uuid sets are read once per full
 // parse of a bg-marked fork.
-func claudeResolveSiblingLineage(path string) *claudeLineagePlan {
-	self := claudeSniffHead(path)
+func claudeResolveSiblingLineage(
+	ctx context.Context, path string,
+) (*claudeLineagePlan, error) {
+	self, err := claudeSniffHead(ctx, path)
+	if err != nil {
+		return nil, err
+	}
 	if !self.ok || !self.rootIsBG {
-		return nil
+		return nil, nil
 	}
 	dir := filepath.Dir(path)
 	dirEntries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	base := filepath.Base(path)
 	type candidate struct {
@@ -221,13 +262,19 @@ func claudeResolveSiblingLineage(path string) *claudeLineagePlan {
 	}
 	var candidates []candidate
 	for _, de := range dirEntries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		name := de.Name()
 		if de.IsDir() || name == base ||
 			!strings.HasSuffix(name, ".jsonl") ||
 			strings.HasPrefix(name, "agent-") {
 			continue
 		}
-		sibling := claudeSniffHead(filepath.Join(dir, name))
+		sibling, err := claudeSniffHead(ctx, filepath.Join(dir, name))
+		if err != nil {
+			return nil, err
+		}
 		if !sibling.ok || sibling.rootUUID != self.rootUUID {
 			continue
 		}
@@ -238,7 +285,7 @@ func claudeResolveSiblingLineage(path string) *claudeLineagePlan {
 		})
 	}
 	if len(candidates) == 0 {
-		return nil
+		return nil, nil
 	}
 	// Non-bg candidates first so an interactive original wins a run
 	// tie against an unrelated bg fork of the same original.
@@ -250,10 +297,14 @@ func claudeResolveSiblingLineage(path string) *claudeLineagePlan {
 	})
 
 	var forkSeq []claudeForkLine
-	if !claudeScanUUIDs(path, func(line claudeForkLine) {
+	complete, err := claudeScanUUIDs(ctx, path, func(line claudeForkLine) {
 		forkSeq = append(forkSeq, line)
-	}) || len(forkSeq) == 0 {
-		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !complete || len(forkSeq) == 0 {
+		return nil, nil
 	}
 
 	// Pick the candidate whose uuid set covers the longest contiguous
@@ -273,10 +324,17 @@ func claudeResolveSiblingLineage(path string) *claudeLineagePlan {
 	bestStem := ""
 	var bestSet map[string]struct{}
 	for _, c := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		set := make(map[string]struct{})
-		if !claudeScanUUIDs(c.path, func(line claudeForkLine) {
+		complete, err := claudeScanUUIDs(ctx, c.path, func(line claudeForkLine) {
 			set[line.uuid] = struct{}{}
-		}) {
+		})
+		if err != nil {
+			return nil, err
+		}
+		if !complete {
 			continue
 		}
 		run := 0
@@ -297,7 +355,7 @@ func claudeResolveSiblingLineage(path string) *claudeLineagePlan {
 		}
 	}
 	if bestRun == 0 {
-		return nil
+		return nil, nil
 	}
 	dropUUIDs := make(map[string]struct{}, bestRun)
 	for _, line := range forkSeq[:bestRun] {
@@ -320,11 +378,11 @@ func claudeResolveSiblingLineage(path string) *claudeLineagePlan {
 		}
 	}
 	if danglingChildren > 1 {
-		return nil
+		return nil, nil
 	}
 	return &claudeLineagePlan{
 		parentSessionID: bestStem,
 		dropCount:       bestRun,
 		dropUUIDs:       dropUUIDs,
-	}
+	}, nil
 }

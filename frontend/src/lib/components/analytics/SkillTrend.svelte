@@ -1,10 +1,13 @@
 <script lang="ts">
+  import { Chart, Circle, Layer, Line, Spline } from "layerchart";
+  import { scalePoint } from "d3-scale";
   import { analytics } from "../../stores/analytics.svelte.js";
   import { settings } from "../../stores/settings.svelte.js";
   import GranularityPicker from "../shared/GranularityPicker.svelte";
-  import { formatDateTime, m } from "../../i18n/index.js";
+  import { formatDateTime, getLocale, m } from "../../i18n/index.js";
   import { parseLocalDate } from "../../utils/dates.js";
   import { chartSeriesColorMap } from "../../utils/chartPalette.js";
+  import LargeChartFrame from "../shared/LargeChartFrame.svelte";
 
   // Soft cap from the series-count ladder: past six skills the tail folds
   // into "Other" instead of generating more hues.
@@ -14,7 +17,8 @@
   const PLOT_TOP = 8;
   const LABEL_HEIGHT = 18;
   const SVG_HEIGHT = PLOT_TOP + PLOT_HEIGHT + LABEL_HEIGHT;
-  const PAD_X = 10;
+  const PLOT_LEFT = 40;
+  const PLOT_RIGHT = 10;
   const MAX_X_LABELS = 14;
 
   const trendEntries = $derived(analytics.skills?.trend ?? []);
@@ -124,22 +128,9 @@
 
   function xAt(index: number): number {
     const n = trendEntries.length;
-    const span = Math.max(chartWidth - 2 * PAD_X, 0);
-    if (n <= 1) return PAD_X + span / 2;
-    return PAD_X + (index * span) / (n - 1);
-  }
-
-  function yAt(value: number): number {
-    return PLOT_TOP + PLOT_HEIGHT - (value / maxValue) * PLOT_HEIGHT;
-  }
-
-  function linePath(values: number[]): string {
-    return values
-      .map((v, i) => {
-        const cmd = i === 0 ? "M" : "L";
-        return `${cmd}${xAt(i).toFixed(1)},${yAt(v).toFixed(1)}`;
-      })
-      .join(" ");
+    const span = Math.max(chartWidth - PLOT_LEFT - PLOT_RIGHT, 0);
+    if (n <= 1) return PLOT_LEFT + span / 2;
+    return PLOT_LEFT + (index * span) / (n - 1);
   }
 
   function seriesColor(key: string): string {
@@ -150,8 +141,7 @@
     Math.max(Math.ceil(trendEntries.length / MAX_X_LABELS), 1),
   );
 
-  function bucketLabel(date: string, index: number): string {
-    if (index % labelStep !== 0) return "";
+  function bucketLabel(date: string): string {
     const parsed = parseLocalDate(date);
     if (!parsed) return date;
     if (analytics.skillsGranularity === "month") {
@@ -176,13 +166,15 @@
     });
   }
 
-  // Edge labels anchor inward so they never clip at the chart bounds.
-  function labelAnchor(index: number): string {
-    const x = xAt(index);
-    if (x < 30) return "start";
-    if (x > chartWidth - 30) return "end";
-    return "middle";
-  }
+  const xTicks = $derived(
+    trendEntries
+      .filter((_, index) =>
+        index === 0 ||
+        index === trendEntries.length - 1 ||
+        index % labelStep === 0
+      )
+      .map((entry) => entry.date),
+  );
 
   // Crosshair: snap the pointer to the nearest bucket and read out every
   // visible series at that X in one tooltip.
@@ -196,9 +188,9 @@
       e.currentTarget as SVGElement
     ).getBoundingClientRect();
     const x = e.clientX - rect.left;
-    const span = Math.max(chartWidth - 2 * PAD_X, 1);
+    const span = Math.max(chartWidth - PLOT_LEFT - PLOT_RIGHT, 1);
     const index = Math.min(
-      Math.max(Math.round(((x - PAD_X) / span) * (n - 1)), 0),
+      Math.max(Math.round(((x - PLOT_LEFT) / span) * (n - 1)), 0),
       n - 1,
     );
     hoverIndex = index;
@@ -250,6 +242,18 @@
       }))
       .sort((a, b) => b.value - a.value);
   });
+
+  const chartSeries = $derived(
+    visibleSeries.map((series) => ({
+      ...series,
+      points: trendEntries.map((entry, index) => ({
+        date: entry.date,
+        value: series.values[index] ?? 0,
+      })),
+    })),
+  );
+
+  const chartData = $derived(chartSeries.flatMap((series) => series.points));
 </script>
 
 <div class="trend-container">
@@ -293,7 +297,7 @@
           ></span>
           <span class="legend-name">{series.label}</span>
           <span class="legend-count">
-            {series.total.toLocaleString()}
+            {series.total.toLocaleString(getLocale())}
           </span>
         </button>
       {/each}
@@ -318,71 +322,70 @@
       onblur={handleLeave}
       onkeydown={handleKeydown}
     >
-      <svg
+      <Chart
+        data={chartData}
+        x="date"
+        y="value"
+        xScale={scalePoint()}
+        yDomain={[0, maxValue]}
+        xRange={[PLOT_LEFT, chartWidth - PLOT_RIGHT]}
+        yRange={[PLOT_TOP + PLOT_HEIGHT, PLOT_TOP]}
+        padding={0}
         width={chartWidth}
         height={SVG_HEIGHT}
-        class="chart-svg"
         aria-hidden="true"
       >
-        <line
-          class="baseline"
-          x1={PAD_X}
-          y1={PLOT_TOP + PLOT_HEIGHT}
-          x2={chartWidth - PAD_X}
-          y2={PLOT_TOP + PLOT_HEIGHT}
-        />
+        <Layer class="chart-svg" aria-hidden="true">
+          <LargeChartFrame
+            {xTicks}
+            yTicks={4}
+            formatX={(value) => bucketLabel(String(value))}
+            formatY={(value) => Number(value).toLocaleString(getLocale())}
+          >
+            {#each chartSeries as series (series.key)}
+              {#if trendEntries.length > 1}
+                <Spline
+                  class="series-line"
+                  data={series.points}
+                  x="date"
+                  y="value"
+                  style={`stroke: ${seriesColor(series.key)}`}
+                  fill="none"
+                />
+              {:else}
+                <Circle
+                  class="series-marker"
+                  data={series.points}
+                  x="date"
+                  y="value"
+                  r={4}
+                  fill={seriesColor(series.key)}
+                />
+              {/if}
+            {/each}
 
-        {#each visibleSeries as series (series.key)}
-          {#if trendEntries.length > 1}
-            <path
-              class="series-line"
-              d={linePath(series.values)}
-              style="stroke: {seriesColor(series.key)}"
-            />
-          {:else}
-            <circle
-              class="series-marker"
-              cx={xAt(0)}
-              cy={yAt(series.values[0] ?? 0)}
-              r="4"
-              style="fill: {seriesColor(series.key)}"
-            />
-          {/if}
-        {/each}
-
-        {#if hoverIndex !== null}
-          <line
-            class="crosshair"
-            x1={xAt(hoverIndex)}
-            y1={PLOT_TOP}
-            x2={xAt(hoverIndex)}
-            y2={PLOT_TOP + PLOT_HEIGHT}
-          />
-          {#each visibleSeries as series (series.key)}
-            <circle
-              class="series-marker"
-              cx={xAt(hoverIndex)}
-              cy={yAt(series.values[hoverIndex] ?? 0)}
-              r="4"
-              style="fill: {seriesColor(series.key)}"
-            />
-          {/each}
-        {/if}
-
-        {#each trendEntries as entry, index (entry.date)}
-          {@const label = bucketLabel(entry.date, index)}
-          {#if label}
-            <text
-              class="x-label"
-              x={xAt(index)}
-              y={SVG_HEIGHT - 4}
-              text-anchor={labelAnchor(index)}
-            >
-              {label}
-            </text>
-          {/if}
-        {/each}
-      </svg>
+            {#if hoverIndex !== null}
+              <Line
+                class="crosshair"
+                x1={xAt(hoverIndex)}
+                y1={PLOT_TOP}
+                x2={xAt(hoverIndex)}
+                y2={PLOT_TOP + PLOT_HEIGHT}
+              />
+              {#each chartSeries as series (series.key)}
+                <Circle
+                  class="series-marker"
+                  data={[series.points[hoverIndex]]}
+                  x="date"
+                  y="value"
+                  r={4}
+                  fill={seriesColor(series.key)}
+                />
+              {/each}
+            {/if}
+          </LargeChartFrame>
+        </Layer>
+      </Chart>
       <table id="skill-trend-data" class="kit-sr-only">
         <caption>{m.analytics_skill_trend_title()}</caption>
         <thead>
@@ -398,7 +401,7 @@
             <tr>
               <th scope="row">{bucketDateLabel(entry.date)}</th>
               {#each allSeries as series (series.key)}
-                <td>{(series.values[index] ?? 0).toLocaleString()}</td>
+                <td>{(series.values[index] ?? 0).toLocaleString(getLocale())}</td>
               {/each}
             </tr>
           {/each}
@@ -423,7 +426,7 @@
               style="background: {seriesColor(row.key)}"
             ></span>
             <span class="tip-value">
-              {row.value.toLocaleString()}
+              {row.value.toLocaleString(getLocale())}
             </span>
             <span class="tip-name">{row.label}</span>
           </div>
@@ -516,16 +519,11 @@
     width: 100%;
   }
 
-  .chart-svg {
+  .trend-container :global(.chart-svg) {
     display: block;
   }
 
-  .baseline {
-    stroke: var(--border-muted);
-    stroke-width: 1;
-  }
-
-  .series-line {
+  .trend-container :global(.series-line) {
     fill: none;
     stroke-width: 2;
     stroke-linecap: round;
@@ -533,23 +531,18 @@
   }
 
   /* Surface ring keeps markers legible where they cross a line. */
-  .series-marker {
+  .trend-container :global(.series-marker) {
     stroke: var(--bg-surface);
     stroke-width: 2;
     pointer-events: none;
   }
 
-  .crosshair {
+  .trend-container :global(.crosshair) {
     stroke: var(--text-muted);
     stroke-width: 1;
     stroke-dasharray: none;
     opacity: 0.5;
     pointer-events: none;
-  }
-
-  .x-label {
-    font-size: 8px;
-    fill: var(--text-muted);
   }
 
   .tooltip {

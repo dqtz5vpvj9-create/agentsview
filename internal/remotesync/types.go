@@ -2,26 +2,102 @@ package remotesync
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
+	"sort"
+	"time"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/jsonutil"
 	"go.kenn.io/agentsview/internal/parser"
 	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
 type SyncStats struct {
-	SessionsSynced int `json:"sessions_synced"`
-	SessionsTotal  int `json:"sessions_total"`
-	Skipped        int `json:"skipped"`
-	Failed         int `json:"failed"`
+	SessionsSynced       int              `json:"sessions_synced"`
+	SessionsTotal        int              `json:"sessions_total"`
+	Skipped              int              `json:"skipped"`
+	Failed               int              `json:"failed"`
+	PendingNew           int              `json:"pending_new,omitzero"`
+	PendingRearmed       int              `json:"pending_rearmed,omitzero"`
+	PendingReplayed      int              `json:"pending_replayed,omitzero"`
+	PendingPaths         int              `json:"pending_paths,omitzero"`
+	ArmedPaths           int              `json:"armed_paths,omitzero"`
+	ExactSources         int              `json:"exact_sources,omitzero"`
+	FallbackProviders    int              `json:"fallback_providers,omitzero"`
+	FallbackSources      int              `json:"fallback_sources,omitzero"`
+	FilesDiscovered      int              `json:"files_discovered,omitzero"`
+	FilesProcessed       int              `json:"files_processed,omitzero"`
+	PruneExactScopes     int              `json:"prune_exact_scopes,omitzero"`
+	PruneProviderScopes  int              `json:"prune_provider_scopes,omitzero"`
+	PruneHostWideScope   bool             `json:"prune_host_wide_scope,omitzero"`
+	PrunedExact          int              `json:"pruned_exact,omitzero"`
+	PrunedProvider       int              `json:"pruned_provider,omitzero"`
+	PrunedHostWide       int              `json:"pruned_host_wide,omitzero"`
+	ErrorSuppressed      int              `json:"error_suppressed,omitzero"`
+	FullReason           FullImportReason `json:"full_reason,omitempty"`
+	JournalOutcome       JournalOutcome   `json:"journal_outcome,omitempty"`
+	PlanningDuration     time.Duration    `json:"planning_duration,omitzero"`
+	PruningDuration      time.Duration    `json:"pruning_duration,omitzero"`
+	ProcessingDuration   time.Duration    `json:"processing_duration,omitzero"`
+	CachePersistDuration time.Duration    `json:"cache_persist_duration,omitzero"`
+	RetirementDuration   time.Duration    `json:"retirement_duration,omitzero"`
+	Deferred             int              `json:"-"`
+	incomplete           bool
+}
+
+func (s SyncStats) ProcessingComplete() bool {
+	return !s.incomplete && s.Deferred == 0
+}
+
+type syncStatsJSON SyncStats
+
+func (s SyncStats) MarshalJSONTo(out *jsontext.Encoder) error {
+	return jsonutil.MarshalDurationFields(out, syncStatsJSON(s))
+}
+
+func (s *SyncStats) UnmarshalJSONFrom(in *jsontext.Decoder) error {
+	var decoded syncStatsJSON
+	if err := jsonutil.UnmarshalDurationFields(in, &decoded); err != nil {
+		return err
+	}
+	*s = SyncStats(decoded)
+	return nil
 }
 
 type TargetSet struct {
-	Dirs           map[parser.AgentType][]string `json:"dirs"`
-	Files          map[parser.AgentType][]string `json:"files,omitempty"`
-	ExtraFiles     []string                      `json:"extra_files,omitempty"`
-	ForbiddenRoots []string                      `json:"forbidden_roots,omitempty"`
+	Dirs               map[parser.AgentType][]string `json:"dirs"`
+	Files              map[parser.AgentType][]string `json:"files,omitempty"`
+	ExtraFiles         []string                      `json:"extra_files,omitempty"`
+	ProviderExtraFiles map[parser.AgentType][]string `json:"provider_extra_files,omitempty"`
+	ForbiddenRoots     []string                      `json:"forbidden_roots,omitempty"`
+}
+
+// AllExtraFiles returns shared and provider-owned curated files without
+// duplicates. Provider keys are sorted so archive and manifest inputs remain
+// deterministic despite map iteration order.
+func (t TargetSet) AllExtraFiles() []string {
+	files := append([]string(nil), t.ExtraFiles...)
+	seen := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		seen[file] = struct{}{}
+	}
+	agents := make([]string, 0, len(t.ProviderExtraFiles))
+	for agent := range t.ProviderExtraFiles {
+		agents = append(agents, string(agent))
+	}
+	sort.Strings(agents)
+	for _, name := range agents {
+		for _, file := range t.ProviderExtraFiles[parser.AgentType(name)] {
+			if _, exists := seen[file]; exists {
+				continue
+			}
+			seen[file] = struct{}{}
+			files = append(files, file)
+		}
+	}
+	return files
 }
 
 // HasFileScopedAgents reports whether any agent exports a curated
@@ -30,15 +106,42 @@ func (t TargetSet) HasFileScopedAgents() bool {
 	return len(t.Files) > 0
 }
 
+func (t TargetSet) isFileScoped(agent parser.AgentType) bool {
+	_, ok := t.Files[agent]
+	return ok
+}
+
 // verbatimFileScopedAgent reports whether a file-scoped agent's
 // curated files are exported byte-for-byte by WriteArchive. Verbatim
-// agents (RooCode) can ride the manifest/delta path: the manifest
-// advertises exactly the files the archive streams, so one changed
-// transcript transfers alone. Sanitizing agents (Windsurf rewrites
-// its state DB) must stay on the full-archive flow, and new
-// file-scoped agents default to sanitized until added here.
+// agents (RooCode, Kilo Legacy, Cursor, VS Code Copilot) can ride the
+// manifest/delta path: the manifest advertises exactly the files the
+// archive streams, so one changed transcript transfers alone.
+// Sanitizing agents (Windsurf rewrites its state DB) must stay on the
+// full-archive flow, and new file-scoped agents default to sanitized
+// until added here.
 func verbatimFileScopedAgent(agent parser.AgentType) bool {
-	return agent == parser.AgentRooCode || agent == parser.AgentKiloLegacy
+	return agent == parser.AgentRooCode || agent == parser.AgentKiloLegacy ||
+		agent == parser.AgentCursor || agent == parser.AgentVSCodeCopilot
+}
+
+// snapshotFileScopedAgent reports whether a file-scoped agent's
+// curated files are exported as consistent SQLite snapshots rather
+// than raw bytes. Snapshot agents ride the manifest/delta path like
+// verbatim agents; the manifest advertises the snapshot's logical
+// identity instead of the raw file's.
+func snapshotFileScopedAgent(agent parser.AgentType) bool {
+	return agent == parser.AgentZed
+}
+
+// emptyFileScopeAgent reports whether an agent's root stays
+// advertised with an explicitly empty curated file list when
+// discovery finds no sessions. Retaining the empty scope keeps a
+// stale client request authorized after the last session is deleted,
+// so the manifest can go empty and the client mirror evicts the
+// remaining copies instead of failing the sync. Agents without this
+// trait drop the root entirely when nothing is discovered.
+func emptyFileScopeAgent(agent parser.AgentType) bool {
+	return agent == parser.AgentCursor || agent == parser.AgentVSCodeCopilot
 }
 
 // HasSanitizedFileScopedAgents reports whether any agent's export is
@@ -46,7 +149,7 @@ func verbatimFileScopedAgent(agent parser.AgentType) bool {
 // manifest/delta path cannot model.
 func (t TargetSet) HasSanitizedFileScopedAgents() bool {
 	for agent := range t.Files {
-		if !verbatimFileScopedAgent(agent) {
+		if !verbatimFileScopedAgent(agent) && !snapshotFileScopedAgent(agent) {
 			return true
 		}
 	}
@@ -55,7 +158,8 @@ func (t TargetSet) HasSanitizedFileScopedAgents() bool {
 
 // IsEmpty reports whether the set names no sync targets at all.
 func (t TargetSet) IsEmpty() bool {
-	return len(t.Dirs) == 0 && len(t.Files) == 0 && len(t.ExtraFiles) == 0
+	return len(t.Dirs) == 0 && len(t.Files) == 0 && len(t.ExtraFiles) == 0 &&
+		len(t.ProviderExtraFiles) == 0
 }
 
 // SplitFileScoped partitions the set into the targets the
@@ -69,7 +173,8 @@ func (t TargetSet) SplitFileScoped() (dirScoped, fileScoped TargetSet) {
 	dirScoped.ForbiddenRoots = append([]string(nil), t.ForbiddenRoots...)
 	fileScoped.ForbiddenRoots = append([]string(nil), t.ForbiddenRoots...)
 	for agent, dirs := range t.Dirs {
-		if _, ok := t.Files[agent]; ok && !verbatimFileScopedAgent(agent) {
+		if t.isFileScoped(agent) &&
+			!verbatimFileScopedAgent(agent) && !snapshotFileScopedAgent(agent) {
 			if fileScoped.Dirs == nil {
 				fileScoped.Dirs = make(map[parser.AgentType][]string)
 			}
@@ -83,7 +188,7 @@ func (t TargetSet) SplitFileScoped() (dirScoped, fileScoped TargetSet) {
 	}
 	for agent, files := range t.Files {
 		target := &fileScoped
-		if verbatimFileScopedAgent(agent) {
+		if verbatimFileScopedAgent(agent) || snapshotFileScopedAgent(agent) {
 			target = &dirScoped
 		}
 		if target.Files == nil {
@@ -92,6 +197,17 @@ func (t TargetSet) SplitFileScoped() (dirScoped, fileScoped TargetSet) {
 		target.Files[agent] = files
 	}
 	dirScoped.ExtraFiles = t.ExtraFiles
+	for agent, files := range t.ProviderExtraFiles {
+		target := &dirScoped
+		if t.isFileScoped(agent) &&
+			!verbatimFileScopedAgent(agent) && !snapshotFileScopedAgent(agent) {
+			target = &fileScoped
+		}
+		if target.ProviderExtraFiles == nil {
+			target.ProviderExtraFiles = make(map[parser.AgentType][]string)
+		}
+		target.ProviderExtraFiles[agent] = files
+	}
 	return dirScoped, fileScoped
 }
 
@@ -105,12 +221,12 @@ func (t TargetSet) SplitFileScoped() (dirScoped, fileScoped TargetSet) {
 // retaining the TargetSet's agent ownership information.
 func (t TargetSet) DeltaAllowedRoots() []string {
 	forbidden := newForbiddenRootMatcher(t.ForbiddenRoots)
-	roots := make([]string, 0, len(t.Dirs)+len(t.Files)+len(t.ExtraFiles))
+	roots := make([]string, 0, len(t.Dirs)+len(t.Files)+len(t.AllExtraFiles()))
 	for agent, dirs := range t.Dirs {
 		if parser.RemoteSyncExcludedAgent(agent) {
 			continue
 		}
-		if _, fileScoped := t.Files[agent]; fileScoped {
+		if t.isFileScoped(agent) {
 			continue
 		}
 		for _, dir := range dirs {
@@ -123,7 +239,7 @@ func (t TargetSet) DeltaAllowedRoots() []string {
 		if parser.RemoteSyncExcludedAgent(agent) {
 			continue
 		}
-		if verbatimFileScopedAgent(agent) {
+		if verbatimFileScopedAgent(agent) || snapshotFileScopedAgent(agent) {
 			for _, file := range files {
 				if !forbidden.within(file) {
 					roots = append(roots, file)
@@ -131,7 +247,7 @@ func (t TargetSet) DeltaAllowedRoots() []string {
 			}
 		}
 	}
-	for _, file := range t.ExtraFiles {
+	for _, file := range t.AllExtraFiles() {
 		if !forbidden.within(file) {
 			roots = append(roots, file)
 		}
@@ -160,6 +276,9 @@ func (r ArchiveRequest) MarshalJSON() ([]byte, error) {
 	if len(r.ExtraFiles) > 0 {
 		out["extra_files"] = r.ExtraFiles
 	}
+	if len(r.ProviderExtraFiles) > 0 {
+		out["provider_extra_files"] = r.ProviderExtraFiles
+	}
 	if len(r.ForbiddenRoots) > 0 {
 		out["forbidden_roots"] = r.ForbiddenRoots
 	}
@@ -171,19 +290,21 @@ func (r ArchiveRequest) MarshalJSON() ([]byte, error) {
 
 func (r *ArchiveRequest) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		Dirs           map[parser.AgentType][]string `json:"dirs"`
-		Files          json.RawMessage               `json:"files"`
-		ExtraFiles     []string                      `json:"extra_files"`
-		ForbiddenRoots []string                      `json:"forbidden_roots"`
-		DeltaFiles     []string                      `json:"delta_files"`
+		Dirs               map[parser.AgentType][]string `json:"dirs"`
+		Files              jsontext.Value                `json:"files"`
+		ExtraFiles         []string                      `json:"extra_files"`
+		ProviderExtraFiles map[parser.AgentType][]string `json:"provider_extra_files"`
+		ForbiddenRoots     []string                      `json:"forbidden_roots"`
+		DeltaFiles         []string                      `json:"delta_files"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
 	r.TargetSet = TargetSet{
-		Dirs:           raw.Dirs,
-		ExtraFiles:     raw.ExtraFiles,
-		ForbiddenRoots: raw.ForbiddenRoots,
+		Dirs:               raw.Dirs,
+		ExtraFiles:         raw.ExtraFiles,
+		ProviderExtraFiles: raw.ProviderExtraFiles,
+		ForbiddenRoots:     raw.ForbiddenRoots,
 	}
 	r.DeltaFiles = raw.DeltaFiles
 	if len(raw.Files) == 0 {
@@ -207,9 +328,16 @@ func (r *ArchiveRequest) UnmarshalJSON(data []byte) error {
 }
 
 type Importer struct {
-	Host                    string
-	Full                    bool
-	DB                      *db.DB
-	BlockedResultCategories []string
-	Progress                syncpkg.ProgressFunc
+	Host                      string
+	Full                      bool
+	ForceFullParseAfterCache  bool
+	RequireComplete           bool
+	DB                        *db.DB
+	BlockedResultCategories   []string
+	Progress                  syncpkg.ProgressFunc
+	Targets                   TargetSet
+	Root                      string
+	replaceRemoteSkippedFiles func(string, map[string]int64) error
+	applyRemoteSkippedChanges func(string, []string, map[string]int64) error
+	saveSkipCache             func(*db.DB, *syncpkg.Engine, remotePathMap) error
 }
