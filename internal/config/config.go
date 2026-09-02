@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
+	jsonv1 "encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"maps"
 	"net"
@@ -25,6 +28,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/gofrs/flock"
 	"github.com/spf13/pflag"
+	"go.kenn.io/agentsview/internal/jsonutil"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/pathutil"
 )
@@ -113,9 +117,24 @@ type DuckDBConfig struct {
 	// preflight) may run before the client gives up, so an unresponsive
 	// endpoint fails fast instead of hanging forever. Zero selects the
 	// package default; a negative value disables the guard.
-	AttachTimeout   time.Duration `toml:"attach_timeout" json:"attach_timeout,omitempty"`
+	AttachTimeout   time.Duration `toml:"attach_timeout" json:"attach_timeout,omitzero"`
 	Projects        []string      `toml:"projects" json:"projects,omitempty"`
 	ExcludeProjects []string      `toml:"exclude_projects" json:"exclude_projects,omitempty"`
+}
+
+type duckDBConfigJSON DuckDBConfig
+
+func (c DuckDBConfig) MarshalJSONTo(out *jsontext.Encoder) error {
+	return jsonutil.MarshalDurationFields(out, duckDBConfigJSON(c))
+}
+
+func (c *DuckDBConfig) UnmarshalJSONFrom(in *jsontext.Decoder) error {
+	var decoded duckDBConfigJSON
+	if err := jsonutil.UnmarshalDurationFields(in, &decoded); err != nil {
+		return err
+	}
+	*c = DuckDBConfig(decoded)
+	return nil
 }
 
 // VectorConfig holds settings for the optional local semantic-search
@@ -142,9 +161,11 @@ type VectorConfig struct {
 // Model identity (model, dimension, request_dimensions, max_input_chars,
 // query_prefix, document_prefix, input_suffix) is deliberately global rather
 // than per-server: it joins the generation fingerprint, and query vectors are
-// only comparable to stored document vectors from the same space. Servers
-// differ only in transport and capacity, so a build run on any server produces
-// vectors every other server's queries can search.
+// only comparable to stored document vectors from the same space.
+// ModelContextTokens is also global because it describes the model, but only
+// controls conservative request batching and does not join the fingerprint.
+// Servers differ only in transport and capacity, so a build run on any server
+// produces vectors every other server's queries can search.
 type VectorEmbeddingsConfig struct {
 	Model     string `toml:"model" json:"model"`
 	Dimension int    `toml:"dimension" json:"dimension"`
@@ -160,6 +181,11 @@ type VectorEmbeddingsConfig struct {
 	// MaxInputChars caps the rune length of each chunk sent for
 	// embedding. Default 8192.
 	MaxInputChars int `toml:"max_input_chars" json:"max_input_chars"`
+	// ModelContextTokens is the maximum tokens the model accepts for one
+	// input. When a server sets MaxBatchTokens, builds conservatively charge
+	// this full amount for every input while composing request batches.
+	// Zero leaves token-budget batching disabled. Default 0.
+	ModelContextTokens int `toml:"model_context_tokens" json:"model_context_tokens,omitempty"`
 	// QueryPrefix is prepended verbatim to search queries before embedding.
 	// It allows instruction-tuned models to distinguish queries from indexed
 	// documents. Changing it cuts a new vector generation. Default empty.
@@ -196,6 +222,10 @@ type VectorEmbeddingsServerConfig struct {
 	APIKeyEnv string `toml:"api_key_env" json:"api_key_env,omitempty"`
 	// BatchSize is the number of inputs sent per HTTP call. Default 32.
 	BatchSize int `toml:"batch_size" json:"batch_size"`
+	// MaxBatchTokens is the provider's maximum total input tokens per HTTP
+	// call. When set with ModelContextTokens, builds reduce BatchSize so the
+	// worst-case request remains within this cap. Zero disables the cap.
+	MaxBatchTokens int `toml:"max_batch_tokens" json:"max_batch_tokens,omitempty"`
 	// Concurrency is the number of documents embedded in parallel during a
 	// build against this server. Sequential requests leave a build
 	// round-trip-bound against remote endpoints, so the default is 4;
@@ -204,8 +234,11 @@ type VectorEmbeddingsServerConfig struct {
 	// Timeout is a parseable duration string applied to each HTTP
 	// call. Default "30s".
 	Timeout string `toml:"timeout" json:"timeout"`
-	// MaxRetries is the maximum total attempts on 429/5xx/network errors
-	// (4xx fails fast); 0 means one attempt. Default 3.
+	// MaxRetries is the maximum total attempts on retryable errors other than
+	// document-build 429 rate limits, which retry until success or
+	// cancellation instead of consuming this budget (see
+	// vector.EncoderConfig.RetryRateLimits). Other 4xx responses fail fast;
+	// 0 means one attempt. Default 3.
 	MaxRetries int `toml:"max_retries" json:"max_retries"`
 }
 
@@ -309,6 +342,11 @@ func (c VectorConfig) Validate() error {
 			"[vector.embeddings] max_input_chars must be greater than 0, got %d",
 			c.Embeddings.MaxInputChars)
 	}
+	if c.Embeddings.ModelContextTokens < 0 {
+		return fmt.Errorf(
+			"[vector.embeddings] model_context_tokens must not be negative, got %d",
+			c.Embeddings.ModelContextTokens)
+	}
 	if err := c.Embeddings.validateServers(); err != nil {
 		return err
 	}
@@ -362,7 +400,7 @@ func (c VectorEmbeddingsConfig) validateServers() error {
 		}
 	}
 	for _, name := range sortedServerNames(c.Servers) {
-		if err := c.Servers[name].validate(name); err != nil {
+		if err := c.Servers[name].validate(name, c.ModelContextTokens); err != nil {
 			return err
 		}
 	}
@@ -370,7 +408,7 @@ func (c VectorEmbeddingsConfig) validateServers() error {
 }
 
 // validate checks one named server's transport settings.
-func (c VectorEmbeddingsServerConfig) validate(name string) error {
+func (c VectorEmbeddingsServerConfig) validate(name string, modelContextTokens int) error {
 	section := fmt.Sprintf("[vector.embeddings.servers.%s]", name)
 	if c.Endpoint == "" {
 		return fmt.Errorf("%s endpoint is required", section)
@@ -390,6 +428,19 @@ func (c VectorEmbeddingsServerConfig) validate(name string) error {
 	}
 	if c.BatchSize <= 0 {
 		return fmt.Errorf("%s batch_size must be greater than 0, got %d", section, c.BatchSize)
+	}
+	if c.MaxBatchTokens < 0 {
+		return fmt.Errorf(
+			"%s max_batch_tokens must not be negative, got %d", section, c.MaxBatchTokens)
+	}
+	if c.MaxBatchTokens > 0 && modelContextTokens <= 0 {
+		return fmt.Errorf(
+			"%s max_batch_tokens requires [vector.embeddings] model_context_tokens", section)
+	}
+	if c.MaxBatchTokens > 0 && c.MaxBatchTokens < modelContextTokens {
+		return fmt.Errorf(
+			"%s max_batch_tokens (%d) must be at least model_context_tokens (%d)",
+			section, c.MaxBatchTokens, modelContextTokens)
 	}
 	if c.Concurrency <= 0 {
 		return fmt.Errorf("%s concurrency must be greater than 0, got %d", section, c.Concurrency)
@@ -480,7 +531,40 @@ type CustomModelRate struct {
 	InputMicrodollarsPerMTok         int64 `json:"input_microdollars_per_mtok" toml:"input_microdollars_per_mtok"`
 	OutputMicrodollarsPerMTok        int64 `json:"output_microdollars_per_mtok" toml:"output_microdollars_per_mtok"`
 	CacheCreationMicrodollarsPerMTok int64 `json:"cache_creation_microdollars_per_mtok,omitempty" toml:"cache_creation_microdollars_per_mtok"`
-	CacheReadMicrodollarsPerMTok     int64 `json:"cache_read_microdollars_per_mtok,omitempty" toml:"cache_read_microdollars_per_mtok"`
+	// Zero means no separate 1h rate: 1h-TTL cache writes then bill at
+	// cache_creation_microdollars_per_mtok.
+	CacheCreation1hMicrodollarsPerMTok int64 `json:"cache_creation_1h_microdollars_per_mtok,omitempty" toml:"cache_creation_1h_microdollars_per_mtok"`
+	CacheReadMicrodollarsPerMTok       int64 `json:"cache_read_microdollars_per_mtok,omitempty" toml:"cache_read_microdollars_per_mtok"`
+}
+
+func decodeCustomModelPricing(data string) (map[string]CustomModelRate, error) {
+	var decoded struct {
+		CustomModelPricing map[string]CustomModelRate `toml:"custom_model_pricing"`
+	}
+	metadata, err := toml.Decode(data, &decoded)
+	if err != nil {
+		return nil, fmt.Errorf("parsing config: %w", err)
+	}
+	for _, key := range metadata.Undecoded() {
+		if len(key) != 3 || key[0] != "custom_model_pricing" {
+			continue
+		}
+		return nil, fmt.Errorf(
+			"%s: unsupported pricing field; use input_microdollars_per_mtok, output_microdollars_per_mtok, cache_creation_microdollars_per_mtok, cache_creation_1h_microdollars_per_mtok, or cache_read_microdollars_per_mtok",
+			key.String(),
+		)
+	}
+	for model, rate := range decoded.CustomModelPricing {
+		if rate.InputMicrodollarsPerMTok < 0 ||
+			rate.OutputMicrodollarsPerMTok < 0 ||
+			rate.CacheCreationMicrodollarsPerMTok < 0 ||
+			rate.CacheCreation1hMicrodollarsPerMTok < 0 ||
+			rate.CacheReadMicrodollarsPerMTok < 0 {
+			return nil, fmt.Errorf(
+				"custom_model_pricing.%s: rates must not be negative", model)
+		}
+	}
+	return decoded.CustomModelPricing, nil
 }
 
 type RemoteTransport string
@@ -522,10 +606,25 @@ type RemoteHost struct {
 	Host      string          `toml:"host" json:"host"`
 	Transport RemoteTransport `toml:"transport,omitempty" json:"transport,omitempty"`
 	User      string          `toml:"user,omitempty" json:"user,omitempty"`
-	Port      int             `toml:"port,omitempty" json:"port,omitempty"`
+	Port      int             `toml:"port,omitempty" json:"port,omitzero"`
 	URL       string          `toml:"url,omitempty" json:"url,omitempty"`
 	Token     string          `toml:"token,omitempty" json:"-"`
-	Interval  time.Duration   `toml:"interval,omitempty" json:"interval,omitempty"`
+	Interval  time.Duration   `toml:"interval,omitempty" json:"interval,omitzero"`
+}
+
+type remoteHostJSON RemoteHost
+
+func (h RemoteHost) MarshalJSONTo(out *jsontext.Encoder) error {
+	return jsonutil.MarshalDurationFields(out, remoteHostJSON(h))
+}
+
+func (h *RemoteHost) UnmarshalJSONFrom(in *jsontext.Decoder) error {
+	var decoded remoteHostJSON
+	if err := jsonutil.UnmarshalDurationFields(in, &decoded); err != nil {
+		return err
+	}
+	*h = RemoteHost(decoded)
+	return nil
 }
 
 // SessionSource adds one agent session root with optional machine attribution.
@@ -622,9 +721,9 @@ type Config struct {
 	// arrive within this window after a prior broadcast are coalesced
 	// into a single trailing broadcast, bounding dashboard refetch
 	// work during bursts of sync activity. Zero disables coalescing.
-	EventsCoalesceInterval time.Duration `json:"events_coalesce_interval,omitempty" toml:"events_coalesce_interval"`
+	EventsCoalesceInterval time.Duration `json:"events_coalesce_interval,omitzero" toml:"events_coalesce_interval"`
 
-	DaemonIdleTimeout time.Duration `json:"daemon_idle_timeout,omitempty" toml:"daemon_idle_timeout"`
+	DaemonIdleTimeout time.Duration `json:"daemon_idle_timeout,omitzero" toml:"daemon_idle_timeout"`
 
 	CustomModelPricing map[string]CustomModelRate `json:"custom_model_pricing,omitempty" toml:"custom_model_pricing"`
 
@@ -640,6 +739,21 @@ type Config struct {
 	HostExplicit bool `json:"-" toml:"-"`
 
 	pgEnvOverrides pgEnvOverrides
+}
+
+type configJSON Config
+
+func (c Config) MarshalJSONTo(out *jsontext.Encoder) error {
+	return jsonutil.MarshalDurationFields(out, configJSON(c))
+}
+
+func (c *Config) UnmarshalJSONFrom(in *jsontext.Decoder) error {
+	var decoded configJSON
+	if err := jsonutil.UnmarshalDurationFields(in, &decoded); err != nil {
+		return err
+	}
+	*c = Config(decoded)
+	return nil
 }
 
 func (c Config) ResolvedChartPalette() ChartPalette {
@@ -1163,67 +1277,110 @@ func (c *Config) loadLegacyJSONReadOnly() error {
 		return fmt.Errorf("reading config.json: %w", err)
 	}
 
-	var m map[string]any
-	if err := json.Unmarshal(data, &m); err != nil {
-		return fmt.Errorf("parsing config.json: %w", err)
+	converted, err := legacyJSONToTOML(data)
+	if err != nil {
+		return err
 	}
+	return c.applyConfigTOML(converted)
+}
+
+func legacyJSONToTOML(data []byte) (string, error) {
+	var m map[string]any
+	decoder := jsonv1.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&m); err != nil {
+		return "", fmt.Errorf("parsing config.json: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
+		return "", fmt.Errorf("parsing config.json: %w", err)
+	}
+	normalized, err := normalizeLegacyJSONNumbers(m)
+	if err != nil {
+		return "", fmt.Errorf("parsing config.json: %w", err)
+	}
+	m = normalized.(map[string]any)
 
 	var buf bytes.Buffer
 	if err := toml.NewEncoder(&buf).Encode(m); err != nil {
-		return fmt.Errorf("encoding config.json: %w", err)
+		return "", fmt.Errorf("encoding config.json: %w", err)
 	}
-	return c.applyConfigTOML(buf.String())
+	return buf.String(), nil
+}
+
+func normalizeLegacyJSONNumbers(value any) (any, error) {
+	switch typed := value.(type) {
+	case jsonv1.Number:
+		if strings.ContainsAny(typed.String(), ".eE") {
+			return typed.Float64()
+		}
+		return typed.Int64()
+	case map[string]any:
+		for key, child := range typed {
+			normalized, err := normalizeLegacyJSONNumbers(child)
+			if err != nil {
+				return nil, err
+			}
+			typed[key] = normalized
+		}
+	case []any:
+		for index, child := range typed {
+			normalized, err := normalizeLegacyJSONNumbers(child)
+			if err != nil {
+				return nil, err
+			}
+			typed[index] = normalized
+		}
+	}
+	return value, nil
 }
 
 func (c *Config) applyConfigTOML(data string) error {
 	var file struct {
-		GithubToken                    string                     `toml:"github_token"`
-		CursorSecret                   string                     `toml:"cursor_secret"`
-		CursorAdminAPIKey              string                     `toml:"cursor_admin_api_key"`
-		CursorAdminEmail               string                     `toml:"cursor_admin_email"`
-		CursorAdminUserID              string                     `toml:"cursor_admin_user_id"`
-		Host                           string                     `toml:"host"`
-		Port                           int                        `toml:"port"`
-		ChartPalette                   ChartPalette               `toml:"chart_palette"`
-		PublicURL                      string                     `toml:"public_url"`
-		PublicOrigins                  []string                   `toml:"public_origins"`
-		Proxy                          ProxyConfig                `toml:"proxy"`
-		WatchExcludePatterns           []string                   `toml:"watch_exclude_patterns"`
-		DisabledAgents                 []string                   `toml:"disabled_agents"`
-		SyncIncludeCwdPrefixes         []string                   `toml:"sync_include_cwd_prefixes"`
-		ScanProtectedPaths             bool                       `toml:"scan_protected_paths"`
-		ResultContentBlockedCategories []string                   `toml:"result_content_blocked_categories"`
-		Terminal                       TerminalConfig             `toml:"terminal"`
-		AuthToken                      string                     `toml:"auth_token"`
-		RequireAuth                    bool                       `toml:"require_auth"`
-		RemoteAccess                   bool                       `toml:"remote_access"`
-		DisableUpdateCheck             bool                       `toml:"disable_update_check"`
-		DefaultPG                      string                     `toml:"default_pg"`
-		PG                             PGConfig                   `toml:"pg"`
-		DuckDB                         DuckDBConfig               `toml:"duckdb"`
-		Vector                         VectorConfig               `toml:"vector"`
-		Recall                         RecallConfig               `toml:"recall"`
-		Insights                       InsightsConfig             `toml:"insights"`
-		Automated                      AutomatedConfig            `toml:"automated"`
-		Agent                          map[string]AgentConfig     `toml:"agent"`
-		EventsCoalesceInterval         time.Duration              `toml:"events_coalesce_interval"`
-		DaemonIdleTimeout              time.Duration              `toml:"daemon_idle_timeout"`
-		CustomModelPricing             map[string]CustomModelRate `toml:"custom_model_pricing"`
-		RemoteHosts                    []RemoteHost               `toml:"remote_hosts"`
-		SessionSources                 []sessionSourceConfig      `toml:"session_sources"`
+		GithubToken                    string                 `toml:"github_token"`
+		CursorSecret                   string                 `toml:"cursor_secret"`
+		CursorAdminAPIKey              string                 `toml:"cursor_admin_api_key"`
+		CursorAdminEmail               string                 `toml:"cursor_admin_email"`
+		CursorAdminUserID              string                 `toml:"cursor_admin_user_id"`
+		Host                           string                 `toml:"host"`
+		Port                           int                    `toml:"port"`
+		ChartPalette                   ChartPalette           `toml:"chart_palette"`
+		PublicURL                      string                 `toml:"public_url"`
+		PublicOrigins                  []string               `toml:"public_origins"`
+		Proxy                          ProxyConfig            `toml:"proxy"`
+		WatchExcludePatterns           []string               `toml:"watch_exclude_patterns"`
+		DisabledAgents                 []string               `toml:"disabled_agents"`
+		SyncIncludeCwdPrefixes         []string               `toml:"sync_include_cwd_prefixes"`
+		ScanProtectedPaths             bool                   `toml:"scan_protected_paths"`
+		ResultContentBlockedCategories []string               `toml:"result_content_blocked_categories"`
+		Terminal                       TerminalConfig         `toml:"terminal"`
+		AuthToken                      string                 `toml:"auth_token"`
+		RequireAuth                    bool                   `toml:"require_auth"`
+		RemoteAccess                   bool                   `toml:"remote_access"`
+		DisableUpdateCheck             bool                   `toml:"disable_update_check"`
+		DefaultPG                      string                 `toml:"default_pg"`
+		PG                             PGConfig               `toml:"pg"`
+		DuckDB                         DuckDBConfig           `toml:"duckdb"`
+		Vector                         VectorConfig           `toml:"vector"`
+		Recall                         RecallConfig           `toml:"recall"`
+		Insights                       InsightsConfig         `toml:"insights"`
+		Automated                      AutomatedConfig        `toml:"automated"`
+		Agent                          map[string]AgentConfig `toml:"agent"`
+		EventsCoalesceInterval         time.Duration          `toml:"events_coalesce_interval"`
+		DaemonIdleTimeout              time.Duration          `toml:"daemon_idle_timeout"`
+		RemoteHosts                    []RemoteHost           `toml:"remote_hosts"`
+		SessionSources                 []sessionSourceConfig  `toml:"session_sources"`
 	}
 	meta, err := toml.Decode(data, &file)
 	if err != nil {
 		return fmt.Errorf("parsing config: %w", err)
 	}
-	for _, key := range meta.Undecoded() {
-		if len(key) != 3 || key[0] != "custom_model_pricing" {
-			continue
-		}
-		return fmt.Errorf(
-			"%s: unsupported pricing field; use input_microdollars_per_mtok, output_microdollars_per_mtok, cache_creation_microdollars_per_mtok, or cache_read_microdollars_per_mtok",
-			key.String(),
-		)
+	customModelPricing, err := decodeCustomModelPricing(data)
+	if err != nil {
+		return err
 	}
 	var raw map[string]any
 	if _, err := toml.Decode(data, &raw); err != nil {
@@ -1380,6 +1537,9 @@ func (c *Config) applyConfigTOML(data string) error {
 	if meta.IsDefined("vector", "embeddings", "max_input_chars") {
 		c.Vector.Embeddings.MaxInputChars = file.Vector.Embeddings.MaxInputChars
 	}
+	if meta.IsDefined("vector", "embeddings", "model_context_tokens") {
+		c.Vector.Embeddings.ModelContextTokens = file.Vector.Embeddings.ModelContextTokens
+	}
 	if meta.IsDefined("vector", "embeddings", "query_prefix") {
 		c.Vector.Embeddings.QueryPrefix = file.Vector.Embeddings.QueryPrefix
 	}
@@ -1442,16 +1602,8 @@ func (c *Config) applyConfigTOML(data string) error {
 			c.Agent[name] = cfg
 		}
 	}
-	if len(file.CustomModelPricing) > 0 {
-		for model, rate := range file.CustomModelPricing {
-			if rate.InputMicrodollarsPerMTok < 0 ||
-				rate.OutputMicrodollarsPerMTok < 0 ||
-				rate.CacheCreationMicrodollarsPerMTok < 0 ||
-				rate.CacheReadMicrodollarsPerMTok < 0 {
-				return fmt.Errorf("custom_model_pricing.%s: rates must not be negative", model)
-			}
-		}
-		c.CustomModelPricing = file.CustomModelPricing
+	if len(customModelPricing) > 0 {
+		c.CustomModelPricing = customModelPricing
 	}
 	if len(file.RemoteHosts) > 0 {
 		hosts := make([]RemoteHost, len(file.RemoteHosts))

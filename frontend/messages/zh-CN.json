@@ -984,7 +984,7 @@
   "activity_int_auto_short": "{int} 交互 / {auto} 自动",
   "activity_peak_label": "峰值 {count}",
   "activity_agent_min_value": "{value} 代理分钟",
-  "activity_no_sessions_selected_slot": "所选时段内没有活跃会话。",
+  "activity_no_sessions_selected_range": "所选时间范围内没有活跃会话。",
   "activity_output_tokens_value": [
     {
       "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
@@ -999,7 +999,7 @@
   "activity_overlay_metric": "并发叠加指标",
   "activity_overlay_none": "无",
   "activity_tokens": "Token",
-  "activity_filter_active_in_slot": "筛选此时间段内活跃的会话",
+  "activity_filter_active_in_range": "筛选此时间范围内活跃的会话",
   "activity_mixed": "混合",
   "activity_window": "时间窗",
   "activity_sessions": "会话",
@@ -1261,6 +1261,7 @@
   "session_vitals_title": "分析",
   "session_vitals_subtitle": "会话指标",
   "session_vitals_close": "关闭会话分析",
+  "session_vitals_resize": "调整会话分析面板大小",
   "session_vitals_session": "会话",
   "session_vitals_repository": "存储库",
   "session_vitals_worktree": "工作树",

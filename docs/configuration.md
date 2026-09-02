@@ -18,12 +18,18 @@ AgentsView stores all persistent data under a single directory, defaulting to
 ~/.agentsview/
 ├── sessions.db      # SQLite database (WAL mode)
 ├── vectors.db       # Semantic-search vector index (when [vector] is enabled)
+├── usage-cache-v6-<id>.db # Disposable usage-aggregate cache
 ├── config.toml      # Configuration file
 ├── config.toml.lock # Serializes concurrent config writers
 ├── db.write.lock    # Per-data-dir SQLite write-owner lock
 ├── serve.log        # Detached daemon log
 └── uploads/         # Uploaded session files
 ```
+
+`usage-cache-v6-<id>.db` is a derived cache of usage aggregates, not user
+data. It is safe to delete when no AgentsView process is running; the next
+usage query rebuilds it automatically. `sessions.db` remains the only file
+that needs backing up.
 
 The desktop app and CLI share a detached local daemon for fresh reads and
 writes. A running daemon owns local SQLite writes for this data directory and
@@ -290,7 +296,7 @@ Omitting the key keeps its default directories.
 | Posit Assistant       | `~/.posit/assistant/workspaces/`                                                 | Per-conversation `conversation.json` tree plus `lm-messages.jsonl` transcript                                                   |
 | Positron Assistant    | (platform-specific, see below)                                                   | JSON / JSONL per session                                                                                                        |
 | QClaw                 | `~/.qclaw/assets/static/agents/`                                                 | JSONL per session                                                                                                               |
-| Qoder                 | Legacy export roots plus platform-specific `SharedClientCache` (see below)       | JSONL project transcripts plus sidecar metadata                                                                                 |
+| Qoder                 | Legacy export roots, Qoder CLI CN, plus platform-specific `SharedClientCache` (see below) | JSONL project transcripts plus sidecar metadata                                                                                 |
 | Qwen Code             | `~/.qwen/projects/`                                                              | JSONL per session                                                                                                               |
 | QwenPaw               | `~/.copaw/workspaces/`                                                           | JSON session files                                                                                                              |
 | Reasonix              | `~/.reasonix/` and `~/AppData/Roaming/reasonix/`                                 | JSONL sessions plus `.jsonl.meta` sidecars                                                                                      |
@@ -320,7 +326,10 @@ session store, so open the current Prime Agent once before syncing a legacy
 archive with AgentsView.
 
 **Qoder default directories** include the legacy `~/.qoder/projects/` and
-`~/.qoderwork/projects/` export roots plus the current IDE store:
+`~/.qoderwork/projects/` export roots, the Qoder CLI CN store, and the current
+IDE store:
+
+- **Qoder CLI CN:** `~/.qoder-cn/projects/`
 
 - **macOS:**
   `~/Library/Application Support/Qoder/SharedClientCache/cli/projects/`
@@ -803,9 +812,10 @@ PostgreSQL.
 
 ### S3-Compatible Session Sources
 
-Claude and Codex session roots can also be `s3://` URIs. This is useful when
-several machines push their raw session files to object storage and one central
-AgentsView instance reads them without SSH access to those machines.
+Claude, Codex, and Cursor session roots can also be `s3://` URIs. This is
+useful when several machines push their raw session files to object storage
+and one central AgentsView instance reads them without SSH access to those
+machines.
 
 ```toml
 claude_project_dirs = [
@@ -817,11 +827,16 @@ codex_sessions_dirs = [
   "~/.codex/sessions",
   "s3://agent-archive/laptop/raw/codex",
 ]
+
+cursor_project_dirs = [
+  "~/.cursor/projects",
+  "s3://agent-archive/laptop/raw/cursor",
+]
 ```
 
 S3 sources are read-only inputs to the normal local sync. AgentsView lists
 matching objects, fetches each changed object to a temporary file, parses it
-with the existing Claude/Codex parser, records the original `s3://` URI as
+with the existing per-agent parser, records the original `s3://` URI as
 `file_path`, and removes the temporary file. No persistent local mirror is
 created.
 
@@ -848,6 +863,7 @@ Expected object layouts:
 s3://bucket/.../<machine>/raw/claude/<project>/<uuid>.jsonl
 s3://bucket/.../<machine>/raw/claude/<project>/subagents/.../agent-*.jsonl
 s3://bucket/.../<machine>/raw/codex/2026/06/24/rollout-*.jsonl
+s3://bucket/.../<machine>/raw/cursor/<project>/<uuid>.jsonl
 ```
 
 The machine name is derived from the path segment immediately before `raw`. If
@@ -1022,7 +1038,7 @@ autonomous run whose last persisted prompt is outside either bound, that rollout
 uses native-watcher freshness until another persisted prompt makes it hot
 again.
 
-For `s3://` Claude and Codex roots, change detection uses object size,
+For `s3://` Claude, Codex, and Cursor roots, change detection uses object size,
 `LastModified`, and available object fingerprints such as ETag, version ID, and
 checksums from listing or stat calls. Object content is downloaded only after
 that metadata shows a parse may be needed.

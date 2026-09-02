@@ -6,7 +6,8 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"log"
@@ -19,18 +20,20 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/jsonutil"
 )
 
 const (
-	lastPushBoundaryStateKey           = "last_push_boundary_state"
-	lastPushSourceArchiveIDKey         = "pg_source_archive_id_v1"
-	lastPushTargetFingerprintKey       = "pg_target_fingerprint_v1"
-	sessionAliasBackfillStateKey       = "pg_session_alias_backfill_v1"
-	legacyProjectIdentityStateKey      = "project_identity_publication_revision_v2"
-	projectIdentityPublicationStateKey = "project_identity_publication_revision_v3"
-	transcriptRevisionBackfillStateKey = "pg_transcript_revision_backfill_v1"
-	sessionProvenanceBackfillStateKey  = "pg_session_provenance_backfill_v2"
-	unfilteredPublicationScope         = "all-projects"
+	lastPushBoundaryStateKey               = "last_push_boundary_state"
+	lastPushSourceArchiveIDKey             = "pg_source_archive_id_v1"
+	lastPushTargetFingerprintKey           = "pg_target_fingerprint_v1"
+	sessionAliasBackfillStateKey           = "pg_session_alias_backfill_v1"
+	legacyProjectIdentityStateKey          = "project_identity_publication_revision_v2"
+	projectIdentityPublicationStateKey     = "project_identity_publication_revision_v3"
+	transcriptRevisionBackfillStateKey     = "pg_transcript_revision_backfill_v1"
+	sessionProvenanceBackfillStateKey      = "pg_session_provenance_backfill_v2"
+	timestampNormalizationBackfillStateKey = "pg_timestamp_normalization_backfill_v1"
+	unfilteredPublicationScope             = "all-projects"
 )
 
 // pushMarkerIDStateKey names the local sync-state entry holding this DB's
@@ -58,6 +61,21 @@ type PushResult struct {
 	Errors           int
 	Duration         time.Duration
 	Vectors          VectorPushResult
+}
+
+type pushResultJSON PushResult
+
+func (r PushResult) MarshalJSONTo(out *jsontext.Encoder) error {
+	return jsonutil.MarshalDurationFields(out, pushResultJSON(r))
+}
+
+func (r *PushResult) UnmarshalJSONFrom(in *jsontext.Decoder) error {
+	var decoded pushResultJSON
+	if err := jsonutil.UnmarshalDurationFields(in, &decoded); err != nil {
+		return err
+	}
+	*r = PushResult(decoded)
+	return nil
 }
 
 // pushPrepareProgressStride bounds how many sessions the fingerprint loop
@@ -289,6 +307,17 @@ func (s *Sync) PushWithOptions(
 	if transcriptRevisionBackfillNeeded {
 		log.Printf(
 			"pgsync: transcript revision backfill marker missing; forcing full push",
+		)
+	}
+	timestampNormalizationBackfillNeeded := false
+	full, timestampNormalizationBackfillNeeded, err =
+		applyTimestampNormalizationBackfillRequirement(state, full)
+	if err != nil {
+		return result, err
+	}
+	if timestampNormalizationBackfillNeeded {
+		log.Printf(
+			"pgsync: timestamp normalization backfill marker missing; forcing full push",
 		)
 	}
 	if full {
@@ -561,6 +590,11 @@ func (s *Sync) PushWithOptions(
 		); err != nil {
 			return result, err
 		}
+		if err := completeTimestampNormalizationBackfill(
+			state, timestampNormalizationBackfillNeeded, result,
+		); err != nil {
+			return result, err
+		}
 		if err := s.syncProjectIdentityObservations(
 			ctx, full, identityRefreshSessionIDs,
 		); err != nil {
@@ -688,6 +722,11 @@ func (s *Sync) PushWithOptions(
 	}
 	if err := completeTranscriptRevisionBackfill(
 		state, transcriptRevisionBackfillNeeded, result,
+	); err != nil {
+		return result, err
+	}
+	if err := completeTimestampNormalizationBackfill(
+		state, timestampNormalizationBackfillNeeded, result,
 	); err != nil {
 		return result, err
 	}
@@ -1674,6 +1713,35 @@ func completeTranscriptRevisionBackfill(
 	return markTranscriptRevisionBackfillDone(local)
 }
 
+func applyTimestampNormalizationBackfillRequirement(
+	local syncStateStore, full bool,
+) (bool, bool, error) {
+	done, err := local.GetSyncState(timestampNormalizationBackfillStateKey)
+	if err != nil {
+		return full, false, fmt.Errorf(
+			"reading %s: %w", timestampNormalizationBackfillStateKey, err,
+		)
+	}
+	if done == "1" {
+		return full, false, nil
+	}
+	return true, true, nil
+}
+
+func completeTimestampNormalizationBackfill(
+	local syncStateStore, needed bool, result PushResult,
+) error {
+	if !needed || result.Errors > 0 {
+		return nil
+	}
+	if err := local.SetSyncState(timestampNormalizationBackfillStateKey, "1"); err != nil {
+		return fmt.Errorf(
+			"updating %s: %w", timestampNormalizationBackfillStateKey, err,
+		)
+	}
+	return nil
+}
+
 func persistPushTargetFingerprint(
 	local syncStateStore,
 	fingerprint string,
@@ -2174,17 +2242,17 @@ func nilStr(s *string) any {
 	return v
 }
 
-// nilStrTS converts a nil or empty *string timestamp to a
-// *time.Time for PG TIMESTAMPTZ columns.
-func nilStrTS(s *string) any {
-	if s == nil || *s == "" {
-		return nil
+// optionalSQLiteTimestamp converts an empty SQLite timestamp to SQL NULL and
+// rejects non-empty values that would otherwise be silently mirrored as NULL.
+func optionalSQLiteTimestamp(value string) (any, error) {
+	if value == "" {
+		return nil, nil
 	}
-	t, ok := ParseSQLiteTimestamp(*s)
+	t, ok := ParseSQLiteTimestamp(value)
 	if !ok {
-		return nil
+		return nil, fmt.Errorf("invalid SQLite timestamp %q", value)
 	}
-	return t
+	return t, nil
 }
 
 // pushSession upserts a single session into PG.
@@ -2195,7 +2263,25 @@ func (s *Sync) pushSession(
 	ctx context.Context, tx *sql.Tx, sess db.Session, markerID string,
 	legacyMarkerMachines []string,
 ) error {
-	createdAt, _ := ParseSQLiteTimestamp(sess.CreatedAt)
+	createdAt, ok := ParseSQLiteTimestamp(sess.CreatedAt)
+	if !ok {
+		return fmt.Errorf(
+			"parsing session %s created_at: invalid SQLite timestamp %q",
+			sess.ID, sess.CreatedAt,
+		)
+	}
+	startedAt, err := optionalSQLiteTimestamp(stringValue(sess.StartedAt))
+	if err != nil {
+		return fmt.Errorf("parsing session %s started_at: %w", sess.ID, err)
+	}
+	endedAt, err := optionalSQLiteTimestamp(stringValue(sess.EndedAt))
+	if err != nil {
+		return fmt.Errorf("parsing session %s ended_at: %w", sess.ID, err)
+	}
+	deletedAt, err := optionalSQLiteTimestamp(stringValue(sess.DeletedAt))
+	if err != nil {
+		return fmt.Errorf("parsing session %s deleted_at: %w", sess.ID, err)
+	}
 	isAutomated := sess.IsAutomated
 	pushedMachine := pushedSessionMachine(sess, s.machine)
 	var existingMachine sql.NullString
@@ -2449,10 +2535,10 @@ func (s *Sync) pushSession(
 		nilStr(sess.DisplayName),
 		nilStr(sess.SessionName),
 		createdAt,
-		nilStrTS(sess.StartedAt),
-		nilStrTS(sess.EndedAt),
-		nilStrTS(sess.DeletedAt),
-		nilStrTS(sess.DeletedAt),
+		startedAt,
+		endedAt,
+		deletedAt,
+		deletedAt,
 		nilStr(sess.DeletionCause),
 		sess.MessageCount, sess.UserMessageCount,
 		sess.TotalOutputTokens, sess.PeakContextTokens,
@@ -3340,7 +3426,7 @@ func pgMessageTokenFingerprint(
 	ctx context.Context, tx *sql.Tx, sessionID string,
 ) (string, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT ordinal, model, token_usage, context_tokens,
+		`SELECT ordinal, model, provider_id, token_usage, context_tokens,
 			output_tokens, has_context_tokens, has_output_tokens,
 			claude_message_id, claude_request_id,
 			source_type, source_subtype, prompt_source, source_uuid,
@@ -3358,13 +3444,13 @@ func pgMessageTokenFingerprint(
 	var b strings.Builder
 	for rows.Next() {
 		var ordinal, contextTokens, outputTokens int
-		var model, tokenUsage string
+		var model, providerID, tokenUsage string
 		var hasContextTokens, hasOutputTokens bool
 		var claudeMsgID, claudeReqID string
 		var srcType, srcSubtype, promptSource, srcUUID, srcParentUUID string
 		var isSidechain, isCompactBoundary bool
 		if err := rows.Scan(
-			&ordinal, &model, &tokenUsage, &contextTokens,
+			&ordinal, &model, &providerID, &tokenUsage, &contextTokens,
 			&outputTokens, &hasContextTokens, &hasOutputTokens,
 			&claudeMsgID, &claudeReqID,
 			&srcType, &srcSubtype, &promptSource, &srcUUID, &srcParentUUID,
@@ -3373,10 +3459,11 @@ func pgMessageTokenFingerprint(
 			return "", err
 		}
 		fmt.Fprintf(&b,
-			"%d|%d:%s|%d:%s|%d|%d|%t|%t|%s|%s|"+
+			"%d|%d:%s|%d:%s|%d:%s|%d|%d|%t|%t|%s|%s|"+
 				"%d:%s|%d:%s|%d:%s|%d:%s|%d:%s|%t|%t;",
 			ordinal,
 			len(model), model,
+			len(providerID), providerID,
 			len(tokenUsage), tokenUsage,
 			contextTokens, outputTokens,
 			hasContextTokens, hasOutputTokens,
@@ -3564,7 +3651,7 @@ func pgUsageEventFingerprint(
 	ctx context.Context, tx *sql.Tx, sessionID string,
 ) (string, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT message_ordinal, source, model,
+		`SELECT message_ordinal, source, model, provider_id,
 			input_tokens, output_tokens,
 			cache_creation_input_tokens, cache_read_input_tokens,
 			reasoning_tokens, cost_microdollars, cost_status, cost_source,
@@ -3582,7 +3669,7 @@ func pgUsageEventFingerprint(
 	var b strings.Builder
 	for rows.Next() {
 		var ordinal sql.NullInt64
-		var source, model, costStatus, costSource string
+		var source, model, providerID, costStatus, costSource string
 		var inputTokens, outputTokens int
 		var cacheCreationInputTokens, cacheReadInputTokens int
 		var reasoningTokens int
@@ -3590,7 +3677,7 @@ func pgUsageEventFingerprint(
 		var occurredAt sql.NullTime
 		var dedupKey sql.NullString
 		if err := rows.Scan(
-			&ordinal, &source, &model,
+			&ordinal, &source, &model, &providerID,
 			&inputTokens, &outputTokens,
 			&cacheCreationInputTokens, &cacheReadInputTokens,
 			&reasoningTokens, &cost, &costStatus, &costSource,
@@ -3603,11 +3690,12 @@ func pgUsageEventFingerprint(
 			occurred = FormatISO8601(occurredAt.Time)
 		}
 		fmt.Fprintf(&b,
-			"%t|%d|%d:%s|%d:%s|%d|%d|%d|%d|%d|%t|%d|%d:%s|%d:%s|%d:%s|%d:%s;",
+			"%t|%d|%d:%s|%d:%s|%d:%s|%d|%d|%d|%d|%d|%t|%d|%d:%s|%d:%s|%d:%s|%d:%s;",
 			ordinal.Valid,
 			ordinal.Int64,
 			len(source), source,
 			len(model), model,
+			len(providerID), providerID,
 			inputTokens,
 			outputTokens,
 			cacheCreationInputTokens,
@@ -3641,32 +3729,32 @@ func bulkInsertMessages(
 			timestamp, has_thinking, has_tool_use,
 			content_length, is_system, model, token_usage,
 			context_tokens, output_tokens,
+			provider_id,
 			has_context_tokens, has_output_tokens,
 			claude_message_id, claude_request_id,
 			source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain,
 			is_compact_boundary) VALUES `)
-		args := make([]any, 0, len(batch)*25)
+		args := make([]any, 0, len(batch)*26)
 		for j, m := range batch {
 			if j > 0 {
 				b.WriteByte(',')
 			}
-			p := j*25 + 1
+			p := j*26 + 1
 			fmt.Fprintf(&b,
-				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
 				p, p+1, p+2, p+3, p+4,
 				p+5, p+6, p+7, p+8, p+9,
 				p+10, p+11, p+12, p+13, p+14, p+15,
 				p+16, p+17, p+18, p+19, p+20,
-				p+21, p+22, p+23, p+24,
+				p+21, p+22, p+23, p+24, p+25,
 			)
-			var ts any
-			if m.Timestamp != "" {
-				if t, ok := ParseSQLiteTimestamp(
-					m.Timestamp,
-				); ok {
-					ts = t
-				}
+			ts, err := optionalSQLiteTimestamp(m.Timestamp)
+			if err != nil {
+				return fmt.Errorf(
+					"parsing message %s ordinal %d timestamp: %w",
+					sessionID, m.Ordinal, err,
+				)
 			}
 			// Sanitize every parser-derived string, not just
 			// content: model and source fields come from
@@ -3682,6 +3770,7 @@ func bulkInsertMessages(
 				sanitizePG(m.Model),
 				sanitizePG(string(m.TokenUsage)),
 				m.ContextTokens, m.OutputTokens,
+				sanitizePG(m.ProviderID),
 				m.HasContextTokens, m.HasOutputTokens,
 				sanitizePG(m.ClaudeMessageID),
 				sanitizePG(m.ClaudeRequestID),
@@ -3720,25 +3809,27 @@ func bulkInsertUsageEvents(
 		b.WriteString(`INSERT INTO usage_events (
 			session_id, message_ordinal, source, model,
 			input_tokens, output_tokens,
+			provider_id,
 			cache_creation_input_tokens, cache_read_input_tokens,
 			reasoning_tokens, cost_microdollars, cost_status, cost_source,
 			occurred_at, dedup_key) VALUES `)
-		args := make([]any, 0, len(batch)*14)
+		args := make([]any, 0, len(batch)*15)
 		for j, ev := range batch {
 			if j > 0 {
 				b.WriteByte(',')
 			}
-			p := j*14 + 1
+			p := j*15 + 1
 			fmt.Fprintf(&b,
-				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
 				p, p+1, p+2, p+3, p+4, p+5, p+6,
-				p+7, p+8, p+9, p+10, p+11, p+12, p+13,
+				p+7, p+8, p+9, p+10, p+11, p+12, p+13, p+14,
 			)
-			var occurred any
-			if ev.OccurredAt != "" {
-				if t, ok := ParseSQLiteTimestamp(ev.OccurredAt); ok {
-					occurred = t
-				}
+			occurred, err := optionalSQLiteTimestamp(ev.OccurredAt)
+			if err != nil {
+				return fmt.Errorf(
+					"parsing usage event %s occurred_at: %w",
+					ev.SessionID, err,
+				)
 			}
 			var ordinal any
 			if ev.MessageOrdinal != nil {
@@ -3755,6 +3846,7 @@ func bulkInsertUsageEvents(
 				sanitizePG(ev.Model),
 				ev.InputTokens,
 				ev.OutputTokens,
+				sanitizePG(ev.ProviderID),
 				ev.CacheCreationInputTokens,
 				ev.CacheReadInputTokens,
 				ev.ReasoningTokens,
@@ -3947,11 +4039,12 @@ func bulkInsertToolResultEvents(
 				p, p+1, p+2, p+3, p+4, p+5,
 				p+6, p+7, p+8, p+9, p+10, p+11,
 			)
-			var ts any
-			if r.ev.Timestamp != "" {
-				if t, ok := ParseSQLiteTimestamp(r.ev.Timestamp); ok {
-					ts = t
-				}
+			ts, err := optionalSQLiteTimestamp(r.ev.Timestamp)
+			if err != nil {
+				return fmt.Errorf(
+					"parsing tool result event %s ordinal %d timestamp: %w",
+					sessionID, r.ordinal, err,
+				)
 			}
 			args = append(args,
 				sessionID,

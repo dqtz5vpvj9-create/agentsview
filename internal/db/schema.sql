@@ -80,9 +80,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- mirrored to PG/DuckDB.
     last_write_incremental INTEGER NOT NULL DEFAULT 0,
     deleted_at  TEXT,
-    -- NULL remains the established user-trash representation; source_missing
-    -- is recoverable when the file reappears.
+    -- Retained for compatibility with older archives and mirrors. New source
+    -- availability state is stored independently in source_missing_at.
     deletion_cause TEXT,
+    -- SQLite-only sync state. A missing source must not hide or trash the
+    -- archived session; it only prevents freshness checks from skipping a
+    -- reparse when that source returns.
+    source_missing_at TEXT,
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     termination_status TEXT,
     secret_leak_count INTEGER NOT NULL DEFAULT 0,
@@ -125,6 +129,7 @@ CREATE TABLE IF NOT EXISTS messages (
     token_usage TEXT NOT NULL DEFAULT '',
     context_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
+    provider_id TEXT NOT NULL DEFAULT '',
     has_context_tokens INTEGER NOT NULL DEFAULT 0,
     has_output_tokens INTEGER NOT NULL DEFAULT 0,
     claude_message_id TEXT NOT NULL DEFAULT '',
@@ -259,6 +264,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
     message_ordinal INTEGER,
     source TEXT NOT NULL,
     model TEXT NOT NULL,
+    provider_id TEXT NOT NULL DEFAULT '',
     input_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
     cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -1157,6 +1163,9 @@ CREATE TABLE IF NOT EXISTS model_pricing (
     input_microdollars_per_mtok   INTEGER NOT NULL DEFAULT 0,
     output_microdollars_per_mtok  INTEGER NOT NULL DEFAULT 0,
     cache_creation_microdollars_per_mtok INTEGER NOT NULL DEFAULT 0,
+    -- 1-hour-TTL cache-write rate; 0 means none published and 1h writes
+    -- bill at cache_creation_microdollars_per_mtok.
+    cache_creation_1h_microdollars_per_mtok INTEGER NOT NULL DEFAULT 0,
     cache_read_microdollars_per_mtok     INTEGER NOT NULL DEFAULT 0,
     updated_at       TEXT NOT NULL
         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -1169,10 +1178,21 @@ CREATE TABLE IF NOT EXISTS model_pricing_bands (
     input_microdollars_per_mtok INTEGER NOT NULL,
     output_microdollars_per_mtok INTEGER NOT NULL,
     cache_creation_microdollars_per_mtok INTEGER NOT NULL,
+    cache_creation_1h_microdollars_per_mtok INTEGER NOT NULL DEFAULT 0,
     cache_read_microdollars_per_mtok INTEGER NOT NULL,
     updated_at TEXT NOT NULL
         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (model_pattern, above_input_tokens)
+);
+
+CREATE TABLE IF NOT EXISTS genai_pricing (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    version TEXT NOT NULL,
+    source_ref TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL CHECK (source IN ('embedded', 'fetched')),
+    data_json BLOB NOT NULL,
+    updated_at TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 -- Git aggregation TTL cache: memoizes `git log --numstat` and

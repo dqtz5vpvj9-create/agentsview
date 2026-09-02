@@ -5,7 +5,7 @@ package sync
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -635,7 +635,7 @@ func TestWriteBatchResyncReplacementEmptyMachineRemainsEmpty(t *testing.T) {
 		"a rebuild must retain an empty attribution already in the replacement")
 }
 
-func TestClaudeIDFreshnessRejectsSourceMissingTombstone(t *testing.T) {
+func TestClaudeIDFreshnessRejectsSourceMissingState(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()
 	missingPath := filepath.Join(root, "missing.jsonl")
@@ -667,7 +667,7 @@ func TestClaudeIDFreshnessRejectsSourceMissingTombstone(t *testing.T) {
 			Agent: string(parser.AgentClaude), FilePath: missingPath,
 		}},
 	))
-	changed, err := database.SoftDeleteSessionSourceOwnership(
+	changed, err := database.MarkSessionSourceMissing(
 		t.Context(), "local", string(parser.AgentClaude), "missing", missingPath,
 	)
 	require.NoError(t, err)
@@ -686,7 +686,7 @@ func TestClaudeIDFreshnessRejectsSourceMissingTombstone(t *testing.T) {
 
 	assert.False(t, engine.shouldSkipFileWithPrefix(
 		"", "missing", info, hash,
-	), "a byte-identical restored source must be reparsed and revived")
+	), "a byte-identical restored source must be reparsed")
 	assert.True(t, engine.shouldSkipFileWithPrefix(
 		"", "user-deleted", info, hash,
 	), "ordinary user trash keeps the established freshness behavior")
@@ -748,11 +748,9 @@ func (f watchRootCountingFactory) NewProvider(
 	cfg parser.ProviderConfig,
 ) parser.Provider {
 	return &watchRootCountingProvider{
-		ProviderBase: parser.ProviderBase{
-			Def:    f.Definition(),
-			Caps:   f.capabilities,
-			Config: cfg.Clone(),
-		},
+		Def:             f.Definition(),
+		Caps:            f.capabilities,
+		Config:          cfg.Clone(),
 		watchRootsCalls: f.watchRootsCalls,
 		watchPlanCalls:  f.watchPlanCalls,
 	}
@@ -867,9 +865,9 @@ func TestSyncAllBaselinesSuccessfulSkipDespiteUnrelatedProviderFailure(t *testin
 	claudeFactory, ok := parser.ProviderFactoryByType(parser.AgentClaude)
 	require.True(t, ok)
 	failing := failingDBBackedProvider{
-		ProviderBase: parser.ProviderBase{Def: parser.AgentDef{
+		Def: parser.AgentDef{
 			Type: parser.AgentWarp, DisplayName: "Warp", FileBased: false,
-		}},
+		},
 		err: errors.New("unrelated provider unavailable"), failOnCall: 2,
 	}
 	warpRoot := t.TempDir()
@@ -1131,12 +1129,10 @@ func TestSyncAllForceParseReparsesFreshStreamingProviderSource(t *testing.T) {
 	}
 	started := time.Unix(1704067200, 0)
 	provider := &directStreamingProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: parser.AgentWarp, FileBased: false},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				StreamingDiscovery: parser.CapabilitySupported,
-			}},
-		},
+		Def: parser.AgentDef{Type: parser.AgentWarp, FileBased: false},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			StreamingDiscovery: parser.CapabilitySupported,
+		}},
 		source:      &source,
 		fingerprint: parser.SourceFingerprint{Key: path, MTimeNS: 1},
 		parseOutcome: parser.ParseOutcome{
@@ -1182,9 +1178,7 @@ func TestForceFullParseBypassesPersistedProviderFreshness(t *testing.T) {
 	}
 	started := time.Unix(1704067200, 0)
 	provider := &directStreamingProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: parser.AgentWarp, FileBased: false},
-		},
+		Def:         parser.AgentDef{Type: parser.AgentWarp, FileBased: false},
 		fingerprint: parser.SourceFingerprint{Key: path, MTimeNS: 1},
 		parseOutcome: parser.ParseOutcome{
 			Results: []parser.ParseResultOutcome{{
@@ -1237,15 +1231,13 @@ func newChangedPathOutcomeEngine(
 		Provider: agent, Key: path, DisplayPath: path, FingerprintKey: path,
 	}
 	provider := &directStreamingProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: agent, FileBased: true},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				DiscoverSources:    parser.CapabilitySupported,
-				StreamingDiscovery: parser.CapabilitySupported,
-				WatchSources:       parser.CapabilitySupported,
-				FindSource:         parser.CapabilitySupported,
-			}},
-		},
+		Def: parser.AgentDef{Type: agent, FileBased: true},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			DiscoverSources:    parser.CapabilitySupported,
+			StreamingDiscovery: parser.CapabilitySupported,
+			WatchSources:       parser.CapabilitySupported,
+			FindSource:         parser.CapabilitySupported,
+		}},
 		source: &source, parseOutcome: outcome(path),
 	}
 	engine := NewEngine(database, EngineConfig{
@@ -1461,13 +1453,13 @@ func TestCollectAndBatchBaselinesHealthySourceBesideFailedSource(t *testing.T) {
 		results <- syncJob{
 			agent: agent,
 			path:  source.path,
-			processResult: processResult{results: []parser.ParseResult{{
+			results: []parser.ParseResult{{
 				Session: parser.ParsedSession{
 					ID: "duplicate", Agent: agent, Project: source.project, Machine: "local",
 					StartedAt: started, EndedAt: started,
 					File: parser.FileInfo{Path: source.path},
 				},
-			}}},
+			}},
 		}
 	}
 	close(results)
@@ -1493,6 +1485,8 @@ func TestCollectAndBatchBaselinesHealthySourceBesideFailedSource(t *testing.T) {
 type manyStreamingProvider struct {
 	parser.ProviderBase
 	sources       []parser.SourceRef
+	parseOutcome  *parser.ParseOutcome
+	parseOutcomes map[string]parser.ParseOutcome
 	discoverCalls atomic.Int32
 	streamCalls   atomic.Int32
 }
@@ -1538,9 +1532,15 @@ func (*manyStreamingProvider) WatchPlan(context.Context) (parser.WatchPlan, erro
 	return parser.WatchPlan{}, nil
 }
 
-func (*manyStreamingProvider) Parse(
+func (provider *manyStreamingProvider) Parse(
 	_ context.Context, req parser.ParseRequest,
 ) (parser.ParseOutcome, error) {
+	if outcome, ok := provider.parseOutcomes[req.Source.DisplayPath]; ok {
+		return outcome, nil
+	}
+	if provider.parseOutcome != nil {
+		return *provider.parseOutcome, nil
+	}
 	path := req.Source.DisplayPath
 	id := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	started := time.Unix(1704067200, 0)
@@ -1554,6 +1554,141 @@ func (*manyStreamingProvider) Parse(
 		}},
 		ResultSetComplete: true,
 	}, nil
+}
+
+func TestIssue1476MissingParentForkDoesNotStarveLaterPages(t *testing.T) {
+	for _, agent := range []parser.AgentType{parser.AgentCodex, parser.AgentTraeX} {
+		t.Run(string(agent), func(t *testing.T) {
+			testIssue1476MissingParentForkDoesNotStarveLaterPages(t, agent)
+		})
+	}
+}
+
+func testIssue1476MissingParentForkDoesNotStarveLaterPages(
+	t *testing.T, agent parser.AgentType,
+) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	const sourceCount = reconciliationPageSize + 1
+	const deferredIndex = 8
+	sources := make([]parser.SourceRef, sourceCount)
+	outcomes := make(map[string]parser.ParseOutcome, sourceCount)
+	started := time.Unix(1704067200, 0)
+	for i := range sources {
+		path := filepath.Join(root, fmt.Sprintf("session-%03d.jsonl", i))
+		require.NoError(t, os.WriteFile(path, []byte("session"), 0o600))
+		sources[i] = parser.SourceRef{
+			Provider: agent, Key: path, DisplayPath: path, FingerprintKey: path,
+		}
+		id := fmt.Sprintf("session-%03d", i)
+		session := parser.ParsedSession{
+			ID: id, Agent: agent, Project: "project", Machine: "local",
+			StartedAt: started, EndedAt: started, File: parser.FileInfo{Path: path},
+		}
+		outcomes[path] = parser.ParseOutcome{
+			Results: []parser.ParseResultOutcome{{
+				Result:      parser.ParseResult{Session: session},
+				DataVersion: parser.DataVersionCurrent,
+			}}, ResultSetComplete: true,
+		}
+	}
+	deferredPath := sources[deferredIndex].Key
+	deferred := outcomes[deferredPath]
+	deferred.Results[0].Result.Session.ID = "forked-child"
+	deferred.Results[0].Result.Session.ParentSessionID = "codex:missing-parent"
+	deferred.Results[0].DataVersion = parser.DataVersionNeedsRetry
+	outcomes[deferredPath] = deferred
+	provider := &manyStreamingProvider{
+		Def: parser.AgentDef{Type: agent, FileBased: true},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			StreamingDiscovery: parser.CapabilitySupported,
+			WatchSources:       parser.CapabilitySupported,
+		}},
+		sources: sources, parseOutcomes: outcomes,
+	}
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{agent: {root}}, Machine: "local",
+		ProviderFactories: []parser.ProviderFactory{manyStreamingFactory{provider}},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			agent: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+
+	err := engine.ReconcileWatchRoots(t.Context(), []string{root}, false)
+	var retry interface{ ReconciliationRetryPaths() []string }
+	require.ErrorAs(t, err, &retry)
+	assert.Equal(t, []string{deferredPath}, retry.ReconciliationRetryPaths())
+	healthySamePageID := strings.TrimSuffix(
+		filepath.Base(sources[deferredIndex-1].DisplayPath),
+		filepath.Ext(sources[deferredIndex-1].DisplayPath),
+	)
+	healthySamePage, getErr := database.GetSession(t.Context(), healthySamePageID)
+	require.NoError(t, getErr)
+	require.NotNil(t, healthySamePage, "healthy session on the deferred page must be included")
+	laterSessionID := strings.TrimSuffix(
+		filepath.Base(sources[len(sources)-1].DisplayPath),
+		filepath.Ext(sources[len(sources)-1].DisplayPath),
+	)
+	later, getErr := database.GetSession(t.Context(), laterSessionID)
+	require.NoError(t, getErr)
+	require.NotNil(t, later, "cursor must advance beyond the deferred page")
+	assert.Less(t, database.GetSessionDataVersion("forked-child"), db.CurrentDataVersion())
+	assert.Equal(t, 1,
+		engine.LastReconciliationResult().Metrics.MaxNonAuthoritativeScopeRows)
+	t.Logf("cursor progress: later page session %q present", later.ID)
+	t.Logf("later-provider presence assertion: %s present", laterSessionID)
+	t.Logf("deferred state: forked-child data version remains stale")
+	t.Logf("rowless proof gate: non-authoritative scope rows=%d",
+		engine.LastReconciliationResult().Metrics.MaxNonAuthoritativeScopeRows)
+}
+
+func TestReconcileUnsupportedSourceMarkersStayPageBounded(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	const agent parser.AgentType = "unsupported-streaming"
+	const sourceCount = reconciliationPageSize*2 + 17
+	sources := make([]parser.SourceRef, sourceCount)
+	for i := range sources {
+		path := filepath.Join(root, fmt.Sprintf("container-%03d", i), "state.vscdb")
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte("unsupported"), 0o600))
+		sources[i] = parser.SourceRef{
+			Provider: agent,
+			Key:      path, DisplayPath: path, FingerprintKey: path,
+		}
+	}
+	unsupported := parser.ParseOutcome{
+		SkipReason: parser.SkipUnsupportedSource, ResultSetComplete: true,
+	}
+	provider := &manyStreamingProvider{
+		Def: parser.AgentDef{Type: agent, FileBased: true},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			DiscoverSources:    parser.CapabilitySupported,
+			StreamingDiscovery: parser.CapabilitySupported,
+			WatchSources:       parser.CapabilitySupported,
+		}},
+		sources: sources, parseOutcome: &unsupported,
+	}
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{agent: {root}},
+		Machine:   "local",
+		ProviderFactories: []parser.ProviderFactory{
+			manyStreamingFactory{provider},
+		},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			agent: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+
+	require.NoError(t, engine.ReconcileWatchRoots(t.Context(), []string{root}, false))
+	result := engine.LastReconciliationResult()
+	assert.True(t, result.Complete)
+	assert.Equal(t, reconciliationPageSize, result.Metrics.MaxSpoolPageRows)
+	assert.Equal(t, reconciliationPageSize,
+		result.Metrics.MaxNonAuthoritativeScopeRows,
+		"unsupported source cardinality must not create pass-wide in-memory state")
 }
 
 func (*manyStreamingProvider) Fingerprint(
@@ -1770,12 +1905,10 @@ func TestSyncProviderDBBackedBaselinesOnlyCompleteSuccessfulSources(t *testing.T
 				}
 			}
 			provider := &baselineDBBackedProvider{
-				ProviderBase: parser.ProviderBase{
-					Def: parser.AgentDef{Type: agent, FileBased: false},
-					Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-						StreamingDiscovery: parser.CapabilitySupported,
-					}},
-				},
+				Def: parser.AgentDef{Type: agent, FileBased: false},
+				Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+					StreamingDiscovery: parser.CapabilitySupported,
+				}},
 				sources: []parser.SourceRef{
 					{Provider: agent, Key: healthyPath, DisplayPath: healthyPath, FingerprintKey: healthyPath},
 					{Provider: agent, Key: failedPath, DisplayPath: failedPath, FingerprintKey: failedPath},
@@ -1883,12 +2016,10 @@ func TestSyncProviderDBBackedBatchesWarmSourceAttributionLookup(t *testing.T) {
 				))
 			}
 			provider := &baselineDBBackedProvider{
-				ProviderBase: parser.ProviderBase{
-					Def: parser.AgentDef{Type: agent, FileBased: false},
-					Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-						StreamingDiscovery: parser.CapabilitySupported,
-					}},
-				},
+				Def: parser.AgentDef{Type: agent, FileBased: false},
+				Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+					StreamingDiscovery: parser.CapabilitySupported,
+				}},
 				sources:          sources,
 				outcomes:         make(map[string]parser.ParseOutcome),
 				fingerprintCalls: make(map[string]int),
@@ -1956,12 +2087,10 @@ func TestSyncProviderDBBackedBaselinesEveryStoredMachineForSharedSource(
 		))
 	}
 	provider := &baselineDBBackedProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: agent, FileBased: false},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				StreamingDiscovery: parser.CapabilitySupported,
-			}},
-		},
+		Def: parser.AgentDef{Type: agent, FileBased: false},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			StreamingDiscovery: parser.CapabilitySupported,
+		}},
 		sources: []parser.SourceRef{{
 			Provider: agent, Key: path,
 			DisplayPath: path, FingerprintKey: path,
@@ -2026,14 +2155,12 @@ func TestSyncProviderDBBackedAgentFlushesEachSourceBeforeParsingNext(t *testing.
 		}
 	}
 	provider := &manyStreamingProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{
-				Type: parser.AgentWarp, DisplayName: "Warp", FileBased: false,
-			},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				StreamingDiscovery: parser.CapabilitySupported,
-			}},
+		Def: parser.AgentDef{
+			Type: parser.AgentWarp, DisplayName: "Warp", FileBased: false,
 		},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			StreamingDiscovery: parser.CapabilitySupported,
+		}},
 		sources: sources,
 	}
 	engine := NewEngine(database, EngineConfig{
@@ -2105,12 +2232,10 @@ func TestSyncAllStreamsDBBackedDiscoveryExactlyOnce(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "session.db")
 	provider := &manyStreamingProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: parser.AgentWarp, DisplayName: "Warp"},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				StreamingDiscovery: parser.CapabilitySupported,
-			}},
-		},
+		Def: parser.AgentDef{Type: parser.AgentWarp, DisplayName: "Warp"},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			StreamingDiscovery: parser.CapabilitySupported,
+		}},
 		sources: []parser.SourceRef{{
 			Provider: parser.AgentWarp, Key: path,
 			DisplayPath: path, FingerprintKey: path,
@@ -2174,9 +2299,7 @@ func TestProviderForceReplaceRewritesResolvedMultiSessionHintScopes(t *testing.T
 		}))
 	}
 	provider := &storedHintScopeProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: "scope-provider"},
-		},
+		Def:       parser.AgentDef{Type: "scope-provider"},
 		container: container,
 	}
 	engine := &Engine{
@@ -2213,15 +2336,14 @@ func TestProviderChangedPathEventKindTreatsExistingHashPathAsPhysical(t *testing
 func TestReconcileWatchRootsNeverCallsDiscoverSliceFallback(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()
-	provider := &directStreamingProvider{ProviderBase: parser.ProviderBase{
+	provider := &directStreamingProvider{
 		Def: parser.AgentDef{Type: "direct-streaming"},
 		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
 			DiscoverSources:    parser.CapabilitySupported,
 			StreamingDiscovery: parser.CapabilitySupported,
 			WatchSources:       parser.CapabilitySupported,
 			FindSource:         parser.CapabilitySupported,
-		}},
-	}}
+		}}}
 	engine := NewEngine(database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{"direct-streaming": {root}},
 		Machine:   "local",
@@ -2310,15 +2432,13 @@ func TestReconcileWatchRootsParseFailureCannotAcknowledgeComplete(t *testing.T) 
 	}
 	parseErr := errors.New("injected parse failure")
 	provider := &directStreamingProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: "direct-streaming", FileBased: true},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				DiscoverSources:    parser.CapabilitySupported,
-				StreamingDiscovery: parser.CapabilitySupported,
-				WatchSources:       parser.CapabilitySupported,
-				FindSource:         parser.CapabilitySupported,
-			}},
-		},
+		Def: parser.AgentDef{Type: "direct-streaming", FileBased: true},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			DiscoverSources:    parser.CapabilitySupported,
+			StreamingDiscovery: parser.CapabilitySupported,
+			WatchSources:       parser.CapabilitySupported,
+			FindSource:         parser.CapabilitySupported,
+		}},
 		source: &source, parseErr: parseErr,
 	}
 	engine := NewEngine(database, EngineConfig{
@@ -2373,15 +2493,13 @@ func TestReconcileWatchRootsPartialProviderOutcomesCannotAcknowledgeComplete(t *
 				DisplayPath: path, FingerprintKey: path,
 			}
 			provider := &directStreamingProvider{
-				ProviderBase: parser.ProviderBase{
-					Def: parser.AgentDef{Type: "partial-streaming", FileBased: true},
-					Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-						DiscoverSources:    parser.CapabilitySupported,
-						StreamingDiscovery: parser.CapabilitySupported,
-						WatchSources:       parser.CapabilitySupported,
-						FindSource:         parser.CapabilitySupported,
-					}},
-				},
+				Def: parser.AgentDef{Type: "partial-streaming", FileBased: true},
+				Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+					DiscoverSources:    parser.CapabilitySupported,
+					StreamingDiscovery: parser.CapabilitySupported,
+					WatchSources:       parser.CapabilitySupported,
+					FindSource:         parser.CapabilitySupported,
+				}},
 				source: &source, parseOutcome: tc.outcome,
 			}
 			engine := NewEngine(database, EngineConfig{
@@ -2417,15 +2535,13 @@ func TestReconcileWatchRootsCwdFilteredZeroResultRevokesDeletionProof(t *testing
 	}
 	started := time.Unix(1704067200, 0)
 	provider := &directStreamingProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: agent, FileBased: true},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				DiscoverSources:    parser.CapabilitySupported,
-				StreamingDiscovery: parser.CapabilitySupported,
-				WatchSources:       parser.CapabilitySupported,
-				FindSource:         parser.CapabilitySupported,
-			}},
-		},
+		Def: parser.AgentDef{Type: agent, FileBased: true},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			DiscoverSources:    parser.CapabilitySupported,
+			StreamingDiscovery: parser.CapabilitySupported,
+			WatchSources:       parser.CapabilitySupported,
+			FindSource:         parser.CapabilitySupported,
+		}},
 		source: &source,
 		parseOutcome: parser.ParseOutcome{
 			Results: []parser.ParseResultOutcome{{
@@ -2509,13 +2625,11 @@ func TestReconcileWatchRootsArchiveWriteFailureCannotAcknowledgeComplete(t *test
 		DisplayPath: path, FingerprintKey: path,
 	}
 	provider := &directStreamingProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: "write-failure-streaming", FileBased: true},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				DiscoverSources: parser.CapabilitySupported, StreamingDiscovery: parser.CapabilitySupported,
-				WatchSources: parser.CapabilitySupported, FindSource: parser.CapabilitySupported,
-			}},
-		},
+		Def: parser.AgentDef{Type: "write-failure-streaming", FileBased: true},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			DiscoverSources: parser.CapabilitySupported, StreamingDiscovery: parser.CapabilitySupported,
+			WatchSources: parser.CapabilitySupported, FindSource: parser.CapabilitySupported,
+		}},
 		source: &source,
 		parseOutcome: parser.ParseOutcome{
 			Results: []parser.ParseResultOutcome{{
@@ -2567,15 +2681,13 @@ func TestReconcileWatchRootsOpenCodeGateSkipsUnchangedContainerInConstantState(t
 		DisplayPath: path, FingerprintKey: path,
 	}
 	provider := &directStreamingProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: parser.AgentOpenCode},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				DiscoverSources:    parser.CapabilitySupported,
-				StreamingDiscovery: parser.CapabilitySupported,
-				WatchSources:       parser.CapabilitySupported,
-				FindSource:         parser.CapabilitySupported,
-			}},
-		},
+		Def: parser.AgentDef{Type: parser.AgentOpenCode},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			DiscoverSources:    parser.CapabilitySupported,
+			StreamingDiscovery: parser.CapabilitySupported,
+			WatchSources:       parser.CapabilitySupported,
+			FindSource:         parser.CapabilitySupported,
+		}},
 		source: &source,
 		parseOutcome: parser.ParseOutcome{
 			Results: []parser.ParseResultOutcome{{
@@ -2637,9 +2749,9 @@ func TestReconcileWatchRootsFailsWhenDBBackedDiscoveryFails(t *testing.T) {
 	root := t.TempDir()
 	discoveryErr := errors.New("provider database unavailable")
 	provider := failingDBBackedProvider{
-		ProviderBase: parser.ProviderBase{Def: parser.AgentDef{
+		Def: parser.AgentDef{
 			Type: parser.AgentWarp, DisplayName: "Warp", FileBased: false,
-		}},
+		},
 		err: discoveryErr, failOnCall: 1,
 	}
 	engine := NewEngine(database, EngineConfig{
@@ -2665,9 +2777,9 @@ func TestReconcileWatchRootsFailsWhenFileDiscoveryFails(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()
 	provider := failingDBBackedProvider{
-		ProviderBase: parser.ProviderBase{Def: parser.AgentDef{
+		Def: parser.AgentDef{
 			Type: parser.AgentCowork, DisplayName: "Cowork", FileBased: true,
-		}},
+		},
 		err: errors.New("source listing unavailable"), failOnCall: 1,
 	}
 	engine := NewEngine(database, EngineConfig{
@@ -2752,14 +2864,12 @@ func TestReconcileWatchRootsCancellationDuringLaterSpoolPage(t *testing.T) {
 		}
 	}
 	provider := &manyStreamingProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: agent, FileBased: true},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				DiscoverSources:    parser.CapabilitySupported,
-				StreamingDiscovery: parser.CapabilitySupported,
-				WatchSources:       parser.CapabilitySupported,
-			}},
-		},
+		Def: parser.AgentDef{Type: agent, FileBased: true},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			DiscoverSources:    parser.CapabilitySupported,
+			StreamingDiscovery: parser.CapabilitySupported,
+			WatchSources:       parser.CapabilitySupported,
+		}},
 		sources: sources,
 	}
 	engine := NewEngine(database, EngineConfig{
@@ -2800,14 +2910,12 @@ func TestReconcileWatchRootsPartialSecondPageArchiveWriteFailure(t *testing.T) {
 		}
 	}
 	provider := &manyStreamingProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: agent, FileBased: true},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				DiscoverSources:    parser.CapabilitySupported,
-				StreamingDiscovery: parser.CapabilitySupported,
-				WatchSources:       parser.CapabilitySupported,
-			}},
-		},
+		Def: parser.AgentDef{Type: agent, FileBased: true},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			DiscoverSources:    parser.CapabilitySupported,
+			StreamingDiscovery: parser.CapabilitySupported,
+			WatchSources:       parser.CapabilitySupported,
+		}},
 		sources: sources,
 	}
 	engine := NewEngine(database, EngineConfig{
@@ -3087,11 +3195,9 @@ func TestReconciliationReplacementIndexReportsDiscoveryAndCleanupErrors(t *testi
 	discoveryErr := errors.New("replacement discovery failed")
 	cleanupErr := errors.New("replacement cleanup failed")
 	provider := &failingDBBackedProvider{
-		ProviderBase: parser.ProviderBase{
-			Def:    parser.AgentDef{Type: parser.AgentClaude, FileBased: true},
-			Config: parser.ProviderConfig{Roots: []string{root}},
-		},
-		err: discoveryErr, failOnCall: 1,
+		Def:    parser.AgentDef{Type: parser.AgentClaude, FileBased: true},
+		Config: parser.ProviderConfig{Roots: []string{root}},
+		err:    discoveryErr, failOnCall: 1,
 	}
 	engine := NewEngine(database, EngineConfig{Machine: "local"})
 	t.Cleanup(engine.Close)
@@ -3178,7 +3284,7 @@ func TestTombstoneMissingWatchSourcesScopesSharedPathByAgent(t *testing.T) {
 	for _, id := range []string{"claude-shared", "codex-shared"} {
 		active, err := database.GetSession(t.Context(), id)
 		require.NoError(t, err)
-		assert.Nil(t, active)
+		assert.NotNil(t, active)
 	}
 }
 
@@ -3249,8 +3355,8 @@ func TestTombstoneMissingWatchSourcesCodexReplacementFallback(t *testing.T) {
 		"a surviving same-UUID duplicate is a replacement, not a deletion")
 	gone, err := database.GetSession(t.Context(), "codex:"+solo)
 	require.NoError(t, err)
-	assert.Nil(t, gone,
-		"a missing copy with no survivor must tombstone")
+	assert.NotNil(t, gone,
+		"a missing copy with no survivor must be marked source-missing")
 }
 
 func TestTombstoneMissingWatchSourcesPaginatesLargeArchive(t *testing.T) {
@@ -3306,11 +3412,10 @@ func TestTombstoneMissingWatchSourcesDoesNotRediscoverEachOwnership(t *testing.T
 			require.NoError(t, database.BaselineActiveSessionSourcePaths(
 				t.Context(), "local", sources,
 			))
-			provider := &lookupSourceProvider{ProviderBase: parser.ProviderBase{
+			provider := &lookupSourceProvider{
 				Def: parser.AgentDef{
 					Type: parser.AgentCowork, IDPrefix: "cowork:", FileBased: true,
-				},
-			}}
+				}}
 			engine := NewEngine(database, EngineConfig{
 				AgentDirs: map[parser.AgentType][]string{
 					parser.AgentCowork: {root},
@@ -3385,7 +3490,7 @@ func TestTombstoneMissingWatchSourcesDoesNotInferUnvalidatedVirtualPaths(t *test
 		"provider-neutral reconciliation must not reinterpret '#' as virtual syntax")
 }
 
-func TestReconcileWatchRootsRevivesRecreatedSourceMissingSession(t *testing.T) {
+func TestReconcileWatchRootsRefreshesRecreatedSourceMissingSession(t *testing.T) {
 	fx := newEngineFixture(t)
 	t.Cleanup(fx.engine.Close)
 	path := fx.writeClaudeSession(t, "project", "session.jsonl", "first")
@@ -3403,7 +3508,7 @@ func TestReconcileWatchRootsRevivesRecreatedSourceMissingSession(t *testing.T) {
 	))
 	active, err = fx.db.GetSession(t.Context(), "session")
 	require.NoError(t, err)
-	assert.Nil(t, active, "missing source is hidden after reconciliation")
+	assert.NotNil(t, active, "missing source remains browsable after reconciliation")
 
 	fx.writeClaudeSession(t, "project", "session.jsonl", "recreated")
 	require.NoError(t, fx.engine.ReconcileWatchRoots(
@@ -3411,17 +3516,17 @@ func TestReconcileWatchRootsRevivesRecreatedSourceMissingSession(t *testing.T) {
 	))
 	active, err = fx.db.GetSession(t.Context(), "session")
 	require.NoError(t, err)
-	require.NotNil(t, active, "same source must become visible after recreation")
+	require.NotNil(t, active, "session remains visible after source recreation")
 	require.NotNil(t, active.FirstMessage)
 	assert.Equal(t, "recreated", *active.FirstMessage)
 	messages, err := fx.db.GetAllMessages(t.Context(), "session")
 	require.NoError(t, err)
 	require.Len(t, messages, 1)
 	assert.Equal(t, "recreated", messages[0].Content,
-		"revival must replace message rows left by the deleted source")
+		"source return must replace messages retained while the source was missing")
 }
 
-func TestReconcileWatchRootsRevivesByteIdenticalSourceWithWarmSkipCache(
+func TestReconcileWatchRootsRefreshesByteIdenticalSourceWithWarmSkipCache(
 	t *testing.T,
 ) {
 	fx := newEngineFixture(t)
@@ -3452,7 +3557,7 @@ func TestReconcileWatchRootsRevivesByteIdenticalSourceWithWarmSkipCache(
 	))
 	active, err := fx.db.GetSession(t.Context(), "session")
 	require.NoError(t, err)
-	assert.Nil(t, active, "missing source is hidden after reconciliation")
+	assert.NotNil(t, active, "missing source remains browsable after reconciliation")
 
 	fx.engine.Close()
 	fx.engineWithEmitter(nil)
@@ -3466,7 +3571,7 @@ func TestReconcileWatchRootsRevivesByteIdenticalSourceWithWarmSkipCache(
 	active, err = fx.db.GetSession(t.Context(), "session")
 	require.NoError(t, err)
 	require.NotNil(t, active,
-		"a source-missing tombstone must not retain a cache entry that hides restoration")
+		"source-missing state must not retain a cache entry that hides restoration")
 	require.NotNil(t, active.FirstMessage)
 	assert.Equal(t, "unchanged", *active.FirstMessage)
 }
@@ -3511,8 +3616,8 @@ func TestReconcileWatchRootsPreservesHistoricalRowsUntilExactSourceObserved(
 		"a never-observed historical row must remain in the persistent archive")
 	observed, err = fx.db.GetSession(t.Context(), "observed")
 	require.NoError(t, err)
-	assert.Nil(t, observed,
-		"a source observed by the prior pass becomes deletion-eligible")
+	assert.NotNil(t, observed,
+		"a source observed by the prior pass can be marked source-missing")
 }
 
 func TestReconciliationSourceBaselineUsesStoredPathRewrite(t *testing.T) {
@@ -3538,7 +3643,7 @@ func TestReconciliationSourceBaselineUsesStoredPathRewrite(t *testing.T) {
 		}},
 		nil, nil,
 	))
-	changed, err := database.SoftDeleteSessionSourceOwnership(
+	changed, err := database.MarkSessionSourceMissing(
 		t.Context(), "host", "claude", "session", storedPath,
 	)
 	require.NoError(t, err)
@@ -3594,8 +3699,8 @@ func TestSyncPathsBaselinesPresentSourceBeforeLaterDelete(t *testing.T) {
 	fx.engine.SyncPathsContext(t.Context(), []string{path})
 	active, err = fx.db.GetSession(t.Context(), "incremental")
 	require.NoError(t, err)
-	assert.Nil(t, active,
-		"a later watcher delete may tombstone the exact previously observed path")
+	assert.NotNil(t, active,
+		"a later watcher delete may mark the exact observed path source-missing")
 }
 
 func TestStartupMaintenanceWaitsForForegroundSyncAndSerializesLaterSyncs(
@@ -3685,6 +3790,19 @@ func TestStartupMaintenanceWaitsForForegroundSyncAndSerializesLaterSyncs(
 	require.NoError(t, <-laterSyncDone)
 }
 
+func TestDeferredStartupPassDoesNotAcknowledgeReconciliation(t *testing.T) {
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		Machine:                 "local",
+		DeferStartupMaintenance: true,
+	})
+	t.Cleanup(engine.Close)
+
+	engine.RecordStartupReconciled(SyncStats{Deferred: 1}, nil)
+
+	assert.False(t, engine.StartupReconciled())
+}
+
 func TestStartupSyncFallbackRunsWhenForegroundSyncNeverArrives(t *testing.T) {
 	database := openTestDB(t)
 	engine := NewEngine(database, EngineConfig{
@@ -3752,9 +3870,9 @@ func TestStartupReconciledCallbackReportsIncompleteDiscoveryOnce(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()
 	provider := failingDBBackedProvider{
-		ProviderBase: parser.ProviderBase{Def: parser.AgentDef{
+		Def: parser.AgentDef{
 			Type: parser.AgentCowork, DisplayName: "Cowork", FileBased: true,
-		}},
+		},
 		err: errors.New("source listing unavailable"), failOnCall: 1,
 	}
 	type callbackResult struct {
@@ -3796,9 +3914,9 @@ func TestStartupSyncFallbackUsesSuccessSignalNotMaintenanceRelease(t *testing.T)
 	database := openTestDB(t)
 	root := t.TempDir()
 	provider := failingDBBackedProvider{
-		ProviderBase: parser.ProviderBase{Def: parser.AgentDef{
+		Def: parser.AgentDef{
 			Type: parser.AgentCowork, DisplayName: "Cowork", FileBased: true,
-		}},
+		},
 		err: errors.New("source listing unavailable"), failOnCall: 1,
 	}
 	reconciled := make(chan struct{}, 1)
@@ -3833,6 +3951,43 @@ func TestStartupSyncFallbackUsesSuccessSignalNotMaintenanceRelease(t *testing.T)
 	case <-time.After(time.Second):
 		require.FailNow(t, "successful fallback did not reconcile startup")
 	}
+}
+
+func TestSyncThenRunSuppressesWorkWhenProcessingIsIncomplete(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	cause := errors.New("source listing unavailable")
+	provider := &failingDBBackedProvider{
+		err: cause, failOnCall: 1,
+	}
+	provider.ProviderBase = parser.ProviderBase{
+		Def: parser.AgentDef{Type: parser.AgentCowork, FileBased: true},
+	}
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentCowork: {root}},
+		Machine:   "local",
+		ProviderFactories: []parser.ProviderFactory{
+			failingDBBackedFactory{provider: provider},
+		},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentCowork: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+
+	workCalled := false
+	stats, err := engine.SyncThenRun(
+		t.Context(), false, nil, func(bool) error {
+			workCalled = true
+			return nil
+		},
+	)
+
+	require.NoError(t, err)
+	assert.False(t, stats.ProcessingComplete())
+	assert.Greater(t, stats.providerFailures, 0)
+	assert.False(t, workCalled,
+		"incomplete sync results must not run downstream acknowledgement work")
 }
 
 func TestStartupReconciledCallbackOwnersRetainFailureForLaterSuccess(t *testing.T) {
@@ -4076,44 +4231,38 @@ func (f fakeFileInfo) ModTime() time.Time {
 func (f fakeFileInfo) IsDir() bool { return false }
 func (f fakeFileInfo) Sys() any    { return nil }
 
-func TestHasLegacyKiroCandidates(t *testing.T) {
-	tests := []struct {
-		name  string
-		files []parser.DiscoveredFile
-		want  bool
-	}{
-		{
-			name: "empty",
-			want: false,
-		},
-		{
-			name: "non-kiro files",
-			files: []parser.DiscoveredFile{
-				{Agent: parser.AgentClaude, Path: "/tmp/claude/session.jsonl"},
-			},
-			want: false,
-		},
-		{
-			name: "kiro sqlite database source",
-			files: []parser.DiscoveredFile{
-				{Agent: parser.AgentKiro, Path: "/tmp/kiro/data.sqlite3"},
-			},
-			want: false,
-		},
-		{
-			name: "legacy kiro jsonl",
-			files: []parser.DiscoveredFile{
-				{Agent: parser.AgentKiro, Path: "/tmp/kiro/session.jsonl"},
-			},
-			want: true,
-		},
-	}
+func TestKiroReconciliationRootPreferenceUsesConfiguredOrder(t *testing.T) {
+	first := filepath.Join(t.TempDir(), "first")
+	second := filepath.Join(t.TempDir(), "second")
+	firstPath := filepath.Join(first, "sess.jsonl")
+	secondPath := filepath.Join(second, "sess.jsonl")
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, hasLegacyKiroCandidates(tt.files))
-		})
-	}
+	assert.Equal(t, int64(2), configuredRootPreference(
+		firstPath, []string{first, second},
+	))
+	assert.Equal(t, int64(1), configuredRootPreference(
+		secondPath, []string{first, second},
+	))
+	assert.Equal(t, int64(1), configuredRootPreference(
+		firstPath, []string{second, first},
+	))
+	assert.Equal(t, int64(2), configuredRootPreference(
+		secondPath, []string{second, first},
+	))
+}
+
+func TestKiroReconciliationRootPreferenceUsesSourceAttribution(t *testing.T) {
+	ancestor := filepath.Join(t.TempDir(), "ancestor")
+	descendant := filepath.Join(ancestor, "descendant")
+	path := filepath.Join(descendant, "session.jsonl")
+	source := parser.SourceRef{ConfiguredRoot: descendant}
+
+	assert.Equal(t, int64(1), configuredRootPreferenceForSource(
+		source, path, []string{ancestor, descendant},
+	), "the provider root must outrank an overlapping ancestor")
+	assert.Equal(t, int64(2), configuredRootPreferenceForSource(
+		parser.SourceRef{}, path, []string{ancestor, descendant},
+	), "unknown attribution must retain the path fallback")
 }
 
 func TestFilterEmptyMessages(t *testing.T) {
@@ -5019,6 +5168,69 @@ func TestWriteBatchRemoteIDPrefixUsageEvents(t *testing.T) {
 	assert.Equal(t, "gemini", events[0].Model)
 	assert.Equal(t, 100, events[0].InputTokens)
 	assert.Equal(t, 50, events[0].OutputTokens)
+}
+
+func TestDisabledSignalRecomputationSkipsEveryFullWritePath(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		write func(*Engine, pendingWrite) error
+	}{
+		{
+			name: "ordinary",
+			write: func(e *Engine, pw pendingWrite) error {
+				written, _, failed, _ := e.writeBatch(
+					[]pendingWrite{pw}, syncWriteDefault, true,
+				)
+				if written != 1 || failed != 0 {
+					return fmt.Errorf("written=%d failed=%d", written, failed)
+				}
+				return nil
+			},
+		},
+		{
+			name: "bulk",
+			write: func(e *Engine, pw pendingWrite) error {
+				written, _, failed, _ := e.writeBatch(
+					[]pendingWrite{pw}, syncWriteBulk, true,
+				)
+				if written != 1 || failed != 0 {
+					return fmt.Errorf("written=%d failed=%d", written, failed)
+				}
+				return nil
+			},
+		},
+		{name: "single session", write: (*Engine).writeSessionFull},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database := openTestDB(t)
+			engine := NewEngine(database, EngineConfig{
+				Machine: "capture", DisableSignalRecomputation: true,
+			})
+			t.Cleanup(engine.Close)
+			id := "no-signals-" + strings.ReplaceAll(tc.name, " ", "-")
+			pw := pendingWrite{
+				sess: parser.ParsedSession{
+					ID: id, Project: "capture", Machine: "capture",
+					Agent: parser.AgentClaude, StartedAt: time.Now(),
+					MessageCount: 1,
+				},
+				msgs: []parser.ParsedMessage{{
+					Role: parser.RoleUser, Content: "bounded capture content",
+				}},
+			}
+
+			require.NoError(t, tc.write(engine, pw))
+
+			session, err := database.GetSession(t.Context(), id)
+			require.NoError(t, err)
+			require.NotNil(t, session)
+			assert.Zero(t, session.QualitySignalVersion)
+			assert.Empty(t, session.SecretsRulesVersion)
+			messages, err := database.GetAllMessages(t.Context(), id)
+			require.NoError(t, err)
+			assert.Len(t, messages, 1)
+		})
+	}
 }
 
 func TestWriteBatchBulkDemotesFailedDeclaredMember(t *testing.T) {
@@ -6950,7 +7162,7 @@ func TestWriteBatchFailedReplacementKeepsSourceMissingSessionRetryable(t *testin
 			Agent: string(parser.AgentQwenPaw), FilePath: path,
 		}},
 	))
-	changed, err := database.SoftDeleteSessionSourceOwnership(
+	changed, err := database.MarkSessionSourceMissing(
 		t.Context(), "local", string(parser.AgentQwenPaw),
 		"qwenpaw:retry-revival", path,
 	)
@@ -6978,8 +7190,8 @@ func TestWriteBatchFailedReplacementKeepsSourceMissingSessionRetryable(t *testin
 	assert.Equal(t, 1, failed)
 	active, err := database.GetSession(t.Context(), "qwenpaw:retry-revival")
 	require.NoError(t, err)
-	assert.Nil(t, active,
-		"a failed content replacement must not revive the source-missing row")
+	assert.NotNil(t, active,
+		"a failed content replacement must not clear source-missing state")
 	info := fakeSnapshotInfo{
 		fName: filepath.Base(path), fSize: int64(len("new content")), fMtime: 2,
 	}
@@ -8016,12 +8228,11 @@ func TestStampProviderFileIdentityPreservesProviderSnapshotIdentity(t *testing.T
 		authoritativeInode, authoritativeDevice = 101, 202
 	}
 
-	provider := &incrementalRequestRecorder{ProviderBase: parser.ProviderBase{
+	provider := &incrementalRequestRecorder{
 		Def: parser.AgentDef{Type: parser.AgentCodex},
 		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
 			IncrementalAppend: parser.CapabilitySupported,
-		}},
-	}}
+		}}}
 	results := []parser.ParseResult{
 		{Session: parser.ParsedSession{File: parser.FileInfo{
 			Path: path, Inode: authoritativeInode, Device: authoritativeDevice,
@@ -8170,15 +8381,14 @@ func TestTryProviderIncrementalAppendPassesPersistedSessionID(t *testing.T) {
 		Content:   "hello",
 	}}))
 
-	provider := &incrementalRequestRecorder{ProviderBase: parser.ProviderBase{
+	provider := &incrementalRequestRecorder{
 		Def: parser.AgentDef{
 			Type:     parser.AgentCodex,
 			IDPrefix: "codex:",
 		},
 		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
 			IncrementalAppend: parser.CapabilitySupported,
-		}},
-	}}
+		}}}
 	e := &Engine{
 		db:       database,
 		idPrefix: "remote~",
@@ -8229,10 +8439,8 @@ func TestCollectAndBatchPrefixesParserExcludedIDs(t *testing.T) {
 
 	results := make(chan syncJob, 1)
 	results <- syncJob{
-		processResult: processResult{
-			excludedSessionIDs: []string{"probe"},
-		},
-		path: "/remote/probe.jsonl",
+		excludedSessionIDs: []string{"probe"},
+		path:               "/remote/probe.jsonl",
 	}
 	close(results)
 
@@ -8270,10 +8478,8 @@ func TestCollectAndBatchClearsDanglingParentAfterParserExclusion(t *testing.T) {
 
 	results := make(chan syncJob, 1)
 	results <- syncJob{
-		processResult: processResult{
-			excludedSessionIDs: []string{parentID},
-		},
-		path: "/archive/excluded-spawner.jsonl",
+		excludedSessionIDs: []string{parentID},
+		path:               "/archive/excluded-spawner.jsonl",
 	}
 	close(results)
 
@@ -8291,6 +8497,73 @@ func TestCollectAndBatchClearsDanglingParentAfterParserExclusion(t *testing.T) {
 	require.NotNil(t, child)
 	assert.Nil(t, child.ParentSessionID,
 		"bulk exclusion must clear a child parent that no longer exists")
+}
+
+func TestCollectAndBatchCompletesPostWriteLinksAfterCancellation(t *testing.T) {
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{Machine: "local"})
+	t.Cleanup(engine.Close)
+
+	for _, session := range []db.Session{
+		{ID: "link-parent", Project: "project", Machine: "local", Agent: "zencoder"},
+		{ID: "repair-parent", Project: "project", Machine: "local", Agent: "zencoder"},
+		{ID: "repair-child", Project: "project", Machine: "local", Agent: "zencoder"},
+	} {
+		require.NoError(t, database.UpsertSession(session))
+	}
+	require.NoError(t, database.InsertMessages([]db.Message{
+		{SessionID: "link-parent", Ordinal: 0, Role: "assistant",
+			Content: "spawn link child", HasToolUse: true,
+			ToolCalls: []db.ToolCall{{
+				ToolUseID: "link-call", ToolName: "Task", Category: "Task",
+				SubagentSessionID: "link-child",
+			}}},
+		{SessionID: "repair-parent", Ordinal: 0, Role: "assistant",
+			Content: "spawn repair child", HasToolUse: true,
+			ToolCalls: []db.ToolCall{{
+				ToolUseID: "repair-call", ToolName: "Task", Category: "Task",
+				SubagentSessionID: "repair-child",
+			}}},
+	}))
+	require.NoError(t, database.QueueSubagentParentRepairs([]string{"repair-child"}))
+
+	sourcePath := filepath.Join(t.TempDir(), "link-child.jsonl")
+	results := make(chan syncJob, 1)
+	results <- syncJob{
+		results: []parser.ParseResult{{
+			Session: parser.ParsedSession{
+				ID: "link-child", Project: "project", Machine: "local",
+				Agent: parser.AgentZencoder,
+				File:  parser.FileInfo{Path: sourcePath, Size: 1, Mtime: 1},
+			},
+		}},
+		agent: parser.AgentZencoder, path: sourcePath, machine: "local",
+	}
+	close(results)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	stats := engine.collectAndBatchWithOptions(
+		ctx, results, 1, 1, nil, syncWriteDefault,
+		collectAndBatchOptions{observeResult: func(syncJob) { cancel() }},
+	)
+
+	assert.Equal(t, 1, stats.Synced)
+	linked, err := database.GetSession(t.Context(), "link-child")
+	require.NoError(t, err)
+	require.NotNil(t, linked)
+	require.NotNil(t, linked.ParentSessionID)
+	assert.Equal(t, "link-parent", *linked.ParentSessionID)
+	repaired, err := database.GetSession(t.Context(), "repair-child")
+	require.NoError(t, err)
+	require.NotNil(t, repaired)
+	require.NotNil(t, repaired.ParentSessionID)
+	assert.Equal(t, "repair-parent", *repaired.ParentSessionID)
+	var queued int
+	require.NoError(t, database.Reader().QueryRow(
+		"SELECT count(*) FROM subagent_parent_repair_queue",
+	).Scan(&queued))
+	assert.Zero(t, queued)
 }
 
 func TestShouldSkipByPathWithRewriter(t *testing.T) {
@@ -8548,17 +8821,15 @@ func TestFindSourceFileProviderAuthoritativePrefersProviderOverStoredPath(t *tes
 	}))
 
 	provider := &lookupSourceProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{
-				Type:        parser.AgentCowork,
-				DisplayName: "Cowork",
-				IDPrefix:    "cowork:",
-				FileBased:   true,
-			},
-			Caps: parser.Capabilities{
-				Source: parser.SourceCapabilities{
-					FindSource: parser.CapabilitySupported,
-				},
+		Def: parser.AgentDef{
+			Type:        parser.AgentCowork,
+			DisplayName: "Cowork",
+			IDPrefix:    "cowork:",
+			FileBased:   true,
+		},
+		Caps: parser.Capabilities{
+			Source: parser.SourceCapabilities{
+				FindSource: parser.CapabilitySupported,
 			},
 		},
 		source: parser.SourceRef{
@@ -9451,14 +9722,12 @@ func TestEngine_ReconcileWatchRootsReportsProgressBeforeDiscoveryReturns(t *test
 		}
 	}()
 	provider := &directStreamingProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: agent, FileBased: true},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				DiscoverSources:    parser.CapabilitySupported,
-				StreamingDiscovery: parser.CapabilitySupported,
-				WatchSources:       parser.CapabilitySupported,
-			}},
-		},
+		Def: parser.AgentDef{Type: agent, FileBased: true},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			DiscoverSources:    parser.CapabilitySupported,
+			StreamingDiscovery: parser.CapabilitySupported,
+			WatchSources:       parser.CapabilitySupported,
+		}},
 		discoverStarted: started,
 		discoverRelease: release,
 	}

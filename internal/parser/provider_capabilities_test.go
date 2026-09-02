@@ -22,6 +22,36 @@ func TestProviderCapabilitiesPersistentArchiveDefaultUnsupported(t *testing.T) {
 	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).PersistentArchive)
 }
 
+func TestProviderCapabilitiesS3DiscoveryDefaultUnsupported(t *testing.T) {
+	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).S3Discovery)
+}
+
+func TestProviderCapabilitiesS3DiscoveryMatchConsumers(t *testing.T) {
+	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).S3Discovery,
+		"new providers must opt in explicitly")
+
+	supported := map[AgentType]bool{
+		AgentClaude:    true,
+		AgentCodex:     true,
+		AgentCursor:    true,
+		AgentIcodemate: true,
+	}
+	for _, factory := range ProviderFactories() {
+		agent := factory.Definition().Type
+		got := factory.Capabilities().Source.S3Discovery
+		if supported[agent] {
+			assert.Equal(t, CapabilitySupported, got)
+			provider := factory.NewProvider(ProviderConfig{
+				Roots: []string{t.TempDir()},
+			})
+			assert.Implements(t, (*S3Provider)(nil), provider)
+			continue
+		}
+		assert.Equalf(t, CapabilityUnsupported, got,
+			"%s must not opt into S3 discovery", agent)
+	}
+}
+
 func TestProviderCapabilitiesActivityHintsMatchConsumers(t *testing.T) {
 	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).ActivityHints,
 		"new providers must opt in explicitly")
@@ -96,8 +126,8 @@ func TestWatchSourceProvidersDiscoverEachDirectly(t *testing.T) {
 func TestSourceSetProviderDiscoverEachDoesNotCallCollectingDiscover(t *testing.T) {
 	sources := &streamingSourceSetTestDouble{}
 	provider := &SourceSetProvider{
-		ProviderBase: ProviderBase{Def: AgentDef{Type: "stream-test"}},
-		sources:      sources,
+		Def:     AgentDef{Type: "stream-test"},
+		sources: sources,
 	}
 
 	var got []SourceRef
@@ -166,6 +196,27 @@ func TestProviderMigrationRejectsStreamingCapabilityWithoutInterface(t *testing.
 	assert.Contains(t, err.Error(), "StreamingDiscoverer")
 }
 
+func TestProviderMigrationRejectsS3DiscoveryWithoutInterface(t *testing.T) {
+	factory := testProviderFactory{
+		def: AgentDef{Type: "invalid-s3-provider"},
+		caps: Capabilities{Source: SourceCapabilities{
+			DiscoverSources: CapabilitySupported,
+			FindSource:      CapabilitySupported,
+			S3Discovery:     CapabilitySupported,
+		}},
+	}
+
+	err := ValidateProviderMigrationModes(
+		[]ProviderFactory{factory},
+		map[AgentType]ProviderMigrationMode{
+			"invalid-s3-provider": ProviderMigrationProviderAuthoritative,
+		},
+	)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "S3Provider")
+}
+
 func TestProviderMigrationRejectsSharedContainerWithoutExactRehydration(t *testing.T) {
 	factory := streamingWithoutExactFactory{testProviderFactory{
 		def: AgentDef{Type: "invalid-shared-container-provider"}, caps: Capabilities{Source: SourceCapabilities{
@@ -214,12 +265,10 @@ func TestSourceSetFactoryDowngradesAndRejectsMissingExactRehydration(t *testing.
 
 func TestProviderCapabilitiesRequireWatchRootPlanner(t *testing.T) {
 	provider := &watchRootCapabilityTestProvider{
-		ProviderBase: ProviderBase{
-			Def: AgentDef{Type: "watch-root-test"},
-			Caps: Capabilities{Source: SourceCapabilities{
-				WatchRoots: CapabilitySupported,
-			}},
-		},
+		Def: AgentDef{Type: "watch-root-test"},
+		Caps: Capabilities{Source: SourceCapabilities{
+			WatchRoots: CapabilitySupported,
+		}},
 		plan: WatchPlan{Roots: []WatchRoot{{Path: "/fallback"}}},
 	}
 
@@ -232,7 +281,7 @@ func TestProviderCapabilitiesRequireWatchRootPlanner(t *testing.T) {
 
 func TestProviderCapabilitiesFallbackWatchPlanRetainsOnlyRootMetadata(t *testing.T) {
 	provider := &watchRootCapabilityTestProvider{
-		ProviderBase: ProviderBase{Def: AgentDef{Type: "legacy-watch-root-test"}},
+		Def: AgentDef{Type: "legacy-watch-root-test"},
 		plan: WatchPlan{Roots: []WatchRoot{{
 			Path:         "/sessions",
 			Recursive:    true,
@@ -287,9 +336,8 @@ type streamingSourceSetTestDouble struct {
 type streamingWithoutExactFactory struct{ testProviderFactory }
 
 func (factory streamingWithoutExactFactory) NewProvider(cfg ProviderConfig) Provider {
-	return &streamingWithoutExactProvider{testProvider: testProvider{ProviderBase: ProviderBase{
-		Def: factory.def, Caps: factory.caps, Config: cfg.Clone(),
-	}}}
+	return &streamingWithoutExactProvider{
+		Def: factory.def, Caps: factory.caps, Config: cfg.Clone()}
 }
 
 type streamingWithoutExactProvider struct{ testProvider }

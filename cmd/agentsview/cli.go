@@ -1,7 +1,8 @@
 package main
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -55,8 +56,7 @@ func withSilentExitCode(err error, code int) error {
 }
 
 func exitCodeFromError(err error) int {
-	var exitErr *cliExitError
-	if errors.As(err, &exitErr) {
+	if exitErr, ok := errors.AsType[*cliExitError](err); ok {
 		return exitErr.code
 	}
 	return 1
@@ -118,9 +118,11 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newUsageCommand())
 	root.AddCommand(newActivityCommand())
 	root.AddCommand(newPGCommand())
+	root.AddCommand(newRawSyncCommand())
 	root.AddCommand(newDuckDBCommand())
 	root.AddCommand(newEmbeddingsCommand())
 	root.AddCommand(newSessionCommand())
+	root.AddCommand(newCaptureCommand())
 	root.AddCommand(newMCPCommand())
 	root.AddCommand(newRecallCommand())
 	root.AddCommand(newStatsCommand())
@@ -609,8 +611,10 @@ func newActivityReportCommand() *cobra.Command {
 			"agent_minutes, cost, first_active, project, agent")
 	cmd.Flags().StringVar(&cfg.SessionsDirection, "sessions-direction", "",
 		"Session sort direction (default desc): asc or desc")
-	cmd.Flags().StringVar(&cfg.SessionsBucket, "sessions-bucket", "",
-		"Only sessions active in this zero-based bucket index")
+	cmd.Flags().StringVar(&cfg.SessionsBucketStart, "sessions-bucket-start", "",
+		"First zero-based bucket in the half-open session range")
+	cmd.Flags().StringVar(&cfg.SessionsBucketEnd, "sessions-bucket-end", "",
+		"Exclusive end of the zero-based session bucket range")
 	registerFormatFlags(cmd.Flags())
 	cmd.Flags().BoolVar(&cfg.NoSync, "no-sync", false, "Skip on-demand sync before querying")
 	cmd.Flags().BoolVar(&cfg.Offline, "offline", false, "Use fallback pricing only")
@@ -856,13 +860,14 @@ func newVersionCommand() *cobra.Command {
 		Args:         cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(versionJSON{
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), versionJSON{
 					SchemaVersion: 1,
 					Name:          "agentsview",
 					Version:       version,
 					Commit:        commit,
 					BuildDate:     buildDate,
 				})
+
 			}
 			printVersion(cmd.OutOrStdout())
 			return nil

@@ -67,8 +67,8 @@ type WatchBatch struct {
 	Paths           []string      `json:"paths,omitempty"`
 	Renames         []WatchRename `json:"renames,omitempty"`
 	ReconcileRoots  []string      `json:"reconcile_roots,omitempty"`
-	FullSync        bool          `json:"full_sync,omitempty"`
-	LostEvents      bool          `json:"lost_events,omitempty"`
+	FullSync        bool          `json:"full_sync,omitzero"`
+	LostEvents      bool          `json:"lost_events,omitzero"`
 	lifecycleTokens []backendLifecycleToken
 }
 
@@ -104,9 +104,9 @@ type WatcherOptions struct {
 }
 
 // WatchRetryError carries the authoritative reconciliation scope selected by a
-// callback after it classifies a batch. The watcher consumes only FullSync and
-// ReconcileRoots from WatchRetryBatch; ordinary paths and rename metadata are
-// never replayed through this protocol.
+// callback after it classifies a batch. The watcher consumes the retry scope
+// from WatchRetryBatch; ordinary paths are replayed only when no narrower
+// typed retry scope is available.
 type WatchRetryError interface {
 	error
 	WatchRetryBatch() WatchBatch

@@ -115,7 +115,7 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 	e.syncMu.Lock()
 	var stats SyncStats
 	defer func() {
-		if stats.Synced > 0 {
+		if stats.hasSessionChanges() {
 			e.emit("sessions")
 		}
 	}()
@@ -142,7 +142,6 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 				onProgress(progress)
 			}
 		}, syncWriteDefault, collectAndBatchOptions{
-			preserveMissingSources: true,
 			observeResult: func(job syncJob) {
 				result.FilesProcessed++
 				if job.incremental != nil {
@@ -186,8 +185,14 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 			}
 		}
 	}
-	e.finishSQLiteContainerPass(true, false)
 	e.anomalies.applyTo(&stats)
+	// Pass-level failures cannot be attributed to one container, so they
+	// poison the whole capture; a clean plan subset keeps its verification
+	// age and, being partial, never promotes.
+	if ctx.Err() != nil || processErr != nil || !stats.ProcessingComplete() {
+		e.poisonSQLiteContainerPass()
+	}
+	e.finishSQLiteContainerPass(true, false)
 	if !e.ephemeral {
 		e.persistSkipCache()
 	}
@@ -197,13 +202,13 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 	e.mu.Unlock()
 	result.Stats = stats
 
-	if stats.Synced > 0 {
+	if stats.Synced > 0 || stats.CwdUpdated > 0 {
 		log.Printf("sync: %d file(s) updated", stats.Synced)
 	}
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	if stats.Aborted || stats.Failed > 0 || stats.providerFailures > 0 {
+	if !stats.ProcessingComplete() {
 		return result, errors.Join(processErr, fmt.Errorf(
 			"changed-path plan sync incomplete: %d source or archive failures",
 			stats.Failed,

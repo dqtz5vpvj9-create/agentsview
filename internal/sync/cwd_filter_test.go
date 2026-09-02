@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"runtime"
 	"testing"
 
@@ -66,18 +67,16 @@ func TestCwdPrefixFilterAllows(t *testing.T) {
 // session recorded at the given cwd.
 func exclusionGateJob(cwd string) syncJob {
 	return syncJob{
-		path: "/src/session.jsonl",
-		processResult: processResult{
-			excludedSessionIDs: []string{"stale"},
-			results: []parser.ParseResult{
-				{Session: parser.ParsedSession{
-					ID:      "replacement",
-					Agent:   parser.AgentClaude,
-					Machine: "local",
-					Project: "proj",
-					Cwd:     cwd,
-				}},
-			},
+		path:               "/src/session.jsonl",
+		excludedSessionIDs: []string{"stale"},
+		results: []parser.ParseResult{
+			{Session: parser.ParsedSession{
+				ID:      "replacement",
+				Agent:   parser.AgentClaude,
+				Machine: "local",
+				Project: "proj",
+				Cwd:     cwd,
+			}},
 		},
 	}
 }
@@ -160,7 +159,7 @@ func TestCollectAndBatchKeepsAllowedSourceSiblingCurrent(t *testing.T) {
 	results <- syncJob{
 		agent: parser.AgentCowork,
 		path:  "/src/shared.jsonl",
-		processResult: processResult{results: []parser.ParseResult{
+		results: []parser.ParseResult{
 			{Session: parser.ParsedSession{
 				ID: "cowork:allowed", Agent: parser.AgentCowork,
 				Machine: "local", Project: "proj", Cwd: "/allowed/repo",
@@ -171,7 +170,7 @@ func TestCollectAndBatchKeepsAllowedSourceSiblingCurrent(t *testing.T) {
 				Machine: "local", Project: "proj", Cwd: "/outside/repo",
 				File: parser.FileInfo{Path: "/src/shared.jsonl"},
 			}},
-		}},
+		},
 	}
 	close(results)
 
@@ -212,25 +211,23 @@ func TestCollectAndBatchBaselinesAllowedMissingMemberForMixedCwdSource(
 			agent:   parser.AgentClaude,
 			path:    path,
 			machine: "local",
-			processResult: processResult{
-				results: []parser.ParseResult{
-					{Session: parser.ParsedSession{
-						ID: "replacement-allowed", Agent: parser.AgentClaude,
-						Machine: "local", Project: "proj", Cwd: "/allowed/new",
-						File: parser.FileInfo{Path: path},
-					}},
-					{Session: parser.ParsedSession{
-						ID: "replacement-filtered", Agent: parser.AgentClaude,
-						Machine: "local", Project: "proj", Cwd: "/outside/new",
-						File: parser.FileInfo{Path: path},
-					}},
-				},
-				sourceMissingMembers: []sourceMissingMember{{
-					sessionID: "stale-allowed",
-					filePath:  path,
-					machine:   "local",
+			results: []parser.ParseResult{
+				{Session: parser.ParsedSession{
+					ID: "replacement-allowed", Agent: parser.AgentClaude,
+					Machine: "local", Project: "proj", Cwd: "/allowed/new",
+					File: parser.FileInfo{Path: path},
+				}},
+				{Session: parser.ParsedSession{
+					ID: "replacement-filtered", Agent: parser.AgentClaude,
+					Machine: "local", Project: "proj", Cwd: "/outside/new",
+					File: parser.FileInfo{Path: path},
 				}},
 			},
+			sourceMissingMembers: []sourceMissingMember{{
+				sessionID: "stale-allowed",
+				filePath:  path,
+				machine:   "local",
+			}},
 		}
 		close(results)
 		return engine.collectAndBatch(
@@ -252,10 +249,7 @@ func TestCollectAndBatchBaselinesAllowedMissingMemberForMixedCwdSource(
 	require.Zero(t, second.Failed)
 	stale, err := database.GetSessionFull(ctx, "stale-allowed")
 	require.NoError(t, err)
-	require.NotNil(t, stale)
-	require.NotNil(t, stale.DeletionCause,
-		"the next mixed-CWD parse must retire the admitted missing member")
-	assert.Equal(t, "source_missing", *stale.DeletionCause)
+	assertSourceMissingState(t, stale)
 }
 
 func TestCollectAndBatchCancellationRevokesRejectedMissingMemberBaseline(
@@ -291,12 +285,12 @@ func TestCollectAndBatchCancellationRevokesRejectedMissingMemberBaseline(
 	results := make(chan syncJob, 2)
 	results <- syncJob{
 		agent: parser.AgentClaude, path: path, machine: "local",
-		processResult: processResult{sourceMissingMembers: []sourceMissingMember{
+		sourceMissingMembers: []sourceMissingMember{
 			{sessionID: allowedID, machine: "local", filePath: path},
 			{sessionID: rejectedID, machine: "local", filePath: path},
-		}},
+		},
 	}
-	results <- syncJob{processResult: processResult{err: context.Canceled}}
+	results <- syncJob{err: context.Canceled}
 	close(results)
 
 	stats := engine.collectAndBatch(
@@ -350,10 +344,10 @@ func TestCollectAndBatchFailureRevokesOnlyRejectedMissingMemberBaseline(
 	))
 	require.NoError(t, database.Update(func(tx *sql.Tx) error {
 		_, err := tx.Exec(`
-			CREATE TRIGGER fail_first_source_missing_tombstone
-			BEFORE UPDATE OF deleted_at ON sessions
+			CREATE TRIGGER fail_first_source_missing_mark
+			BEFORE UPDATE OF source_missing_at ON sessions
 			WHEN NEW.id = 'failed-mixed-11111111-2222-4333-8444-555555555555'
-			 AND NEW.deletion_cause = 'source_missing'
+			 AND NEW.source_missing_at IS NOT NULL
 			BEGIN
 				SELECT RAISE(FAIL, 'injected first-member tombstone failure');
 			END`)
@@ -368,10 +362,10 @@ func TestCollectAndBatchFailureRevokesOnlyRejectedMissingMemberBaseline(
 	results := make(chan syncJob, 1)
 	results <- syncJob{
 		agent: parser.AgentClaude, path: path, machine: "local",
-		processResult: processResult{sourceMissingMembers: []sourceMissingMember{
+		sourceMissingMembers: []sourceMissingMember{
 			{sessionID: failingID, machine: "local", filePath: path},
 			{sessionID: rejectedID, machine: "local", filePath: path},
-		}},
+		},
 	}
 	close(results)
 
@@ -416,10 +410,10 @@ func seedPartialSourceMissingFailure(
 	))
 	require.NoError(t, database.Update(func(tx *sql.Tx) error {
 		_, err := tx.Exec(`
-			CREATE TRIGGER fail_second_source_missing_tombstone
-			BEFORE UPDATE OF deleted_at ON sessions
+			CREATE TRIGGER fail_second_source_missing_mark
+			BEFORE UPDATE OF source_missing_at ON sessions
 			WHEN NEW.id = 'partial-success-b'
-			 AND NEW.deletion_cause = 'source_missing'
+			 AND NEW.source_missing_at IS NOT NULL
 			BEGIN
 				SELECT RAISE(FAIL, 'injected later-member tombstone failure');
 			END`)
@@ -451,9 +445,7 @@ func TestSyncAllCountsAndEmitsPartialSourceMissingTombstones(t *testing.T) {
 		"a failed pass must notify clients about its committed tombstone")
 	first, err := fx.db.GetSessionFull(t.Context(), firstID)
 	require.NoError(t, err)
-	require.NotNil(t, first)
-	require.NotNil(t, first.DeletionCause)
-	assert.Equal(t, "source_missing", *first.DeletionCause)
+	assertSourceMissingState(t, first)
 	failing, err := fx.db.GetSession(t.Context(), failingID)
 	require.NoError(t, err)
 	assert.NotNil(t, failing, "the member that failed to tombstone must remain active")
@@ -485,9 +477,7 @@ func TestSyncThenRunEmitsPartialSourceMissingTombstones(t *testing.T) {
 		"coordinated completion must notify clients about its committed tombstone")
 	first, err := fx.db.GetSessionFull(t.Context(), firstID)
 	require.NoError(t, err)
-	require.NotNil(t, first)
-	require.NotNil(t, first.DeletionCause)
-	assert.Equal(t, "source_missing", *first.DeletionCause)
+	assertSourceMissingState(t, first)
 	failing, err := fx.db.GetSession(t.Context(), failingID)
 	require.NoError(t, err)
 	assert.NotNil(t, failing, "the member that failed to tombstone must remain active")
@@ -514,9 +504,7 @@ func TestSyncSingleSessionEmitsPartialSourceMissingTombstones(t *testing.T) {
 		"a failed single-session sync must notify clients about its committed tombstone")
 	first, err := fx.db.GetSessionFull(t.Context(), firstID)
 	require.NoError(t, err)
-	require.NotNil(t, first)
-	require.NotNil(t, first.DeletionCause)
-	assert.Equal(t, "source_missing", *first.DeletionCause)
+	assertSourceMissingState(t, first)
 	failing, err := fx.db.GetSession(t.Context(), failingID)
 	require.NoError(t, err)
 	assert.NotNil(t, failing, "the member that failed to tombstone must remain active")
@@ -584,8 +572,12 @@ func TestReconcileWatchRootsRevokesRejectedBaselineOnPageFailure(
 ) {
 	fx := newEngineFixture(t)
 	path := fx.writeClaudeSession(t, "project", "reconcile-filtered.jsonl", "first")
-	require.Equal(t, 1, fx.engine.SyncAll(t.Context(), nil).Synced)
+	filteredPath := fx.writeClaudeSession(
+		t, "project", "reconcile-source-filtered.jsonl", "first",
+	)
+	require.Equal(t, 2, fx.engine.SyncAll(t.Context(), nil).Synced)
 	primaryID := fx.sessionIDFor(t, path)
+	filteredID := fx.sessionIDFor(t, filteredPath)
 
 	rejectedID, failingID := seedPartialSourceMissingFailure(
 		t, fx.db, primaryID, path,
@@ -600,6 +592,13 @@ func TestReconcileWatchRootsRevokesRejectedBaselineOnPageFailure(
 			END
 			WHERE id IN (?, ?)`,
 			rejectedID, failingID, rejectedID, failingID,
+		)
+		return err
+	}))
+	require.NoError(t, fx.db.Update(func(tx *sql.Tx) error {
+		_, err := tx.Exec(
+			"UPDATE sessions SET cwd = '/outside/project' WHERE id = ?",
+			filteredID,
 		)
 		return err
 	}))
@@ -638,31 +637,57 @@ func TestReconcileWatchRootsRevokesRejectedBaselineOnPageFailure(
 	).Scan(&primaryBaseline))
 	assert.Zero(t, primaryBaseline,
 		"failed-page cleanup must not grant new source proof")
+	var filteredBaseline int
+	require.NoError(t, fx.db.Reader().QueryRow(`
+		SELECT count(*) FROM local_session_source_baselines
+		WHERE session_id = ?`, filteredID,
+	).Scan(&filteredBaseline))
+	assert.Zero(t, filteredBaseline,
+		"a mixed page failure must revoke source-wide proof rejected by CWD")
 	rejected, err := fx.db.GetSession(t.Context(), rejectedID)
 	require.NoError(t, err)
 	assert.NotNil(t, rejected,
 		"the CWD-rejected stale fork must remain active")
+
+	require.NoError(t, fx.db.Update(func(tx *sql.Tx) error {
+		_, err := tx.Exec("DROP TRIGGER fail_second_source_missing_mark")
+		return err
+	}))
+	require.NoError(t, os.Remove(filteredPath))
+	require.NoError(t, fx.engine.ReconcileWatchRoots(
+		t.Context(), []string{fx.claudeDir}, false,
+	))
+	preserved, err := fx.db.GetSession(t.Context(), filteredID)
+	require.NoError(t, err)
+	assert.NotNil(t, preserved,
+		"a source removed before retry must not tombstone its filtered session")
 }
 
-func TestReconcileWatchRootsRevokesRejectedBaselineOnFinalizationFailure(
+func TestReconcileWatchRootsRevokesSourceWideRejectedBaselineOnFinalizationFailure(
 	t *testing.T,
 ) {
 	fx := newEngineFixture(t)
 	path := fx.writeClaudeSession(t, "project", "finalize-filtered.jsonl", "first")
 	require.Equal(t, 1, fx.engine.SyncAll(t.Context(), nil).Synced)
 	primaryID := fx.sessionIDFor(t, path)
-	rejectedID := primaryID + "-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
-	require.NoError(t, fx.db.UpsertSession(db.Session{
-		ID: rejectedID, Project: "project", Machine: "local", Agent: "claude",
-		Cwd: "/outside/project", ParentSessionID: &primaryID,
-		RelationshipType: "fork", FilePath: &path,
+	require.NoError(t, fx.db.Update(func(tx *sql.Tx) error {
+		_, err := tx.Exec(`
+			UPDATE sessions
+			SET cwd = '/outside/project', machine = 'legacy-machine'
+			WHERE id = ?`,
+			primaryID,
+		)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(`
+			UPDATE local_session_source_baselines
+			SET machine = 'legacy-machine'
+			WHERE session_id = ?`,
+			primaryID,
+		)
+		return err
 	}))
-	require.NoError(t, fx.db.SetSessionDataVersion(rejectedID, 0))
-	require.NoError(t, fx.db.BaselineActiveSessionSourceOwnerships(
-		t.Context(), []db.SessionSourceOwnership{{
-			ID: rejectedID, Machine: "local", Agent: "claude", FilePath: path,
-		}},
-	))
 	fx.engine.Close()
 	fx.engine = NewEngine(fx.db, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
@@ -684,31 +709,199 @@ func TestReconcileWatchRootsRevokesRejectedBaselineOnFinalizationFailure(
 		return nil, lookupErr
 	}
 
-	fx.appendClaudeMessage(t, path, "changed")
 	err := fx.engine.ReconcileWatchRoots(
 		t.Context(), []string{fx.claudeDir}, false,
 	)
 
 	require.ErrorIs(t, err, lookupErr)
-	assert.Equal(t, 1, lookupCalls)
-	var rejectedBaseline int
-	require.NoError(t, fx.db.Reader().QueryRow(`
-		SELECT count(*) FROM local_session_source_baselines
-		WHERE session_id = ?`, rejectedID,
-	).Scan(&rejectedBaseline))
-	assert.Zero(t, rejectedBaseline,
-		"failed finalization must revoke proof from a CWD-rejected fork")
+	assert.NotZero(t, lookupCalls)
 	var primaryBaseline int
 	require.NoError(t, fx.db.Reader().QueryRow(`
 		SELECT count(*) FROM local_session_source_baselines
 		WHERE session_id = ?`, primaryID,
 	).Scan(&primaryBaseline))
-	assert.Equal(t, 1, primaryBaseline,
-		"reject-only cleanup must preserve admitted source proof")
-	rejected, err := fx.db.GetSession(t.Context(), rejectedID)
+	assert.Zero(t, primaryBaseline,
+		"failed finalization must revoke source-wide proof rejected by CWD")
+
+	fx.engine.sourceAttributionLookupOverride = nil
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, fx.engine.ReconcileWatchRoots(
+		t.Context(), []string{fx.claudeDir}, false,
+	))
+	preserved, err := fx.db.GetSession(t.Context(), primaryID)
 	require.NoError(t, err)
-	assert.NotNil(t, rejected,
-		"the CWD-rejected stale fork must remain active")
+	assert.NotNil(t, preserved,
+		"a source removed before retry must not tombstone its filtered session")
+}
+
+func TestReconcileWatchRootsRevokesRejectedBaselineOnSpoolFailure(
+	t *testing.T,
+) {
+	for _, tc := range []struct {
+		name      string
+		failWrite bool
+	}{
+		{name: "marker write", failWrite: true},
+		{name: "marker query"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newEngineFixture(t)
+			path := fx.writeClaudeSession(t, "project", "spool-filtered.jsonl", "first")
+			require.Equal(t, 1, fx.engine.SyncAll(t.Context(), nil).Synced)
+			primaryID := fx.sessionIDFor(t, path)
+			rejectedID := primaryID + "-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+			require.NoError(t, fx.db.UpsertSession(db.Session{
+				ID: rejectedID, Project: "project", Machine: "local", Agent: "claude",
+				Cwd: "/outside/project", ParentSessionID: &primaryID,
+				RelationshipType: "fork", FilePath: &path,
+			}))
+			require.NoError(t, fx.db.SetSessionDataVersion(rejectedID, 0))
+			require.NoError(t, fx.db.BaselineActiveSessionSourceOwnerships(
+				t.Context(), []db.SessionSourceOwnership{{
+					ID: rejectedID, Machine: "local", Agent: "claude", FilePath: path,
+				}},
+			))
+			fx.engine.Close()
+			fx.engine = NewEngine(fx.db, EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{
+					parser.AgentClaude: {fx.claudeDir},
+				},
+				Machine:            "local",
+				IncludeCwdPrefixes: []string{"/workspace/allowed"},
+			})
+			t.Cleanup(fx.engine.Close)
+			injected := errors.New("injected non-authoritative spool failure")
+			fx.engine.reconciliationSpoolFactory = func(
+				path string,
+			) (reconciliationSpoolStore, error) {
+				spool, err := newReconciliationSpool(path)
+				if err != nil {
+					return nil, err
+				}
+				return &nonAuthoritativeFailureSpool{
+					reconciliationSpoolStore: spool,
+					err:                      injected,
+					failWrite:                tc.failWrite,
+				}, nil
+			}
+
+			fx.appendClaudeMessage(t, path, "changed")
+			err := fx.engine.ReconcileWatchRoots(
+				t.Context(), []string{fx.claudeDir}, false,
+			)
+
+			require.ErrorIs(t, err, injected)
+			var rejectedBaseline int
+			require.NoError(t, fx.db.Reader().QueryRow(`
+				SELECT count(*) FROM local_session_source_baselines
+				WHERE session_id = ?`, rejectedID,
+			).Scan(&rejectedBaseline))
+			assert.Zero(t, rejectedBaseline,
+				"a spool failure must revoke proof from a CWD-rejected fork")
+			rejected, getErr := fx.db.GetSession(t.Context(), rejectedID)
+			require.NoError(t, getErr)
+			assert.NotNil(t, rejected,
+				"the CWD-rejected stale fork must remain active")
+		})
+	}
+}
+
+func TestReconcileWatchRootsRevokesSourceWideRejectedBaselineOnSpoolFailure(
+	t *testing.T,
+) {
+	for _, tc := range []struct {
+		name      string
+		failWrite bool
+	}{
+		{name: "marker write", failWrite: true},
+		{name: "marker query"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newEngineFixture(t)
+			path := fx.writeClaudeSession(
+				t, "project", "spool-source-filtered.jsonl", "first",
+			)
+			require.Equal(t, 1, fx.engine.SyncAll(t.Context(), nil).Synced)
+			sessionID := fx.sessionIDFor(t, path)
+			require.NoError(t, fx.db.Update(func(tx *sql.Tx) error {
+				_, err := tx.Exec(
+					"UPDATE sessions SET cwd = '/outside/project' WHERE id = ?",
+					sessionID,
+				)
+				return err
+			}))
+			fx.engine.Close()
+			fx.engine = NewEngine(fx.db, EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{
+					parser.AgentClaude: {fx.claudeDir},
+				},
+				Machine:            "local",
+				IncludeCwdPrefixes: []string{"/workspace/allowed"},
+			})
+			t.Cleanup(fx.engine.Close)
+			defaultFactory := fx.engine.reconciliationSpoolFactory
+			injected := errors.New("injected non-authoritative spool failure")
+			fx.engine.reconciliationSpoolFactory = func(
+				path string,
+			) (reconciliationSpoolStore, error) {
+				spool, err := defaultFactory(path)
+				if err != nil {
+					return nil, err
+				}
+				return &nonAuthoritativeFailureSpool{
+					reconciliationSpoolStore: spool,
+					err:                      injected,
+					failWrite:                tc.failWrite,
+				}, nil
+			}
+
+			err := fx.engine.ReconcileWatchRoots(
+				t.Context(), []string{fx.claudeDir}, false,
+			)
+			require.ErrorIs(t, err, injected)
+			var baselineCount int
+			require.NoError(t, fx.db.Reader().QueryRow(`
+				SELECT count(*) FROM local_session_source_baselines
+				WHERE session_id = ?`, sessionID,
+			).Scan(&baselineCount))
+			assert.Zero(t, baselineCount,
+				"a spool failure must revoke source-wide proof rejected by CWD")
+
+			fx.engine.reconciliationSpoolFactory = defaultFactory
+			require.NoError(t, os.Remove(path))
+			require.NoError(t, fx.engine.ReconcileWatchRoots(
+				t.Context(), []string{fx.claudeDir}, false,
+			))
+			preserved, getErr := fx.db.GetSession(t.Context(), sessionID)
+			require.NoError(t, getErr)
+			assert.NotNil(t, preserved,
+				"a source removed before retry must not tombstone its filtered session")
+		})
+	}
+}
+
+type nonAuthoritativeFailureSpool struct {
+	reconciliationSpoolStore
+	err       error
+	failWrite bool
+}
+
+func (spool *nonAuthoritativeFailureSpool) AddNonAuthoritativeScopes(
+	ctx context.Context, scopes []reconciliationSourceScope,
+) error {
+	if spool.failWrite {
+		return spool.err
+	}
+	return spool.reconciliationSpoolStore.AddNonAuthoritativeScopes(ctx, scopes)
+}
+
+func (spool *nonAuthoritativeFailureSpool) HasNonAuthoritativeScopes(
+	ctx context.Context, agent parser.AgentType,
+) (bool, error) {
+	if !spool.failWrite {
+		return false, spool.err
+	}
+	return spool.reconciliationSpoolStore.HasNonAuthoritativeScopes(ctx, agent)
 }
 
 func TestShouldAbortResyncSwap(t *testing.T) {

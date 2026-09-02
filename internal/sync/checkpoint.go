@@ -403,21 +403,21 @@ func buildCodexCheckpoint(
 	anchorDigest string,
 ) (*db.ParserCheckpoint, db.ParserCheckpointBlobs) {
 	return &db.ParserCheckpoint{
-			SessionID:        sessionID,
-			FileChangeTime:   changeTime,
-			Agent:            agent,
-			FilePath:         storedPath,
-			FileInode:        uint64(inode),
-			FileDevice:       uint64(device),
-			FileMTime:        mtime,
-			Offset:           newOffset,
-			TailAnchorDigest: anchorDigest,
-			Hash:             hash,
-			NextOrdinal:      nextOrdinal,
-			Version:          codexCheckpointVersion,
-		}, db.ParserCheckpointBlobs{
-			SessionID: sessionID,
-			Cursor:    cursor,
-			HashState: hashState,
-		}
+		SessionID:        sessionID,
+		FileChangeTime:   changeTime,
+		Agent:            agent,
+		FilePath:         storedPath,
+		FileInode:        uint64(inode),
+		FileDevice:       uint64(device),
+		FileMTime:        mtime,
+		Offset:           newOffset,
+		TailAnchorDigest: anchorDigest,
+		Hash:             hash,
+		NextOrdinal:      nextOrdinal,
+		Version:          codexCheckpointVersion,
+	}, db.ParserCheckpointBlobs{
+		SessionID: sessionID,
+		Cursor:    cursor,
+		HashState: hashState,
+	}
 }

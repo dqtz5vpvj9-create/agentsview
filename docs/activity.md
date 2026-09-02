@@ -173,7 +173,7 @@ See [CLI Reference](/commands/#agentsview-activity-report) and
 ### JSON Contract
 
 `agentsview activity report --json` and `/api/v1/activity/report` share one
-versioned JSON contract. Schema version 6 contains a bounded first session page,
+versioned JSON contract. Schema version 7 contains a bounded first session page,
 `sessions_total`, `sessions_next_cursor`, and a signed self-describing
 `report_id`; it no longer contains the message-sized `intervals` array. The CLI
 and HTTP report use the same `schema_version` and move in lockstep; if the CLI
@@ -194,9 +194,10 @@ Session pages are available at:
 GET /api/v1/activity/report/{report_id}/sessions
 ```
 
-The endpoint accepts `limit`, `cursor`, `sort`, `direction`, and an optional
-zero-based `bucket`. Ordinary page responses contain only the bounded session
-page. Stateless clients that also need report metadata can request
+The endpoint accepts `limit`, `cursor`, `sort`, `direction`, and the optional
+zero-based half-open range `bucket_start` and `bucket_end`. Both range bounds
+must be present. Ordinary page responses contain only the bounded session page.
+Stateless clients that also need report metadata can request
 `include_report=true`; refresh-required responses always include the complete
 replacement report. Ordering always ends with session ID ascending, so a signed
 position cursor remains deterministic after cache eviction or daemon restart.
@@ -208,12 +209,16 @@ report and first page together, rather than mixing a new table with an old
 summary. Sync notifications continue to mark the dashboard stale and do not
 automatically reaggregate it.
 
+Version 7 applies provider-specific billing identity to computed usage and
+preserves reported cost rows and custom pricing overrides. Costs from v6 and v7
+must not be compared as the same billing semantics.
+
 Each project, branch, agent, or machine filter is limited to 1,024 UTF-8 bytes,
 with a 3,072-byte combined limit. The server also validates the fully encoded
 signed `report_id`, including JSON escaping and base64 expansion, before
 aggregation.
 
-Older CLIs do not validate `schema_version` and can decode a v6 plain-JSON
+Older CLIs do not validate `schema_version` and can decode a v7 plain-JSON
 response. The embedded first page deliberately preserves the prior default
 ordering—agent-minutes descending, untimed sessions last, session ID ascending
 as the final tie-break—so their five-row human summary remains compatible. They
@@ -235,7 +240,8 @@ The activity report includes the shared report-level `pricing` and `projects`
 blocks. `pricing.models` is keyed by reported model names. Each entry contains
 an aggregate `cost_source` and explicit `resolutions` with `priced_model` and
 effective rate fields such as `input_cost_per_mtok`, `output_cost_per_mtok`,
-`cache_write_cost_per_mtok`, and `cache_read_cost_per_mtok`, plus available
+`cache_write_cost_per_mtok`, `cache_write_1h_cost_per_mtok`, and
+`cache_read_cost_per_mtok`, plus available
 `bands` and report-specific `application` counts. Every project-bearing report
 row contains an opaque `project_key`. `projects` is keyed by that value and
 carries the presentation-only `display_label`; unknown project identity is

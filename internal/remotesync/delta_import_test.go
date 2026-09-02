@@ -35,9 +35,8 @@ func (f deltaPlanFactory) Capabilities() parser.Capabilities {
 }
 
 func (f deltaPlanFactory) NewProvider(cfg parser.ProviderConfig) parser.Provider {
-	return &deltaPlanProvider{ProviderBase: parser.ProviderBase{
-		Def: f.Definition(), Caps: f.Capabilities(), Config: cfg.Clone(),
-	}, relevance: f.relevance}
+	return &deltaPlanProvider{
+		Def: f.Definition(), Caps: f.Capabilities(), Config: cfg.Clone(), relevance: f.relevance}
 }
 
 type deltaPlanProvider struct {
@@ -217,6 +216,15 @@ func TestJournalOutcomeClosedSet(t *testing.T) {
 		assert.True(t, outcome.Valid(), "outcome %q must be reportable", outcome)
 	}
 	assert.False(t, JournalOutcome("retained(invented)").Valid())
+}
+
+func TestDeferredDeltaRetainsJournalAndRequiredDataVersion(t *testing.T) {
+	engineStats := syncpkg.SyncStats{Deferred: 1}
+	assert.False(t, shouldPersistImportDataVersion(engineStats))
+	assert.Equal(t, JournalProcessingFailures, deltaImportOutcome(engineStats),
+		"deferred processing retains the journal")
+	assert.NotEqual(t, JournalRetired, deltaImportOutcome(engineStats),
+		"deferred processing must not advance the required data version")
 }
 
 func TestPreparedDeltaImportPoisonProjectionDisarmsAndRearms(t *testing.T) {

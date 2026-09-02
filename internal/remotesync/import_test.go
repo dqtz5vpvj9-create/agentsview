@@ -5,7 +5,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"net/http"
 	"os"
@@ -200,6 +200,24 @@ func TestPreparedHTTPSyncRebuildOutcomeClassification(t *testing.T) {
 	}
 }
 
+func TestPreparedHTTPSyncDeferredRebuildIsNotCommitReady(t *testing.T) {
+	remote := newMirrorTestRemote(t)
+	remote.writeSession(t, "session.jsonl",
+		time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC), "deferred rebuild")
+	_, hs := newMirrorSync(t, remote, t.TempDir())
+	prepared, err := hs.Prepare(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, prepared.Close()) })
+	contributor, err := prepared.RebuildContributor()
+	require.NoError(t, err)
+
+	contributor.Finished(syncpkg.SyncStats{Deferred: 1}, nil)
+	assert.False(t, prepared.commitReady)
+	assert.Equal(t, JournalProcessingFailures, prepared.mirrorImport.outcome)
+	require.ErrorContains(t, prepared.Commit(), "not ready to commit")
+	assert.FileExists(t, mirrorJournalPath(MirrorDir(hs.DataDir, hs.Host)))
+}
+
 func TestPreparedHTTPSyncRebuildRetirementFailureRecordsDuration(t *testing.T) {
 	remote := newMirrorTestRemote(t)
 	remote.writeSession(t, "session.jsonl",
@@ -277,6 +295,57 @@ func TestImporterImportsExtractedRemoteFiles(t *testing.T) {
 	require.NotNil(t, full)
 	require.NotNil(t, full.FilePath)
 	assert.Contains(t, *full.FilePath, "devbox:/home/wes/.claude/projects/test-project/session.jsonl")
+}
+
+func TestRequireCompleteRejectsDeferredWithoutHardFailure(t *testing.T) {
+	err := requireCompleteProcessing(syncpkg.SyncStats{Deferred: 1})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed=0")
+	assert.Contains(t, err.Error(), "deferred=1")
+}
+
+func TestImporterHydratesIcodematePersistedToolResult(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+
+	extracted := t.TempDir()
+	remoteRoot := "/remote/icodemate/projects"
+	remoteSession := remoteRoot + "/project/sidecar.jsonl"
+	remoteResult := remoteRoot + "/project/sidecar/tool-results/output.txt"
+	localSession := remappedRemotePath(extracted, remoteSession)
+	localResult := remappedRemotePath(extracted, remoteResult)
+	require.NoError(t, os.MkdirAll(filepath.Dir(localResult), 0o755))
+	require.NoError(t, os.WriteFile(localResult, []byte("remote persisted output\n"), 0o644))
+
+	persistedPath, err := json.Marshal(remoteResult)
+	require.NoError(t, err)
+	placeholder := "<persisted-output>\nOutput too large. Full output saved to: " +
+		remoteResult + "\n</persisted-output>"
+	placeholderJSON, err := json.Marshal(placeholder)
+	require.NoError(t, err)
+	transcript := strings.Join([]string{
+		`{"type":"user","timestamp":"2024-01-01T00:00:00Z","uuid":"u1","message":{"content":"run it"}}`,
+		`{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"make logs"}}]}}`,
+		`{"type":"user","timestamp":"2024-01-01T00:00:02Z","uuid":"u2","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":` + string(placeholderJSON) + `}]},"toolUseResult":{"persistedOutputPath":` + string(persistedPath) + `}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(localSession, []byte(transcript), 0o644))
+
+	stats, err := Importer{Host: "devbox", DB: database}.ImportExtracted(
+		t.Context(), TargetSet{Dirs: map[parser.AgentType][]string{
+			parser.AgentIcodemate: {remoteRoot},
+		}}, extracted,
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.SessionsSynced)
+	messages, err := database.GetMessages(
+		t.Context(), "devbox~icodemate:sidecar", 0, 10, true,
+	)
+	require.NoError(t, err)
+	require.Len(t, messages, 2)
+	require.Len(t, messages[1].ToolCalls, 1)
+	assert.Equal(t, "remote persisted output\n",
+		messages[1].ToolCalls[0].ResultContent)
 }
 
 func TestImporterReturnsPartialStatsWhenOneSourceFails(t *testing.T) {

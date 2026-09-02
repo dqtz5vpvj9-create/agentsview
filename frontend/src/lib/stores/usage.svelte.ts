@@ -6,25 +6,20 @@ import type {
   TopUsageSessionsResponse,
 } from "../api/types/usage.js";
 import { UsageService } from "../api/generated/index";
-import {
-  ApiError,
-  callGenerated,
-  isAbortError,
-} from "../api/runtime.js";
+import { ApiError, callGenerated, isAbortError } from "../api/runtime.js";
 import { sessions } from "./sessions.svelte.js";
 import { perf, type PerfEntryStatus } from "./perf.svelte.js";
 import { rollingRange, today } from "../utils/dates.js";
-import {
-  ALL_TOKEN_TYPES,
-  canonicalTokenTypes,
-  type UsageTokenType,
-} from "./usageTokenTypes.js";
+import { ALL_TOKEN_TYPES, canonicalTokenTypes, type UsageTokenType } from "./usageTokenTypes.js";
 
 type UsageParams = Parameters<typeof UsageService.getApiV1UsageSummary>[0];
-type UsagePairwiseParams =
-  Parameters<typeof UsageService.getApiV1UsagePairwiseComparison>[0];
+type UsagePairwiseParams = Parameters<typeof UsageService.getApiV1UsagePairwiseComparison>[0];
 type UsagePanel = "summary" | "comparison" | "pairwise" | "topSessions";
 type FetchResult = "ok" | "error" | "aborted";
+type FetchAllOptions = {
+  preserveTimeRange?: boolean;
+  refreshTimeSeriesContext?: boolean;
+};
 type LoadedUsageSummary = {
   version: number;
   summary: UsageSummaryResponse;
@@ -39,6 +34,12 @@ export interface UsagePairwiseSideSelection {
 export interface UsagePairwiseSelection {
   left: UsagePairwiseSideSelection;
   right: UsagePairwiseSideSelection;
+}
+
+export interface UsageProjectFilterItem {
+  id: string;
+  name: string;
+  count?: number;
 }
 
 export type GroupBy = "project" | "model" | "agent";
@@ -64,9 +65,7 @@ function isGroupBy(value: unknown): value is GroupBy {
 }
 
 function isUnknownProjectKeyError(error: unknown): boolean {
-  return error instanceof ApiError &&
-    error.status === 400 &&
-    error.code === "unknown_project_key";
+  return error instanceof ApiError && error.status === 400 && error.code === "unknown_project_key";
 }
 
 function loadToggles(): Toggles {
@@ -191,13 +190,128 @@ function samePairwiseSelection(
   left: UsagePairwiseSelection,
   right: UsagePairwiseSelection,
 ): boolean {
-  return left.left.dimension === right.left.dimension &&
+  return (
+    left.left.dimension === right.left.dimension &&
     left.left.value === right.left.value &&
     left.right.dimension === right.right.dimension &&
-    left.right.value === right.right.value;
+    left.right.value === right.right.value
+  );
 }
 
 export type UsageMode = "cost" | "token";
+
+function summaryForDateRange(
+  summary: UsageSummaryResponse,
+  from: string,
+  to: string,
+): UsageSummaryResponse {
+  const daily = summary.daily.filter((day) => day.date >= from && day.date <= to);
+  const projectTotals = new Map<string, UsageSummaryResponse["projectTotals"][number]>();
+  const modelTotals = new Map<string, UsageSummaryResponse["modelTotals"][number]>();
+  const agentTotals = new Map<string, UsageSummaryResponse["agentTotals"][number]>();
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheCreationTokens = 0;
+  let cacheReadTokens = 0;
+  let totalMicrodollars = 0;
+
+  for (const day of daily) {
+    inputTokens += day.inputTokens;
+    outputTokens += day.outputTokens;
+    cacheCreationTokens += day.cacheCreationTokens;
+    cacheReadTokens += day.cacheReadTokens;
+    totalMicrodollars += day.totalCost.microdollars;
+
+    for (const item of day.projectBreakdowns ?? []) {
+      const total = projectTotals.get(item.project_key) ?? {
+        project_key: item.project_key,
+        project: item.project,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        cost: { microdollars: 0 },
+      };
+      total.inputTokens += item.inputTokens;
+      total.outputTokens += item.outputTokens;
+      total.cacheCreationTokens += item.cacheCreationTokens;
+      total.cacheReadTokens += item.cacheReadTokens;
+      total.cost.microdollars += item.cost.microdollars;
+      projectTotals.set(item.project_key, total);
+    }
+
+    for (const item of day.modelBreakdowns ?? []) {
+      const total = modelTotals.get(item.modelName) ?? {
+        model: item.modelName,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        cost: { microdollars: 0 },
+      };
+      total.inputTokens += item.inputTokens;
+      total.outputTokens += item.outputTokens;
+      total.cacheCreationTokens += item.cacheCreationTokens;
+      total.cacheReadTokens += item.cacheReadTokens;
+      total.cost.microdollars += item.cost.microdollars;
+      modelTotals.set(item.modelName, total);
+    }
+
+    for (const item of day.agentBreakdowns ?? []) {
+      const total = agentTotals.get(item.agent) ?? {
+        agent: item.agent,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        cost: { microdollars: 0 },
+      };
+      total.inputTokens += item.inputTokens;
+      total.outputTokens += item.outputTokens;
+      total.cacheCreationTokens += item.cacheCreationTokens;
+      total.cacheReadTokens += item.cacheReadTokens;
+      total.cost.microdollars += item.cost.microdollars;
+      agentTotals.set(item.agent, total);
+    }
+  }
+
+  const byCost = <T extends { cost: { microdollars: number } }>(a: T, b: T) =>
+    b.cost.microdollars - a.cost.microdollars;
+  const cacheHitDenominator = cacheReadTokens + inputTokens;
+
+  return {
+    ...summary,
+    from,
+    to,
+    daily,
+    totals: {
+      inputTokens,
+      outputTokens,
+      cacheCreationTokens,
+      cacheReadTokens,
+      totalCost: { microdollars: totalMicrodollars },
+    },
+    projectTotals: [...projectTotals.values()].sort(
+      (a, b) => byCost(a, b) || a.project_key.localeCompare(b.project_key),
+    ),
+    modelTotals: [...modelTotals.values()].sort(
+      (a, b) => byCost(a, b) || a.model.localeCompare(b.model),
+    ),
+    agentTotals: [...agentTotals.values()].sort(
+      (a, b) => byCost(a, b) || a.agent.localeCompare(b.agent),
+    ),
+    cacheStats: {
+      cacheReadTokens,
+      cacheCreationTokens,
+      uncachedInputTokens: inputTokens,
+      outputTokens,
+      hitRate: cacheHitDenominator > 0 ? cacheReadTokens / cacheHitDenominator : 0,
+      savingsVsUncached: { microdollars: 0 },
+    },
+    unsupportedUsage: undefined,
+    comparison: undefined,
+  };
+}
 
 class UsageStore {
   from: string = $state(rollingRange(DEFAULT_WINDOW_DAYS).from);
@@ -205,9 +319,8 @@ class UsageStore {
   isPinned: boolean = $state(false);
   windowDays: number = $state(DEFAULT_WINDOW_DAYS);
   mode: UsageMode = $state("cost");
-  selectedTokenTypes: UsageTokenType[] = $state([
-    ...ALL_TOKEN_TYPES,
-  ]);
+  selectedTokenTypes: UsageTokenType[] = $state([...ALL_TOKEN_TYPES]);
+  selectedTimeRange: { from: string; to: string } | null = $state(null);
 
   // Excluded project items and included model items
   // (comma-separated strings). Empty models = all models.
@@ -217,6 +330,7 @@ class UsageStore {
   excludedAgents: string = $state("");
   excludedModels: string = $state("");
   selectedModels: string = $state("");
+  knownProjects: UsageProjectFilterItem[] = $state([]);
 
   constructor() {
     const saved = loadUsageFilters();
@@ -228,11 +342,10 @@ class UsageStore {
   }
 
   summary = $state<UsageSummaryResponse | null>(null);
-  pairwiseComparison =
-    $state<UsagePairwiseComparisonResponse | null>(null);
-  pairwiseSelection = $state<UsagePairwiseSelection>(
-    emptyPairwiseSelection(),
-  );
+  private timeSeriesContextSummary = $state<UsageSummaryResponse | null>(null);
+  isTimeRangeSummaryProvisional = $state(false);
+  pairwiseComparison = $state<UsagePairwiseComparisonResponse | null>(null);
+  pairwiseSelection = $state<UsagePairwiseSelection>(emptyPairwiseSelection());
   topSessions = $state<TopUsageSessionsResponse | null>(null);
   lastUpdatedAt: number | null = $state(null);
   hasNewData: boolean = $state(false);
@@ -275,35 +388,28 @@ class UsageStore {
 
   private baseParams(): UsageParams {
     const sessionFilters = sessions.filters;
-    const p: UsageParams = {
+    const range = this.selectedTimeRange ?? {
       from: this.from,
       to: this.to,
+    };
+    const p: UsageParams = {
+      from: range.from,
+      to: range.to,
       timezone: this.timezone,
       project: sessionFilters.project || undefined,
       machine: sessionFilters.machine || undefined,
       agent: sessionFilters.agent || undefined,
       termination: sessionFilters.termination || undefined,
       minUserMessages:
-        sessionFilters.minUserMessages > 0
-          ? sessionFilters.minUserMessages
-          : undefined,
+        sessionFilters.minUserMessages > 0 ? sessionFilters.minUserMessages : undefined,
       includeOneShot: sessionFilters.includeOneShot,
-      includeAutomated:
-        sessionFilters.includeAutomated || undefined,
+      includeAutomated: sessionFilters.includeAutomated || undefined,
       activeSince: sessionFilters.recentlyActive
-        ? new Date(
-            Date.now() - 24 * 60 * 60 * 1000,
-          ).toISOString()
+        ? new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
         : undefined,
     };
-    if (
-      sessionFilters.hideUnknownProject &&
-      sessionFilters.project !== "unknown"
-    ) {
-      p.excludeProject = joinCsvParts(
-        this.excludedProjects,
-        "unknown",
-      );
+    if (sessionFilters.hideUnknownProject && sessionFilters.project !== "unknown") {
+      p.excludeProject = joinCsvParts(this.excludedProjects, "unknown");
     } else if (this.excludedProjects) {
       p.excludeProject = this.excludedProjects;
     }
@@ -319,34 +425,54 @@ class UsageStore {
     return p;
   }
 
+  get timeSeriesSummary(): UsageSummaryResponse | null {
+    return this.timeSeriesContextSummary ?? this.summary;
+  }
+
   get pairwiseModelOptions(): string[] {
     return (this.summary?.modelTotals ?? []).map((entry) => entry.model);
   }
 
   get pairwiseProjectOptions(): string[] {
-    return (this.summary?.projectTotals ?? []).map(
-      (entry) => entry.project_key,
-    );
+    return (this.summary?.projectTotals ?? []).map((entry) => entry.project_key);
   }
 
   pairwiseProjectLabel(key: string): string {
-    return this.summary?.projectTotals.find(
-      (entry) => entry.project_key === key,
-    )?.project ?? "";
+    return this.summary?.projectTotals.find((entry) => entry.project_key === key)?.project ?? "";
   }
 
-  private pairwiseOptionsFor(
-    dimension: UsagePairwiseDimension,
-  ): string[] {
-    return dimension === "project"
-      ? this.pairwiseProjectOptions
-      : this.pairwiseModelOptions;
+  mergeKnownProjects(
+    projects: Array<{ project_key: string; project: string }>,
+    counts: Record<string, number>,
+  ): void {
+    if (projects.length === 0) return;
+    const byKey = new Map(this.knownProjects.map((project) => [project.id, project]));
+    let changed = false;
+    for (const project of projects) {
+      if (!project.project_key || !project.project) continue;
+      const existing = byKey.get(project.project_key);
+      const count = counts[project.project_key];
+      if (!existing || existing.name !== project.project || existing.count !== count) {
+        byKey.set(project.project_key, {
+          id: project.project_key,
+          name: project.project,
+          count,
+        });
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.knownProjects = [...byKey.values()].sort(
+        (a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id),
+      );
+    }
   }
 
-  private preferredPairwiseValue(
-    dimension: UsagePairwiseDimension,
-    fallback: string,
-  ): string {
+  private pairwiseOptionsFor(dimension: UsagePairwiseDimension): string[] {
+    return dimension === "project" ? this.pairwiseProjectOptions : this.pairwiseModelOptions;
+  }
+
+  private preferredPairwiseValue(dimension: UsagePairwiseDimension, fallback: string): string {
     const options = this.pairwiseOptionsFor(dimension);
     for (const option of options) {
       if (option !== fallback) return option;
@@ -358,10 +484,9 @@ class UsageStore {
     const current = this.pairwiseSelection;
     const currentLeftOptions = this.pairwiseOptionsFor(current.left.dimension);
     const currentRightOptions = this.pairwiseOptionsFor(current.right.dimension);
-    const leftValid = current.left.value !== "" &&
-      currentLeftOptions.includes(current.left.value);
-    const rightValid = current.right.value !== "" &&
-      currentRightOptions.includes(current.right.value);
+    const leftValid = current.left.value !== "" && currentLeftOptions.includes(current.left.value);
+    const rightValid =
+      current.right.value !== "" && currentRightOptions.includes(current.right.value);
     if (leftValid && rightValid) return false;
 
     const modelOptions = this.pairwiseModelOptions;
@@ -398,12 +523,18 @@ class UsageStore {
   }
 
   applyDateRange(from: string, to: string) {
+    this.selectedTimeRange = null;
+    this.timeSeriesContextSummary = null;
+    this.isTimeRangeSummaryProvisional = false;
     this.isPinned = true;
     this.from = from;
     this.to = to;
   }
 
   applyRollingWindow(days: number) {
+    this.selectedTimeRange = null;
+    this.timeSeriesContextSummary = null;
+    this.isTimeRangeSummaryProvisional = false;
     this.windowDays = days;
     this.isPinned = false;
     this.rollDates();
@@ -419,10 +550,38 @@ class UsageStore {
     this.fetchAll();
   }
 
-  setPairwiseSide(
-    side: UsagePairwiseSide,
-    updates: Partial<UsagePairwiseSideSelection>,
-  ): void {
+  setTimeRange(from: string, to: string) {
+    if (
+      from === to ||
+      (this.selectedTimeRange?.from === from && this.selectedTimeRange.to === to)
+    ) {
+      return;
+    }
+    if (this.selectedTimeRange === null) {
+      this.timeSeriesContextSummary = this.summary;
+    }
+    this.selectedTimeRange = { from, to };
+    if (this.timeSeriesContextSummary) {
+      this.summary = summaryForDateRange(this.timeSeriesContextSummary, from, to);
+      this.isTimeRangeSummaryProvisional = true;
+    }
+    this.topSessions = null;
+    this.errors.topSessions = null;
+    void this.fetchAll({ preserveTimeRange: true, refreshTimeSeriesContext: false });
+  }
+
+  clearTimeRange() {
+    if (this.selectedTimeRange === null) return;
+    this.selectedTimeRange = null;
+    if (this.timeSeriesContextSummary) {
+      this.summary = this.timeSeriesContextSummary;
+      this.timeSeriesContextSummary = null;
+    }
+    this.isTimeRangeSummaryProvisional = false;
+    void this.fetchAll();
+  }
+
+  setPairwiseSide(side: UsagePairwiseSide, updates: Partial<UsagePairwiseSideSelection>): void {
     const next: UsagePairwiseSelection = {
       left: { ...this.pairwiseSelection.left },
       right: { ...this.pairwiseSelection.right },
@@ -430,13 +589,11 @@ class UsageStore {
     const prev = next[side];
     const dimension = updates.dimension ?? prev.dimension;
     const options = this.pairwiseOptionsFor(dimension);
-    const value = updates.value ??
+    const value =
+      updates.value ??
       (options.includes(prev.value) && prev.dimension === dimension
         ? prev.value
-        : this.preferredPairwiseValue(
-            dimension,
-            next[side === "left" ? "right" : "left"].value,
-          ));
+        : this.preferredPairwiseValue(dimension, next[side === "left" ? "right" : "left"].value));
 
     next[side] = { dimension, value };
     this.pairwiseSelection = next;
@@ -449,32 +606,48 @@ class UsageStore {
   // Toggle an item's exclusion. Clicking an included item
   // excludes it; clicking an excluded item re-includes it.
   toggleProject(name: string): void {
-    this.excludedProjects = this.toggleCsv(
-      this.excludedProjects, name,
-    );
+    this.excludedProjects = this.toggleCsv(this.excludedProjects, name);
     this.fetchAll();
   }
 
-  toggleProjectKey(key: string): void {
-    this.excludedProjectKeys = this.toggleCsv(
-      this.excludedProjectKeys, key,
-    );
-    this.fetchAll();
+  toggleProjectKey(key: string, options: { preserveTimeRange?: boolean } = {}): void {
+    const previous = this.excludedProjectKeys;
+    const hadSelectedTimeRange = options.preserveTimeRange && this.selectedTimeRange !== null;
+    this.excludedProjectKeys = this.toggleCsv(this.excludedProjectKeys, key);
+    const changed = this.excludedProjectKeys;
+    void this.fetchAllWithResult(options).then((result) => {
+      if (result !== "error" || !hadSelectedTimeRange || this.excludedProjectKeys !== changed)
+        return;
+      this.excludedProjectKeys = previous;
+      void this.fetchAll({ preserveTimeRange: true });
+    });
   }
 
-  toggleAgent(name: string): void {
-    this.excludedAgents = this.toggleCsv(
-      this.excludedAgents, name,
-    );
-    this.fetchAll();
+  toggleAgent(name: string, options: { preserveTimeRange?: boolean } = {}): void {
+    const previous = this.excludedAgents;
+    const hadSelectedTimeRange = options.preserveTimeRange && this.selectedTimeRange !== null;
+    this.excludedAgents = this.toggleCsv(this.excludedAgents, name);
+    const changed = this.excludedAgents;
+    void this.fetchAllWithResult(options).then((result) => {
+      if (result !== "error" || !hadSelectedTimeRange || this.excludedAgents !== changed) return;
+      this.excludedAgents = previous;
+      void this.fetchAll({ preserveTimeRange: true });
+    });
   }
 
-  toggleModel(name: string): void {
-    this.selectedModels = this.toggleCsv(
-      this.selectedModels, name,
-    );
+  toggleModel(name: string, options: { preserveTimeRange?: boolean } = {}): void {
+    const previousSelected = this.selectedModels;
+    const previousExcluded = this.excludedModels;
+    const hadSelectedTimeRange = options.preserveTimeRange && this.selectedTimeRange !== null;
+    this.selectedModels = this.toggleCsv(this.selectedModels, name);
     this.excludedModels = "";
-    this.fetchAll();
+    const changed = this.selectedModels;
+    void this.fetchAllWithResult(options).then((result) => {
+      if (result !== "error" || !hadSelectedTimeRange || this.selectedModels !== changed) return;
+      this.selectedModels = previousSelected;
+      this.excludedModels = previousExcluded;
+      void this.fetchAll({ preserveTimeRange: true });
+    });
   }
 
   private toggleCsv(csv: string, name: string): string {
@@ -521,8 +694,12 @@ class UsageStore {
     this.fetchAll();
   }
 
-  deselectAllProjects(all: string[]): void {
-    this.excludedProjects = all.join(",");
+  deselectAllProjectKeys(all: string[]): void {
+    const excluded = new Set(
+      this.excludedProjectKeys ? this.excludedProjectKeys.split(",").filter(Boolean) : [],
+    );
+    for (const key of all) excluded.add(key);
+    this.excludedProjectKeys = [...excluded].join(",");
     this.fetchAll();
   }
 
@@ -585,10 +762,7 @@ class UsageStore {
     if (canonical.length === 0) return false;
     if (
       canonical.length === this.selectedTokenTypes.length &&
-      canonical.every(
-        (tokenType, index) =>
-          tokenType === this.selectedTokenTypes[index],
-      )
+      canonical.every((tokenType, index) => tokenType === this.selectedTokenTypes[index])
     ) {
       return false;
     }
@@ -629,36 +803,67 @@ class UsageStore {
     this.to = to;
   }
 
-  async fetchAll() {
+  async fetchAll(options: FetchAllOptions = {}): Promise<void> {
+    await this.fetchAllWithResult(options);
+  }
+
+  private async fetchAllWithResult(options: FetchAllOptions = {}): Promise<FetchResult> {
+    const selectedRangeAtStart = this.selectedTimeRange ? { ...this.selectedTimeRange } : null;
+    if (!options.preserveTimeRange && this.selectedTimeRange !== null) {
+      this.selectedTimeRange = null;
+      if (this.timeSeriesContextSummary) {
+        this.summary = this.timeSeriesContextSummary;
+        this.timeSeriesContextSummary = null;
+      }
+      this.isTimeRangeSummaryProvisional = false;
+    }
     const fetchVersion = ++this.fetchAllVersion;
     this.invalidatePanel("pairwise");
     this.invalidatePanel("topSessions");
     this.rollDates();
     saveUsageFilters(this);
     const params = this.baseParams();
+    const contextParams =
+      options.preserveTimeRange &&
+      options.refreshTimeSeriesContext !== false &&
+      selectedRangeAtStart !== null
+        ? { ...params, from: this.from, to: this.to }
+        : undefined;
     const summaryPromise = this.fetchSummary({
       loadComparison: false,
       params,
+      contextParams,
     });
     const topSessionsPromise = this.fetchTopSessions(params);
     const loadedSummary = await summaryPromise;
-    if (fetchVersion !== this.fetchAllVersion || !loadedSummary) {
+    if (fetchVersion !== this.fetchAllVersion) {
       await topSessionsPromise;
-      return;
+      return "aborted";
+    }
+    if (!loadedSummary) {
+      await topSessionsPromise;
+      if (fetchVersion !== this.fetchAllVersion) return "aborted";
+      if (
+        selectedRangeAtStart !== null &&
+        this.selectedTimeRange === null &&
+        fetchVersion === this.fetchAllVersion
+      ) {
+        this.invalidatePanel("topSessions");
+        this.topSessions = null;
+        this.errors.topSessions = null;
+        await this.fetchTopSessions(this.baseParams());
+      }
+      return "error";
     }
     const currentTopSessionsPromise = loadedSummary.projectScopeRecovered
       ? topSessionsPromise.then(() => {
-        if (fetchVersion !== this.fetchAllVersion) return "aborted";
-        return this.fetchTopSessions(loadedSummary.params);
-      })
+          if (fetchVersion !== this.fetchAllVersion) return "aborted";
+          return this.fetchTopSessions(loadedSummary.params);
+        })
       : topSessionsPromise;
     const [topSessionsResult, comparisonResult, pairwiseResult] = await Promise.all([
       currentTopSessionsPromise,
-      this.fetchComparison(
-        loadedSummary.version,
-        loadedSummary.summary,
-        loadedSummary.params,
-      ),
+      this.fetchComparison(loadedSummary.version, loadedSummary.summary, loadedSummary.params),
       this.fetchPairwise(loadedSummary.version, loadedSummary.params),
     ]);
     if (
@@ -668,13 +873,24 @@ class UsageStore {
       pairwiseResult === "ok"
     ) {
       this.markRefreshComplete();
+      return "ok";
     }
+    if (
+      fetchVersion !== this.fetchAllVersion ||
+      topSessionsResult === "aborted" ||
+      comparisonResult === "aborted" ||
+      pairwiseResult === "aborted"
+    ) {
+      return "aborted";
+    }
+    return "error";
   }
 
   async fetchSummary(
     options: {
       loadComparison?: boolean;
       params?: UsageParams;
+      contextParams?: UsageParams;
       recoverProjectScope?: boolean;
     } = {},
   ): Promise<LoadedUsageSummary | null> {
@@ -696,12 +912,28 @@ class UsageStore {
     let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
       const params = options.params ?? this.baseParams();
-      const data = await callGenerated(() =>
-        UsageService.getApiV1UsageSummary(params),
-        signal,
-      ) as unknown as UsageSummaryResponse;
+      const contextParams = options.contextParams;
+      let data: UsageSummaryResponse;
+      let contextData: UsageSummaryResponse | null = null;
+      if (contextParams) {
+        [data, contextData] = (await Promise.all([
+          callGenerated(() => UsageService.getApiV1UsageSummary(params), signal),
+          callGenerated(() => UsageService.getApiV1UsageSummary(contextParams), signal),
+        ])) as [UsageSummaryResponse, UsageSummaryResponse];
+      } else {
+        data = (await callGenerated(
+          () => UsageService.getApiV1UsageSummary(params),
+          signal,
+        )) as unknown as UsageSummaryResponse;
+      }
       if (this.versions.summary === v) {
         this.summary = data;
+        this.isTimeRangeSummaryProvisional = false;
+        if (contextData !== null) {
+          this.timeSeriesContextSummary = contextData;
+        } else if (this.selectedTimeRange === null) {
+          this.timeSeriesContextSummary = null;
+        }
         this.errors.summary = null;
         this.ensurePairwiseSelection();
         this.clearPairwiseComparisonState();
@@ -732,22 +964,38 @@ class UsageStore {
       ) {
         this.excludedProjectKeys = "";
         this.abortPanel("topSessions");
+        const recoveredParams = this.baseParams();
         const loaded = await this.fetchSummary({
           loadComparison,
-          params: this.baseParams(),
+          params: recoveredParams,
+          contextParams: options.contextParams
+            ? {
+                ...recoveredParams,
+                from: options.contextParams.from,
+                to: options.contextParams.to,
+              }
+            : undefined,
           recoverProjectScope: false,
         });
-        return loaded === null
-          ? null
-          : { ...loaded, projectScopeRecovered: true };
+        return loaded === null ? null : { ...loaded, projectScopeRecovered: true };
       }
       if (this.versions.summary === v) {
-        // On refetch failure with cached data, swallow the error so
-        // existing values stay visible instead of flipping to a "--"
-        // error state. First-load failures still surface.
-        if (this.summary === null) {
-          this.errors.summary =
-            e instanceof Error ? e.message : "Failed to load";
+        // A selected-range summary is synthesized from daily data while the
+        // request is in flight. If that request fails, restore the parent
+        // window rather than leaving provisional values under an active brush.
+        // Other cached refetch failures keep their existing values visible.
+        if (
+          this.isTimeRangeSummaryProvisional &&
+          this.selectedTimeRange !== null &&
+          this.timeSeriesContextSummary !== null
+        ) {
+          this.summary = this.timeSeriesContextSummary;
+          this.selectedTimeRange = null;
+          this.timeSeriesContextSummary = null;
+          this.isTimeRangeSummaryProvisional = false;
+          this.errors.summary = e instanceof Error ? e.message : "Failed to load";
+        } else if (this.summary === null) {
+          this.errors.summary = e instanceof Error ? e.message : "Failed to load";
         } else {
           console.warn("usage.fetchSummary refetch failed:", e);
         }
@@ -777,13 +1025,14 @@ class UsageStore {
     const started = performance.now();
     let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
-      const comparison = await callGenerated(() =>
-        UsageService.getApiV1UsageComparison({
-          ...params,
-          currentMicrodollars: summary.totals.totalCost.microdollars,
-        }),
+      const comparison = (await callGenerated(
+        () =>
+          UsageService.getApiV1UsageComparison({
+            ...params,
+            currentMicrodollars: summary.totals.totalCost.microdollars,
+          }),
         signal,
-      ) as unknown as UsageComparison;
+      )) as unknown as UsageComparison;
       if (this.versions.summary === summaryVersion) {
         this.summary = { ...summary, comparison };
         return "ok";
@@ -810,9 +1059,7 @@ class UsageStore {
     }
   }
 
-  private currentPairwiseParams(
-    params: UsageParams,
-  ): UsagePairwiseParams | null {
+  private currentPairwiseParams(params: UsageParams): UsagePairwiseParams | null {
     const selection = this.pairwiseSelection;
     if (!selection.left.value || !selection.right.value) {
       return null;
@@ -826,10 +1073,7 @@ class UsageStore {
     };
   }
 
-  private async fetchPairwise(
-    summaryVersion: number,
-    params: UsageParams,
-  ): Promise<FetchResult> {
+  private async fetchPairwise(summaryVersion: number, params: UsageParams): Promise<FetchResult> {
     if (this.versions.summary !== summaryVersion) return "aborted";
     const pairwiseVersion = ++this.versions.pairwise;
     const request = this.currentPairwiseParams(params);
@@ -847,14 +1091,11 @@ class UsageStore {
     const started = performance.now();
     let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
-      const comparison = await callGenerated(() =>
-        UsageService.getApiV1UsagePairwiseComparison(request),
+      const comparison = (await callGenerated(
+        () => UsageService.getApiV1UsagePairwiseComparison(request),
         signal,
-      ) as unknown as UsagePairwiseComparisonResponse;
-      if (
-        this.versions.summary === summaryVersion &&
-        this.versions.pairwise === pairwiseVersion
-      ) {
+      )) as unknown as UsagePairwiseComparisonResponse;
+      if (this.versions.summary === summaryVersion && this.versions.pairwise === pairwiseVersion) {
         this.pairwiseComparison = comparison;
         this.errors.pairwise = null;
         return "ok";
@@ -866,13 +1107,9 @@ class UsageStore {
         return "aborted";
       }
       status = "error";
-      if (
-        this.versions.summary === summaryVersion &&
-        this.versions.pairwise === pairwiseVersion
-      ) {
+      if (this.versions.summary === summaryVersion && this.versions.pairwise === pairwiseVersion) {
         if (this.pairwiseComparison === null) {
-          this.errors.pairwise =
-            e instanceof Error ? e.message : "Failed to load";
+          this.errors.pairwise = e instanceof Error ? e.message : "Failed to load";
         } else {
           console.warn("usage.fetchPairwise failed:", e);
         }
@@ -886,18 +1123,13 @@ class UsageStore {
         status,
       });
       this.clearAbortSignal("pairwise", signal);
-      if (
-        this.versions.summary === summaryVersion &&
-        this.versions.pairwise === pairwiseVersion
-      ) {
+      if (this.versions.summary === summaryVersion && this.versions.pairwise === pairwiseVersion) {
         this.loading.pairwise = false;
       }
     }
   }
 
-  async fetchTopSessions(
-    params: UsageParams | null = null,
-  ): Promise<FetchResult> {
+  async fetchTopSessions(params: UsageParams | null = null): Promise<FetchResult> {
     const v = ++this.versions.topSessions;
     const signal = this.nextAbortSignal("topSessions");
     const isFirstLoad = this.topSessions === null;
@@ -906,18 +1138,18 @@ class UsageStore {
     const started = performance.now();
     let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
-      const data = await callGenerated(() =>
-        UsageService.getApiV1UsageTopSessions({
-          ...(params ?? this.baseParams()),
-          sort: this.mode === "token" ? "tokens" : "cost",
-          tokenTypes:
-            this.mode === "token" &&
-            this.selectedTokenTypes.length < ALL_TOKEN_TYPES.length
-              ? this.selectedTokenTypes.join(",")
-              : undefined,
-        }),
+      const data = (await callGenerated(
+        () =>
+          UsageService.getApiV1UsageTopSessions({
+            ...(params ?? this.baseParams()),
+            sort: this.mode === "token" ? "tokens" : "cost",
+            tokenTypes:
+              this.mode === "token" && this.selectedTokenTypes.length < ALL_TOKEN_TYPES.length
+                ? this.selectedTokenTypes.join(",")
+                : undefined,
+          }),
         signal,
-      ) as unknown as TopUsageSessionsResponse;
+      )) as unknown as TopUsageSessionsResponse;
       if (this.versions.topSessions === v) {
         this.topSessions = data;
         this.errors.topSessions = null;
@@ -932,8 +1164,7 @@ class UsageStore {
       status = "error";
       if (this.versions.topSessions === v) {
         if (this.topSessions === null) {
-          this.errors.topSessions =
-            e instanceof Error ? e.message : "Failed to load";
+          this.errors.topSessions = e instanceof Error ? e.message : "Failed to load";
         } else {
           console.warn("usage.fetchTopSessions refetch failed:", e);
         }
@@ -975,10 +1206,7 @@ class UsageStore {
     return controller.signal;
   }
 
-  private clearAbortSignal(
-    panel: UsagePanel,
-    signal: AbortSignal,
-  ): boolean {
+  private clearAbortSignal(panel: UsagePanel, signal: AbortSignal): boolean {
     if (this.abortControllers[panel]?.signal === signal) {
       delete this.abortControllers[panel];
       this.querying[panel] = false;
@@ -1027,28 +1255,18 @@ export const USAGE_DEFAULT_WINDOW_DAYS = DEFAULT_WINDOW_DAYS;
 export function parseWindowDays(raw: string | undefined): number | null {
   if (!raw) return null;
   const n = Number.parseInt(raw, 10);
-  if (
-    !Number.isFinite(n) ||
-    n <= 0 ||
-    n > MAX_WINDOW_DAYS ||
-    String(n) !== raw
-  ) {
+  if (!Number.isFinite(n) || n <= 0 || n > MAX_WINDOW_DAYS || String(n) !== raw) {
     return null;
   }
   return n;
 }
 
-export function buildUsageUrlParams(
-  state: UsageUrlState,
-): Record<string, string> {
+export function buildUsageUrlParams(state: UsageUrlState): Record<string, string> {
   const params: Record<string, string> = {};
   if (state.isPinned) {
     if (state.from) params["from"] = state.from;
     if (state.to) params["to"] = state.to;
-  } else if (
-    state.windowDays > 0 &&
-    state.windowDays !== DEFAULT_WINDOW_DAYS
-  ) {
+  } else if (state.windowDays > 0 && state.windowDays !== DEFAULT_WINDOW_DAYS) {
     params["window_days"] = String(state.windowDays);
   }
   if (state.selectedModels) {
@@ -1066,11 +1284,7 @@ export function buildUsageUrlParams(
 }
 
 const CSV_MERGE_URL_KEYS = new Set(["exclude_project"]);
-const SESSION_DATE_URL_KEYS = new Set([
-  "date",
-  "date_from",
-  "date_to",
-]);
+const SESSION_DATE_URL_KEYS = new Set(["date", "date_from", "date_to"]);
 
 export function mergeUsageAndSessionUrlParams(
   usageParams: Record<string, string>,

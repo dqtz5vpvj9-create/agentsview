@@ -5,6 +5,69 @@ description: All AgentsView commands, flags, and environment variables
 
 ## Commands
 
+### `agentsview capture`
+
+Capture and export the usage of one exact non-interactive automation run
+without starting the daemon, server, web interface, or watchers:
+
+```bash
+agentsview capture run \
+  --provider claude \
+  --occurrence build-42 \
+  --capture-dir ./capture-build-42 \
+  --result ./usage-build-42.json \
+  -- claude -p "Diagnose the build failure."
+
+agentsview capture report \
+  --capture-dir ./capture-build-42 \
+  --result ./usage-build-42.json
+```
+
+`capture run` supports direct `claude -p` and `codex exec --json` producer
+adapters. It leaves child standard input, output, error, and exit outcome
+intact. The result always uses a separate file; recovery-only `capture report`
+may use `--result -` for standard output. See
+[One-shot CI capture](/one-shot-capture/) for the result contract, retry
+behavior, failure codes, and a complete GitHub Actions job.
+
+______________________________________________________________________
+
+### `agentsview raw-sync`
+
+Capture supported local provider sources and upload their raw generations to
+hosted custody:
+
+```bash
+export AGENTSVIEW_RAW_SYNC_URL=https://agents.example.com
+export AGENTSVIEW_RAW_SYNC_DEVICE_ID=device-id
+export AGENTSVIEW_RAW_SYNC_CREDENTIAL=device-credential
+agentsview raw-sync watch
+agentsview raw-sync status
+```
+
+`raw-sync watch` runs an initial bounded audit, watches for filesystem changes,
+and retries interrupted uploads from its durable local checkpoint. The device
+credential is accepted only through `AGENTSVIEW_RAW_SYNC_CREDENTIAL`, never as a
+command-line flag. `--server` and `--device-id` override their corresponding
+environment variables.
+
+| Flag                    | Default      | Description                                      |
+| ----------------------- | ------------ | ------------------------------------------------ |
+| `--server`              | environment  | Raw-sync server URL                              |
+| `--device-id`           | environment  | Provisioned device ID                            |
+| `--allow-insecure-http` | `false`      | Allow HTTP for a loopback server only            |
+| `--debounce`            | `2s`         | Coalescing window for filesystem changes         |
+| `--interval`            | `15m`        | Interval between bounded provider audits         |
+| `--audit-limit`         | `128`        | Maximum source work in each provider audit       |
+
+`raw-sync status` reads the checkpoint without creating one and prints
+path-free JSON containing capture, queue, retry, failure, and coverage state.
+S3 roots are not captured. This remains an in-development raw-custody path:
+device enrollment and server-side session derivation are not yet available.
+See [Hosted Raw Sync](/hosted-raw-sync/) for the current boundary.
+
+______________________________________________________________________
+
 ### `agentsview daemon`
 
 Manage the detached writable SQLite server:
@@ -120,8 +183,10 @@ agentsview serve restart
 agentsview serve stop
 ```
 
-The parent command starts a detached `agentsview serve` process, waits briefly
-for it to publish its runtime record, and prints the URL, PID, and log path.
+The parent command starts a detached `agentsview serve` process and waits for it
+to publish its runtime record. The five-second readiness window measures startup
+inactivity, so continuing startup progress can keep the parent waiting longer.
+It then prints the URL, PID, and log path.
 Background server output is written to `~/.agentsview/serve.log`. `serve status`
 reports the preferred managed process, URL, version, uptime, and read-only mode
 when available. `serve stop` retains its broad lifecycle scope: it gracefully
@@ -217,12 +282,13 @@ directories on the remote machine, transfers the source session data locally,
 and indexes it into your local archive. SSH remote sync is deprecated and
 receives only critical fixes; use configured HTTP remote sync for new setups.
 
-Local sync can also read configured Claude and Codex roots from S3-compatible
-object storage. Add `s3://` entries to `claude_project_dirs` or
-`codex_sessions_dirs` in `~/.agentsview/config.toml`, then run `agentsview sync`
-normally. This is not SSH remote sync: object storage is treated as a read-only
-session source, using object size and `LastModified` metadata to skip unchanged
-sessions and downloading only objects that need parsing. See
+Local sync can also read configured Claude, Codex, and Cursor roots from
+S3-compatible object storage. Add `s3://` entries to `claude_project_dirs`,
+`codex_sessions_dirs`, or `cursor_project_dirs` in `~/.agentsview/config.toml`,
+then run `agentsview sync` normally. This is not SSH remote sync: object
+storage is treated as a read-only session source, using object size and
+`LastModified` metadata to skip unchanged sessions and downloading only objects
+that need parsing. See
 [Configuration — S3-Compatible Session Sources](/configuration/#s3-compatible-session-sources).
 
 #### Configured Remote Hosts
@@ -256,11 +322,13 @@ force unchanged manifest-capable files to transfer again. Directory-scoped and
 verbatim curated content still use delta transfer. Windsurf's sanitized curated
 export remains a separate full-archive transfer on every sync. HTTP collectors
 and spokes must use the same remote-sync protocol version; incompatible peers
-fail before exchanging targets or archive data. An HTTP preparation or
-contributor failure aborts the combined rebuild without replacing the active
-archive or running SSH. Ordinary incremental and post-swap SSH failures retain
-per-host reporting, and the command exits non-zero if any host failed. See
-[Incremental Sync](/remote-access/#incremental-sync).
+fail before exchanging targets or archive data. A configured HTTP host that is
+offline, unreachable, or times out is skipped; reachable HTTP hosts still join
+the combined rebuild. Other HTTP preparation or contributor failures abort the
+combined rebuild without replacing the active archive or running SSH. Ordinary
+incremental and post-swap SSH failures retain per-host reporting, and the
+command exits non-zero for any failure other than an unavailable configured
+HTTP host. See [Incremental Sync](/remote-access/#incremental-sync).
 
 `agentsview sync --host X` syncs one host, not the whole configured list. When
 the local daemon knows a configured host with that identity, it uses the stored
@@ -397,7 +465,7 @@ agentsview usage daily [flags]
 | `--all`       | `false`       | Scan all history; overrides the default 30-day window                    |
 | `--agent`     |               | Filter by agent name                                                     |
 | `--breakdown` | `false`       | Show per-model rows and populate detailed JSON breakdown arrays          |
-| `--offline`   | `false`       | Skip the LiteLLM pricing fetch; use embedded fallback                    |
+| `--offline`   | `false`       | Skip the pricing catalog fetch; use embedded fallback                    |
 | `--no-sync`   | `false`       | Skip the on-demand sync pass before querying                             |
 | `--timezone`  | system        | IANA timezone name for date bucketing                                    |
 
@@ -633,8 +701,10 @@ ______________________________________________________________________
 
 ### `agentsview pg serve`
 
-Start a read-only web UI backed by PostgreSQL. See [PostgreSQL Sync](/pg-sync/)
-for full documentation.
+Start a read-only session web UI backed by PostgreSQL. On a writable PostgreSQL
+schema, the same server also registers the partial [hosted raw-sync control
+plane](/hosted-raw-sync/#http-control-plane). See [PostgreSQL Sync](/pg-sync/)
+for full server documentation.
 
 ```bash
 agentsview pg serve [flags]
@@ -969,7 +1039,7 @@ agentsview export sessions --all --format ndjson --project agentsview
 The JSON top level has `schema_version`, `database_id`, `cursor`, `pricing`,
 `projects`, and `sessions`. NDJSON writes the same metadata as the first line,
 then one session row per following line. Current builds emit
-`schema_version: 5`; see [Session Export](/session-export/#versioning) for the
+`schema_version: 6`; see [Session Export](/session-export/#versioning) for the
 v1 and transitional 0.38 release history. The default and maximum page size is
 `db.MaxSessionLimit`, currently 500.
 

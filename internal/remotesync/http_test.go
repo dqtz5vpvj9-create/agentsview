@@ -6,7 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -905,7 +905,7 @@ func newMirrorTestRemote(t *testing.T) *mirrorTestRemote {
 		switch r.URL.Path {
 		case "/api/v1/remote-sync/targets":
 			w.Header().Set("Content-Type", "application/json")
-			require.NoError(t, json.NewEncoder(w).Encode(remote.targets))
+			require.NoError(t, json.MarshalWrite(w, remote.targets))
 		case "/api/v1/remote-sync/manifest":
 			if remote.onManifest != nil {
 				remote.onManifest()
@@ -928,7 +928,7 @@ func newMirrorTestRemote(t *testing.T) *mirrorTestRemote {
 			// the manifest cannot model, which the handler surfaces as
 			// 501 so the client falls back to the full archive.
 			var req TargetSet
-			require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+			require.NoError(t, json.UnmarshalRead(r.Body, &req))
 			manifest, err := BuildManifest(req)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusNotImplemented)
@@ -937,11 +937,11 @@ func newMirrorTestRemote(t *testing.T) *mirrorTestRemote {
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Content-Encoding", "gzip")
 			gz := gzip.NewWriter(w)
-			require.NoError(t, json.NewEncoder(gz).Encode(manifest))
+			require.NoError(t, json.MarshalWrite(gz, manifest))
 			require.NoError(t, gz.Close())
 		case "/api/v1/remote-sync/archive":
 			var req ArchiveRequest
-			require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+			require.NoError(t, json.UnmarshalRead(r.Body, &req))
 			remote.archiveRequests = append(remote.archiveRequests, req)
 			if remote.onArchive != nil {
 				remote.onArchive(req)
@@ -1013,7 +1013,7 @@ func (r *mirrorTestRemote) addWindsurfFileScopedAgent(t *testing.T) string {
 	require.NoError(t, err)
 	require.NoError(t, conn.Close())
 
-	resolved := ResolveTargets(config.Config{
+	resolved := resolveTargetsForTest(t, config.Config{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentWindsurf: {userRoot},
 		},
@@ -2544,7 +2544,7 @@ func (r *mirrorTestRemote) addRooCodeAgent(
 	mcpSettings := filepath.Join(settingsDir, "mcp_settings.json")
 	require.NoError(t, os.WriteFile(mcpSettings,
 		[]byte(`{"mcpServers":{"s":{"env":{"API_KEY":"sk-secret"}}}}`), 0o644))
-	resolved := ResolveTargets(config.Config{
+	resolved := resolveTargetsForTest(t, config.Config{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentRooCode: {rooRoot},
 		},
@@ -3151,6 +3151,42 @@ func TestPrepareHTTPSyncsSortsHostsAndUnwindsOnFailure(t *testing.T) {
 	assert.Empty(t, roots, "unwind removes the successful legacy root and spools")
 }
 
+func TestPrepareAvailableHTTPSyncsOmitsOfflineHost(t *testing.T) {
+	var progress []string
+	syncs := []HTTPSync{
+		{Host: "reachable", Progress: func(p syncpkg.Progress) {
+			progress = append(progress, p.Detail)
+		}},
+		{Host: "offline", Progress: func(p syncpkg.Progress) {
+			progress = append(progress, p.Detail)
+		}},
+	}
+	prepared, unavailable, err := prepareHTTPSyncsWithUnavailable(
+		context.Background(), syncs, true,
+		func(_ context.Context, hs HTTPSync) (*PreparedHTTP, error) {
+			if hs.Host == "offline" {
+				return nil, fakeTimeoutError{}
+			}
+			return &PreparedHTTP{sync: hs}, nil
+		},
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, prepared)
+	require.Len(t, unavailable, 1)
+	assert.Equal(t, "offline", unavailable[0].Host)
+	require.Len(t, prepared.sources, 1)
+	assert.Equal(t, "reachable", prepared.sources[0].sync.Host)
+	options, release, err := prepared.BorrowRebuildOptions()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"offline~"},
+		options.UnavailableContributorIDPrefixes)
+	require.Len(t, options.Contributors, 1)
+	release()
+	assert.Contains(t, progress, "Skipped offline remote host offline")
+	require.NoError(t, prepared.Close())
+}
+
 func TestPrepareHTTPSyncsLegacySourcesDoNotCreateWorkingDirectoryLocks(t *testing.T) {
 	remoteA := newMirrorTestRemote(t)
 	remoteA.writeSession(t, "a.jsonl",
@@ -3210,31 +3246,29 @@ func TestPrepareHTTPSyncsOrdersConcurrentCallersByMirrorLockPath(t *testing.T) {
 	syncB.DB = database
 	assert.Less(t, MirrorDir(dataDirA, syncA.Host), MirrorDir(dataDirB, syncB.Host))
 
-	firstA := make(chan struct{})
-	firstB := make(chan struct{})
-	var onceA, onceB stdsync.Once
+	callerOneAtA := make(chan struct{})
+	releaseCallerOneA := make(chan struct{})
+	var callerOneAtAOnce stdsync.Once
 	var orderMu stdsync.Mutex
 	orders := map[string][]string{}
-	record := func(
-		caller, mirror string, ownOnce *stdsync.Once,
-		own chan struct{}, other <-chan struct{},
-	) {
+	record := func(caller, mirror string) {
 		orderMu.Lock()
 		orders[caller] = append(orders[caller], mirror)
 		orderMu.Unlock()
-		ownOnce.Do(func() { close(own) })
-		select {
-		case <-other:
-		case <-time.After(50 * time.Millisecond):
-		}
 	}
 	remoteA.onManifestRequest = func(r *http.Request) {
-		record(r.Header.Get("Authorization"), "mirror-a",
-			&onceA, firstA, firstB)
+		caller := r.Header.Get("Authorization")
+		record(caller, "mirror-a")
+		if caller == "Bearer caller-one" {
+			callerOneAtAOnce.Do(func() { close(callerOneAtA) })
+			select {
+			case <-releaseCallerOneA:
+			case <-r.Context().Done():
+			}
+		}
 	}
 	remoteB.onManifestRequest = func(r *http.Request) {
-		record(r.Header.Get("Authorization"), "mirror-b",
-			&onceB, firstB, firstA)
+		record(r.Header.Get("Authorization"), "mirror-b")
 	}
 
 	callerOne := []HTTPSync{syncB, syncA}
@@ -3248,21 +3282,25 @@ func TestPrepareHTTPSyncsOrdersConcurrentCallersByMirrorLockPath(t *testing.T) {
 		prepared *PreparedHTTPSyncs
 		err      error
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), backgroundWaitTimeout)
 	defer cancel()
-	start := make(chan struct{})
 	results := make(chan result, 2)
-	for caller, syncs := range map[string][]HTTPSync{
-		"caller-one": callerOne,
-		"caller-two": callerTwo,
-	} {
-		go func() {
-			<-start
-			prepared, err := PrepareHTTPSyncs(ctx, syncs)
-			results <- result{caller: caller, prepared: prepared, err: err}
-		}()
+	prepare := func(caller string, syncs []HTTPSync) {
+		prepared, err := PrepareHTTPSyncs(ctx, syncs)
+		results <- result{caller: caller, prepared: prepared, err: err}
 	}
-	close(start)
+	go prepare("caller-one", callerOne)
+	select {
+	case <-callerOneAtA:
+	case <-ctx.Done():
+		orderMu.Lock()
+		observedOrders := fmt.Sprint(orders)
+		orderMu.Unlock()
+		require.FailNow(t, "caller one did not reach its first canonical mirror",
+			"orders=%s", observedOrders)
+	}
+	go prepare("caller-two", callerTwo)
+	close(releaseCallerOneA)
 
 	got := make(map[string]error, 2)
 	for range 2 {
@@ -3431,14 +3469,14 @@ func TestPreparedHTTPSyncsHoldAllLocksUntilClose(t *testing.T) {
 		context.Background(), []HTTPSync{syncB, syncA},
 	)
 	require.NoError(t, err)
-	contributors, release, err := prepared.BorrowRebuildContributors()
+	options, release, err := prepared.BorrowRebuildOptions()
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		release()
 		require.NoError(t, prepared.Close())
 	})
 	assert.Equal(t, []string{"host-a", "host-b"}, []string{
-		contributors[0].Name, contributors[1].Name,
+		options.Contributors[0].Name, options.Contributors[1].Name,
 	})
 
 	for _, host := range []string{"host-a", "host-b"} {
@@ -3466,7 +3504,7 @@ func TestPreparedHTTPSyncsHoldAllLocksUntilClose(t *testing.T) {
 		require.NotNil(t, competing, host)
 		require.NoError(t, competing.Close())
 	}
-	_, _, err = prepared.BorrowRebuildContributors()
+	_, _, err = prepared.BorrowRebuildOptions()
 	assert.ErrorIs(t, err, ErrPreparedClosed,
 		"closed aggregate cannot expose contributors")
 }
@@ -3479,17 +3517,17 @@ func TestPreparedHTTPSyncsBorrowBlocksCloseUntilRelease(t *testing.T) {
 	_, hs := newMirrorSync(t, remote, dataDir)
 	prepared, err := PrepareHTTPSyncs(context.Background(), []HTTPSync{hs})
 	require.NoError(t, err)
-	contributors, release, err := prepared.BorrowRebuildContributors()
+	options, release, err := prepared.BorrowRebuildOptions()
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		release()
 		require.NoError(t, prepared.Close())
 	})
-	require.Len(t, contributors, 1)
-	assert.Equal(t, hs.Host, contributors[0].Name)
+	require.Len(t, options.Contributors, 1)
+	assert.Equal(t, hs.Host, options.Contributors[0].Name)
 
 	assert.ErrorIs(t, prepared.Close(), ErrPreparedInUse)
-	_, _, err = prepared.BorrowRebuildContributors()
+	_, _, err = prepared.BorrowRebuildOptions()
 	assert.ErrorIs(t, err, ErrPreparedClosed,
 		"a Close attempt ends new borrowing while retained ownership remains retryable")
 	lockCtx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
@@ -3509,7 +3547,7 @@ func TestPreparedHTTPSyncsBorrowBlocksCloseUntilRelease(t *testing.T) {
 	require.NoError(t, lockErr)
 	require.NotNil(t, competing)
 	require.NoError(t, competing.Close())
-	_, _, err = prepared.BorrowRebuildContributors()
+	_, _, err = prepared.BorrowRebuildOptions()
 	assert.ErrorIs(t, err, ErrPreparedClosed)
 }
 
@@ -3519,7 +3557,7 @@ func TestPreparedHTTPSyncsBorrowAndCloseAreRaceSafe(t *testing.T) {
 		lock:        &MirrorLockHandle{},
 		releaseLock: func(*MirrorLockHandle) error { return nil },
 	}}}
-	_, initialRelease, err := prepared.BorrowRebuildContributors()
+	_, initialRelease, err := prepared.BorrowRebuildOptions()
 	require.NoError(t, err)
 	start := make(chan struct{})
 	borrowResults := make(chan error, 8)
@@ -3527,7 +3565,7 @@ func TestPreparedHTTPSyncsBorrowAndCloseAreRaceSafe(t *testing.T) {
 	for range 8 {
 		go func() {
 			<-start
-			_, release, borrowErr := prepared.BorrowRebuildContributors()
+			_, release, borrowErr := prepared.BorrowRebuildOptions()
 			if borrowErr == nil {
 				release()
 				release()

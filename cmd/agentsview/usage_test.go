@@ -5,12 +5,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -156,7 +158,7 @@ func TestUsageDailyGolden(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(stdout), &report))
 	assert.Equal(t, export.UsageDailySchemaVersion, report.SchemaVersion)
 
-	assertGoldenBytes(t, "usage_daily_v5.json", []byte(stdout))
+	assertCatalogGolden(t, "usage_daily_v6.json", []byte(stdout))
 }
 
 func TestUsageDailyBreakdownGolden(t *testing.T) {
@@ -186,7 +188,7 @@ func TestUsageDailyBreakdownGolden(t *testing.T) {
 		assert.Equal(t, "golden-host", daily.MachineBreakdowns[0].MachineName)
 	}
 
-	assertGoldenBytes(t, "usage_daily_breakdown_v5.json", []byte(stdout))
+	assertCatalogGolden(t, "usage_daily_breakdown_v6.json", []byte(stdout))
 }
 
 func setupExportGoldenDataDir(t *testing.T) string {
@@ -252,7 +254,7 @@ func seedExportGoldenArchive(t *testing.T, database *db.DB) {
 		startedAt: "2026-07-03T10:00:00Z",
 		endedAt:   "2026-07-03T10:30:00Z",
 		model:     goldenComputedModel,
-		tokenJSON: json.RawMessage(`{"input_tokens":1200,"output_tokens":240,` +
+		tokenJSON: jsontext.Value(`{"input_tokens":1200,"output_tokens":240,` +
 			`"cache_creation_input_tokens":80,"cache_read_input_tokens":400}`),
 		outputTokens: 240,
 		cwd:          "/fixtures/remote-project/worktrees/feature/app",
@@ -263,7 +265,7 @@ func seedExportGoldenArchive(t *testing.T, database *db.DB) {
 		startedAt:    "2026-07-02T09:00:00Z",
 		endedAt:      "2026-07-02T09:20:00Z",
 		model:        goldenComputedModel,
-		tokenJSON:    json.RawMessage(`{"input_tokens":800,"output_tokens":160}`),
+		tokenJSON:    jsontext.Value(`{"input_tokens":800,"output_tokens":160}`),
 		outputTokens: 160,
 		cwd:          "/fixtures/remote-project/worktrees/feature/cli",
 		gitBranch:    "feature/golden",
@@ -327,7 +329,7 @@ type goldenExportSessionSpec struct {
 	startedAt    string
 	endedAt      string
 	model        string
-	tokenJSON    json.RawMessage
+	tokenJSON    jsontext.Value
 	outputTokens int
 	costUSD      *money.Money
 	cwd          string
@@ -415,8 +417,10 @@ func setGoldenPricingUpdatedAt(t *testing.T, dbPath string) {
 	defer func() {
 		require.NoError(t, conn.Close(), "close pricing timestamp db")
 	}()
-	_, err = conn.Exec(`UPDATE model_pricing SET updated_at = ?`,
-		goldenPricingUpdatedAt)
+	_, err = conn.Exec(`
+		UPDATE model_pricing SET updated_at = ?;
+		UPDATE genai_pricing SET updated_at = ?`,
+		goldenPricingUpdatedAt, goldenPricingUpdatedAt)
 	require.NoError(t, err, "set deterministic pricing updated_at")
 }
 
@@ -433,10 +437,57 @@ func assertGoldenBytes(t *testing.T, name string, got []byte) {
 	}
 	want, err := os.ReadFile(path)
 	require.NoError(t, err, "read golden (run with -update to generate)")
+	if strings.HasSuffix(name, ".json") {
+		assert.JSONEq(t, string(want), string(got), "golden mismatch for %s", name)
+		return
+	}
+	if strings.HasSuffix(name, ".ndjson") {
+		wantLines := strings.Split(strings.TrimSpace(string(want)), "\n")
+		gotLines := strings.Split(strings.TrimSpace(string(got)), "\n")
+		require.Len(t, gotLines, len(wantLines), "line count for %s", name)
+		for i := range wantLines {
+			assert.JSONEq(t, wantLines[i], gotLines[i],
+				"golden mismatch for %s line %d", name, i+1)
+		}
+		return
+	}
 	if !bytes.Equal(want, got) {
 		assert.Equal(t, string(want), string(got),
 			"golden mismatch for %s", name)
 	}
+}
+
+func assertCatalogGolden(t *testing.T, name string, got []byte) {
+	t.Helper()
+	var metadata struct {
+		Pricing struct {
+			EffectiveRowCount int `json:"effective_row_count"`
+		} `json:"pricing"`
+	}
+	require.NoError(t, json.Unmarshal(got, &metadata), "decode %s", name)
+	require.Greater(t, metadata.Pricing.EffectiveRowCount, 1000,
+		"pricing catalog row count for %s", name)
+
+	path := filepath.Join("..", "..", "testdata", "golden", name)
+	if *updateGolden {
+		require.NoError(t, os.WriteFile(path, got, 0o644),
+			"write golden %s", name)
+		t.Logf("rewrote %s (%d bytes)", path, len(got))
+		return
+	}
+	want, err := os.ReadFile(path)
+	require.NoError(t, err, "read golden (run with -update to generate)")
+
+	var gotReport, wantReport map[string]any
+	require.NoError(t, json.Unmarshal(got, &gotReport), "decode actual %s", name)
+	require.NoError(t, json.Unmarshal(want, &wantReport), "decode golden %s", name)
+	for _, report := range []map[string]any{gotReport, wantReport} {
+		pricing, ok := report["pricing"].(map[string]any)
+		require.True(t, ok, "pricing object for %s", name)
+		delete(pricing, "effective_row_count")
+		delete(pricing, "digest")
+	}
+	assert.Equal(t, wantReport, gotReport, "golden mismatch for %s", name)
 }
 
 func TestDefaultUsageDateRange(t *testing.T) {
@@ -1041,7 +1092,7 @@ func TestLocalArchiveQueryDailyUsageAppliesDefaultRange(t *testing.T) {
 			Role:       "assistant",
 			Timestamp:  recent,
 			Model:      "test-model",
-			TokenUsage: json.RawMessage(`{"input_tokens":10,"output_tokens":1}`),
+			TokenUsage: jsontext.Value(`{"input_tokens":10,"output_tokens":1}`),
 		},
 		{
 			SessionID:  "old",
@@ -1049,7 +1100,7 @@ func TestLocalArchiveQueryDailyUsageAppliesDefaultRange(t *testing.T) {
 			Role:       "assistant",
 			Timestamp:  old,
 			Model:      "test-model",
-			TokenUsage: json.RawMessage(`{"input_tokens":20,"output_tokens":2}`),
+			TokenUsage: jsontext.Value(`{"input_tokens":20,"output_tokens":2}`),
 		},
 		{
 			SessionID:  "future",
@@ -1057,7 +1108,7 @@ func TestLocalArchiveQueryDailyUsageAppliesDefaultRange(t *testing.T) {
 			Role:       "assistant",
 			Timestamp:  future,
 			Model:      "test-model",
-			TokenUsage: json.RawMessage(`{"input_tokens":40,"output_tokens":4}`),
+			TokenUsage: jsontext.Value(`{"input_tokens":40,"output_tokens":4}`),
 		},
 	}))
 
@@ -1160,7 +1211,7 @@ func seedUsageDailyExportMetadataFixture(
 		{
 			SessionID: "usage-meta-fallback-cost", Ordinal: 0,
 			Role: "assistant", Timestamp: started, Model: fallbackModel,
-			TokenUsage: json.RawMessage(`{"input_tokens":200,"output_tokens":100}`),
+			TokenUsage: jsontext.Value(`{"input_tokens":200,"output_tokens":100}`),
 		},
 	}))
 	cost := money.MustParseDollars("0.25")
@@ -1211,7 +1262,7 @@ func TestFormatDailyUsageJSON(t *testing.T) {
 	out, err := json.Marshal(result)
 	require.NoError(t, err, "json.Marshal failed")
 
-	var decoded map[string]json.RawMessage
+	var decoded map[string]jsontext.Value
 	require.NoError(t, json.Unmarshal(out, &decoded),
 		"json.Unmarshal failed")
 
@@ -1219,7 +1270,7 @@ func TestFormatDailyUsageJSON(t *testing.T) {
 	assert.Contains(t, decoded, "totals", "missing 'totals' key in JSON output")
 
 	// Verify daily array has expected entry
-	var daily []map[string]json.RawMessage
+	var daily []map[string]jsontext.Value
 	require.NoError(t, json.Unmarshal(decoded["daily"], &daily),
 		"parsing daily array")
 	require.Len(t, daily, 1, "daily length")
@@ -1237,7 +1288,7 @@ func TestFormatDailyUsageJSON(t *testing.T) {
 	}
 
 	// Verify totals fields
-	var totals map[string]json.RawMessage
+	var totals map[string]jsontext.Value
 	require.NoError(t, json.Unmarshal(decoded["totals"], &totals),
 		"parsing totals")
 	totalFields := []string{
@@ -1274,7 +1325,7 @@ func TestNewUsageCursorCommandUsesConfigFallbacksAndSharedPagination(t *testing.
 		assert.Empty(t, pass)
 
 		var req map[string]any
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&req), "decode request")
+		require.NoError(t, json.UnmarshalRead(r.Body, &req), "decode request")
 		requests = append(requests, req)
 
 		page, _ := req["page"].(float64)
@@ -1483,7 +1534,7 @@ func TestNewUsageCursorCommandExplicitMemberFilterDoesNotReuseConfigSibling(t *t
 
 			var request map[string]any
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				require.NoError(t, json.NewDecoder(r.Body).Decode(&request),
+				require.NoError(t, json.UnmarshalRead(r.Body, &request),
 					"decode request")
 				_, _ = w.Write([]byte(`{
 					"totalUsageEventsCount": 0,
@@ -1520,7 +1571,7 @@ func TestNewUsageCursorCommandExplicitMemberFilterDoesNotReuseConfigSibling(t *t
 // sampleDailyUsageJSON is a full usage summary body with a single day and
 // non-zero totals, shared by the HTTP and daemon usage tests.
 const sampleDailyUsageJSON = `{
-	"schema_version": 5,
+	"schema_version": 6,
 	"from": "2026-06-01",
 	"to": "2026-06-02",
 	"pricing": {

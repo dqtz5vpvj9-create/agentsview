@@ -51,9 +51,9 @@ type multiSessionMatch struct {
 // path into its physical container path and raw member ID. allowMissing
 // relaxes the regular-file requirement so a database delete (or its WAL/SHM
 // sibling) still classifies for tombstones. rejectShmSiblingEvents refuses to
-// resolve a bare "-shm" sibling event to the container; only Omnigent sets
-// it, because opening its own read connections updates that file's mtime and
-// would otherwise make every scan trigger the next one.
+// resolve a bare "-shm" sibling event to the container; Omnigent and Cursor
+// IDE set it, because opening their own read connections updates that file's
+// mtime and would otherwise make every scan trigger the next one.
 func classifySQLiteContainerPath(
 	root, path, dbRelPath string,
 	allowMissing, rejectShmSiblingEvents bool,

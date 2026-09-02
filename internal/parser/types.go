@@ -1,7 +1,9 @@
 package parser
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"strings"
 	"time"
 
@@ -26,6 +28,7 @@ const (
 	AgentKiloLegacy     AgentType = "kilo-legacy"
 	AgentOpenHands      AgentType = "openhands"
 	AgentCursor         AgentType = "cursor"
+	AgentCursorIDE      AgentType = "cursor-ide"
 	AgentIflow          AgentType = "iflow"
 	AgentAmp            AgentType = "amp"
 	AgentZencoder       AgentType = "zencoder"
@@ -313,6 +316,28 @@ var Registry = []AgentDef{
 		FileBased:   true,
 	},
 	{
+		// Cursor IDE (the GUI editor) is a distinct product from Cursor Agent
+		// (the CLI, see AgentCursor above): it stores every chat session in
+		// one shared VS Code-style global-state SQLite database
+		// (state.vscdb), fanned out into one session per composer addressed
+		// by a "<db>#<composerID>" virtual path.
+		Type:        AgentCursorIDE,
+		DisplayName: "Cursor IDE",
+		EnvVar:      "CURSOR_IDE_DIR",
+		ConfigKey:   "cursor_ide_dirs",
+		DefaultDirs: cursorIDEDefaultDirs(),
+		IDPrefix:    "cursor-ide:",
+		FileBased:   true,
+		// state.vscdb is VS Code's shared global-state database: besides
+		// Cursor's own chat data, its ItemTable co-locates Cursor's live
+		// auth tokens (observed keys cursorAuth/accessToken and
+		// cursorAuth/refreshToken) plus whatever other installed extensions
+		// have stored there, and composerData blobs carry per-composer sync
+		// encryption keys. Remote sync stays disabled until there is an
+		// allowlisted export schema, matching Omnigent's chat.db precedent.
+		RemoteSyncExcluded: true,
+	},
+	{
 		Type:        AgentAmp,
 		DisplayName: "Amp",
 		EnvVar:      "AMP_DIR",
@@ -593,7 +618,7 @@ var Registry = []AgentDef{
 		EnvVar:      "KIRO_SESSIONS_DIR",
 		ConfigKey:   "kiro_dirs",
 		DefaultDirs: []string{
-			".kiro/sessions/cli",
+			".kiro/sessions",
 			".local/share/kiro-cli",
 		},
 		IDPrefix:  "kiro:",
@@ -873,7 +898,7 @@ var Registry = []AgentDef{
 		DisplayName:    "IcodeMate",
 		EnvVar:         "ICODEMATE_DIR",
 		ConfigKey:      "icodemate_dirs",
-		DefaultDirs:    []string{".local/share/icodemate"},
+		DefaultDirs:    []string{".local/share/icodemate", ".icodemate/cli/projects"},
 		IDPrefix:       "icodemate:",
 		WatchSubdirs:   []string{"storage/session_diff"},
 		FileBased:      true,
@@ -1264,7 +1289,7 @@ type ParsedToolCallUpdate struct {
 // slice even though its ordinal is known from the stored transcript.
 type ParsedMessageTokenUsageUpdate struct {
 	Ordinal          int
-	TokenUsage       json.RawMessage
+	TokenUsage       jsontext.Value
 	ContextTokens    int
 	OutputTokens     int
 	HasContextTokens bool
@@ -1305,8 +1330,11 @@ type ParsedMessage struct {
 	ToolCalls     []ParsedToolCall
 	ToolResults   []ParsedToolResult
 
-	Model            string
-	TokenUsage       json.RawMessage
+	Model string
+	// ProviderID identifies the billing provider for this response, such as
+	// Posit Assistant's "positai" managed service or BYO "anthropic".
+	ProviderID       string
+	TokenUsage       jsontext.Value
 	ContextTokens    int
 	OutputTokens     int
 	HasContextTokens bool
@@ -1352,6 +1380,7 @@ type ParsedUsageEvent struct {
 	MessageOrdinal           *int
 	Source                   string
 	Model                    string
+	ProviderID               string
 	InputTokens              int
 	OutputTokens             int
 	CacheCreationInputTokens int
@@ -1371,8 +1400,21 @@ func accumulateMessageTokenUsage(
 	sess *ParsedSession,
 	messages []ParsedMessage,
 ) {
+	_ = accumulateMessageTokenUsageContext(
+		context.Background(), sess, messages,
+	)
+}
+
+func accumulateMessageTokenUsageContext(
+	ctx context.Context,
+	sess *ParsedSession,
+	messages []ParsedMessage,
+) error {
 	sess.aggregateTokenPresenceKnown = true
-	for _, m := range messages {
+	for i, m := range messages {
+		if err := contextErrEvery(ctx, i); err != nil {
+			return err
+		}
 		if m.HasOutputTokens {
 			sess.HasTotalOutputTokens = true
 			sess.TotalOutputTokens += m.OutputTokens
@@ -1384,6 +1426,7 @@ func accumulateMessageTokenUsage(
 			}
 		}
 	}
+	return ctx.Err()
 }
 
 // applyUsageEventTokenTotals recomputes session token totals from the
@@ -1428,7 +1471,21 @@ func applyUsageEventTokenTotals(
 func UsageEventTokenAggregate(
 	events []ParsedUsageEvent,
 ) (totalOut int, hasOut bool, peakCtx int, hasCtx bool) {
+	totalOut, hasOut, peakCtx, hasCtx, _ = UsageEventTokenAggregateContext(
+		context.Background(), events,
+	)
+	return
+}
+
+// UsageEventTokenAggregateContext is the bounded form of the canonical
+// event-derived token rollup.
+func UsageEventTokenAggregateContext(
+	ctx context.Context, events []ParsedUsageEvent,
+) (totalOut int, hasOut bool, peakCtx int, hasCtx bool, err error) {
 	for _, ev := range events {
+		if err = ctx.Err(); err != nil {
+			return
+		}
 		if ev.OutputTokens > 0 {
 			hasOut = true
 			totalOut += ev.OutputTokens
@@ -1443,7 +1500,8 @@ func UsageEventTokenAggregate(
 			}
 		}
 	}
-	return totalOut, hasOut, peakCtx, hasCtx
+	err = ctx.Err()
+	return
 }
 
 // InferTokenPresence determines whether context/output tokens were
@@ -1463,7 +1521,7 @@ func InferTokenPresence(
 		return hasContext, hasOutput
 	}
 
-	var payload map[string]json.RawMessage
+	var payload map[string]jsontext.Value
 	if err := json.Unmarshal(tokenUsage, &payload); err != nil {
 		return hasContext, hasOutput
 	}
@@ -1513,13 +1571,27 @@ func (s ParsedSession) AggregateTokenPresence() (bool, bool) {
 func (s ParsedSession) TokenCoverage(
 	msgs []ParsedMessage,
 ) (bool, bool) {
+	hasTotal, hasPeak, _ := s.TokenCoverageContext(
+		context.Background(), msgs,
+	)
+	return hasTotal, hasPeak
+}
+
+// TokenCoverageContext reports aggregate coverage while allowing bounded
+// transcript preparation to stop between messages.
+func (s ParsedSession) TokenCoverageContext(
+	ctx context.Context, msgs []ParsedMessage,
+) (bool, bool, error) {
 	hasTotal, hasPeak := s.AggregateTokenPresence()
 	for _, m := range msgs {
+		if err := ctx.Err(); err != nil {
+			return false, false, err
+		}
 		msgHasCtx, msgHasOut := m.TokenPresence()
 		hasTotal = hasTotal || msgHasOut
 		hasPeak = hasPeak || msgHasCtx
 	}
-	return hasTotal, hasPeak
+	return hasTotal, hasPeak, ctx.Err()
 }
 
 // ParseResult pairs a parsed session with its messages.

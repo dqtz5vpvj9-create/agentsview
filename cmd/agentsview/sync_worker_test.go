@@ -5,7 +5,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -161,7 +161,7 @@ func TestWorkerResultPreservesTombstonesAcrossProtocol(t *testing.T) {
 		Aborted:    true,
 	})
 	var wire bytes.Buffer
-	require.NoError(t, json.NewEncoder(&wire).Encode(workerLine{Result: &result}))
+	require.NoError(t, json.MarshalWrite(&wire, workerLine{Result: &result}))
 
 	decoded, err := readWorkerResult(&wire, nil)
 	require.NoError(t, err)
@@ -387,6 +387,12 @@ func TestResyncBuildResultFromStatsToleratesMinorityParseFailures(t *testing.T) 
 			ctx:        context.Background(),
 			stats:      sync.SyncStats{Aborted: true},
 			wantStatus: "aborted",
+		},
+		{
+			name:       "deferred processing",
+			ctx:        context.Background(),
+			stats:      sync.SyncStats{Deferred: 1},
+			wantStatus: "failed",
 		},
 		{
 			name:       "build error",

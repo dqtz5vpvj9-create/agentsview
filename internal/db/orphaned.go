@@ -279,10 +279,15 @@ func (d *DB) CopyTrashedDataFrom(sourcePath string) (int, error) {
 		return 0, nil
 	}
 
+	trashFilter := "deleted_at IS NOT NULL"
+	if oldDBHasColumn(ctx, tx, "sessions", "deletion_cause") {
+		trashFilter += " AND (deletion_cause IS NULL" +
+			" OR deletion_cause <> '" + legacyDeletionCauseSourceMissing + "')"
+	}
 	if _, err := tx.ExecContext(ctx, `
 		CREATE TEMP TABLE _trashed_ids AS
 		SELECT id FROM old_db.sessions
-		WHERE deleted_at IS NOT NULL
+		WHERE `+trashFilter+`
 		  AND id NOT IN (SELECT id FROM main.excluded_sessions)`); err != nil {
 		return 0, fmt.Errorf(
 			"identifying trashed sessions: %w", err,
@@ -1136,10 +1141,9 @@ func (d *DB) CopySessionMetadataFrom(
 	defer func() { _ = tx.Rollback() }()
 
 	// Copy user-managed metadata from the quiesced old DB. User-owned
-	// deleted_at is copied for all rows. Recoverable source_missing state is
-	// already carried by the pre-sync trash/orphan copy and must not re-hide a
-	// row that the fresh sync revived after its source reappeared. display_name
-	// is overlaid ONLY for
+	// deleted_at is copied for all rows. Legacy source_missing deletion state
+	// must not re-hide a row that the fresh sync revived after its source
+	// reappeared. display_name is overlaid ONLY for
 	// user-owned rows: the fresh DB already holds re-parsed session_name
 	// values, so agent-owned and cleared rows must keep the fresh value.
 	// Probe columns first so older source DBs don't abort.
@@ -1151,12 +1155,12 @@ func (d *DB) CopySessionMetadataFrom(
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE main.sessions
 			SET deleted_at = CASE
-					WHEN old_s.deletion_cause = '`+deletionCauseSourceMissing+`'
+					WHEN old_s.deletion_cause = '`+legacyDeletionCauseSourceMissing+`'
 					THEN main.sessions.deleted_at
 					ELSE old_s.deleted_at
 				END,
 				deletion_cause = CASE
-					WHEN old_s.deletion_cause = '`+deletionCauseSourceMissing+`'
+					WHEN old_s.deletion_cause = '`+legacyDeletionCauseSourceMissing+`'
 					THEN main.sessions.deletion_cause
 					ELSE old_s.deletion_cause
 				END
@@ -1700,6 +1704,9 @@ func orphanSessionCols(ctx context.Context, tx *sql.Tx) string {
 	if oldDBHasColumn(ctx, tx, "sessions", "deletion_cause") {
 		cols = append(cols, "deletion_cause")
 	}
+	if oldDBHasColumn(ctx, tx, "sessions", "source_missing_at") {
+		cols = append(cols, "source_missing_at")
+	}
 	cols = append(cols, "created_at")
 	for _, c := range []string{
 		"total_output_tokens", "peak_context_tokens",
@@ -1736,8 +1743,9 @@ func orphanSessionCols(ctx context.Context, tx *sql.Tx) string {
 // reconcileTranscriptRevisionsTx preserves read-progress identity across a
 // full resync. Reparsed sessions start with fresh local counters, so matching
 // transcript rows inherit the old counter and changed rows advance it once.
-// The comparison covers the user-visible message and tool-result fields while
-// deliberately excluding session metadata and token/source bookkeeping.
+// The comparison covers the same persisted transcript identity used by the
+// incremental message-diff path, including usage and provider dedup identities.
+// Session metadata and parser-only source bookkeeping remain excluded.
 func reconcileTranscriptRevisionsTx(
 	ctx context.Context, tx *sql.Tx,
 ) error {
@@ -1747,6 +1755,8 @@ func reconcileTranscriptRevisionsTx(
 	for table, columns := range map[string][]string{
 		"messages": {
 			"thinking_text", "is_system", "model",
+			"token_usage", "claude_message_id", "claude_request_id",
+			"source_uuid",
 			"context_tokens", "output_tokens",
 			"has_context_tokens", "has_output_tokens",
 			"source_subtype", "prompt_source", "is_compact_boundary",
@@ -1774,14 +1784,16 @@ func reconcileTranscriptRevisionsTx(
 			SELECT CASE WHEN
 				NOT EXISTS (
 					SELECT ordinal, role, content, thinking_text, timestamp,
-						has_thinking, has_tool_use, is_system, model,
+						has_thinking, has_tool_use, is_system, model, token_usage,
+						claude_message_id, claude_request_id, source_uuid,
 						context_tokens, output_tokens, has_context_tokens,
 						has_output_tokens, source_subtype, prompt_source,
 						is_compact_boundary
 					FROM main.messages WHERE session_id = current.id
 					EXCEPT
 					SELECT ordinal, role, content, thinking_text, timestamp,
-						has_thinking, has_tool_use, is_system, model,
+						has_thinking, has_tool_use, is_system, model, token_usage,
+						claude_message_id, claude_request_id, source_uuid,
 						context_tokens, output_tokens, has_context_tokens,
 						has_output_tokens, source_subtype, prompt_source,
 						is_compact_boundary
@@ -1789,14 +1801,16 @@ func reconcileTranscriptRevisionsTx(
 				)
 				AND NOT EXISTS (
 					SELECT ordinal, role, content, thinking_text, timestamp,
-						has_thinking, has_tool_use, is_system, model,
+						has_thinking, has_tool_use, is_system, model, token_usage,
+						claude_message_id, claude_request_id, source_uuid,
 						context_tokens, output_tokens, has_context_tokens,
 						has_output_tokens, source_subtype, prompt_source,
 						is_compact_boundary
 					FROM old_db.messages WHERE session_id = current.id
 					EXCEPT
 					SELECT ordinal, role, content, thinking_text, timestamp,
-						has_thinking, has_tool_use, is_system, model,
+						has_thinking, has_tool_use, is_system, model, token_usage,
+						claude_message_id, claude_request_id, source_uuid,
 						context_tokens, output_tokens, has_context_tokens,
 						has_output_tokens, source_subtype, prompt_source,
 						is_compact_boundary
@@ -1897,7 +1911,7 @@ func copySessionDataForIDs(
 	}
 	for _, c := range []string{
 		"model", "token_usage", "context_tokens",
-		"output_tokens", "has_context_tokens",
+		"output_tokens", "provider_id", "has_context_tokens",
 		"has_output_tokens",
 		"claude_message_id", "claude_request_id",
 		"source_type", "source_subtype", "prompt_source",
@@ -1918,20 +1932,25 @@ func copySessionDataForIDs(
 	}
 
 	if oldDBHasTable(ctx, tx, "usage_events") {
+		usageEventCols := "session_id, message_ordinal, source, model"
+		usageEventSelect := usageEventCols
+		if oldDBHasColumn(ctx, tx, "usage_events", "provider_id") {
+			usageEventCols += ", provider_id"
+			usageEventSelect += ", provider_id"
+		}
+		usageEventCols += `,
+				input_tokens, output_tokens,
+				cache_creation_input_tokens, cache_read_input_tokens,
+				reasoning_tokens, cost_microdollars, cost_status, cost_source,
+				occurred_at, dedup_key`
+		usageEventSelect += `,
+				input_tokens, output_tokens,
+				cache_creation_input_tokens, cache_read_input_tokens,
+				reasoning_tokens, cost_microdollars, cost_status, cost_source,
+				occurred_at, dedup_key`
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO usage_events (
-				session_id, message_ordinal, source, model,
-				input_tokens, output_tokens,
-				cache_creation_input_tokens, cache_read_input_tokens,
-				reasoning_tokens, cost_microdollars, cost_status, cost_source,
-				occurred_at, dedup_key
-			)
-			SELECT
-				session_id, message_ordinal, source, model,
-				input_tokens, output_tokens,
-				cache_creation_input_tokens, cache_read_input_tokens,
-				reasoning_tokens, cost_microdollars, cost_status, cost_source,
-				occurred_at, dedup_key
+			INSERT INTO usage_events (`+usageEventCols+`)
+			SELECT `+usageEventSelect+`
 			FROM old_db.usage_events
 			WHERE session_id IN (
 				SELECT id FROM `+tempIDsTable+`

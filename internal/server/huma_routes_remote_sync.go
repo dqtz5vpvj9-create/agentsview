@@ -3,7 +3,8 @@ package server
 import (
 	"compress/gzip"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"io"
 	"log"
 	"net/http"
@@ -16,7 +17,7 @@ import (
 
 func (s *Server) registerRemoteSyncRoutes() {
 	group := newRouteGroup(s.api, "/api/v1/remote-sync", "RemoteSync")
-	get(s, group, "/targets", "Resolve remote sync targets", s.humaRemoteSyncTargets)
+	s.get(group, "/targets", "Resolve remote sync targets", s.humaRemoteSyncTargets)
 	s.mux.HandleFunc("/api/v1/remote-sync/archive", s.remoteSyncArchiveHTTP)
 	s.mux.HandleFunc("/api/v1/remote-sync/manifest", s.remoteSyncManifestHTTP)
 }
@@ -42,9 +43,13 @@ func (s *Server) humaRemoteSyncTargets(
 	if _, ok := s.db.(*db.DB); !ok {
 		return nil, apiError(http.StatusNotImplemented, "not available in remote mode")
 	}
+	targets, err := remotesync.ResolveTargets(s.ingestionConfig())
+	if err != nil {
+		return nil, apiError(http.StatusInternalServerError, err.Error())
+	}
 	return &remoteSyncTargetsOutput{
 		ProtocolVersion: strconv.Itoa(remotesync.ProtocolVersion),
-		Body:            remotesync.ResolveTargets(s.ingestionConfig()),
+		Body:            targets,
 	}, nil
 }
 
@@ -70,11 +75,15 @@ func (s *Server) remoteSyncManifestHTTP(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req remotesync.TargetSet
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.UnmarshalRead(r.Body, &req); err != nil {
 		http.Error(w, "invalid manifest request", http.StatusBadRequest)
 		return
 	}
-	allowed := remotesync.ResolveTargets(s.ingestionConfig())
+	allowed, err := remotesync.ResolveTargets(s.ingestionConfig())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	manifestTargets, ok := remotesync.SelectAllowedTargets(allowed, req)
 	if !ok {
 		http.Error(w, "remote sync target is not allowed", http.StatusForbidden)
@@ -102,7 +111,7 @@ func (s *Server) remoteSyncManifestHTTP(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Encoding", "gzip")
 	gz := gzip.NewWriter(w)
-	if err := json.NewEncoder(gz).Encode(manifest); err != nil {
+	if err := json.MarshalEncode(jsontext.NewEncoder(gz), manifest); err != nil {
 		log.Printf("remote sync manifest stream failed: %v", err)
 		_ = gz.Close()
 		return
@@ -125,11 +134,15 @@ func (s *Server) remoteSyncArchiveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req remotesync.ArchiveRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.UnmarshalRead(r.Body, &req); err != nil {
 		http.Error(w, "invalid archive request", http.StatusBadRequest)
 		return
 	}
-	allowed := remotesync.ResolveTargets(s.ingestionConfig())
+	allowed, err := remotesync.ResolveTargets(s.ingestionConfig())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	archiveTargets, ok := remotesync.SelectAllowedTargets(allowed, req.TargetSet)
 	if !ok {
 		http.Error(w, "remote sync target is not allowed", http.StatusForbidden)
@@ -155,7 +168,6 @@ func (s *Server) remoteSyncArchiveHTTP(w http.ResponseWriter, r *http.Request) {
 		gz = gzip.NewWriter(archiveWriter)
 		out = gz
 	}
-	var err error
 	if deltaMode {
 		err = remotesync.WriteArchiveFiles(out, allowed, files)
 	} else {

@@ -44,6 +44,10 @@ type RebuildContributor struct {
 // RebuildOptions configures optional sources for an atomic full rebuild.
 type RebuildOptions struct {
 	Contributors []RebuildContributor
+	// UnavailableContributorIDPrefixes identifies configured contributor
+	// namespaces that could not be prepared. Their history is excluded from
+	// rebuild safety expectations and survives through orphan copying.
+	UnavailableContributorIDPrefixes []string
 	// includePhaseDiagnostics is enabled only by the options entrypoint. The
 	// legacy ResyncAll wrapper keeps both returned and in-flight stats free of
 	// options-only diagnostics.
@@ -77,6 +81,7 @@ func (e *RebuildContributorError) Unwrap() error { return e.Err }
 
 type rebuildOperations struct {
 	rebuildFTS                        func(*db.DB) error
+	rebuildUsageIndexes               func(*db.DB) error
 	reopen                            func(*db.DB) error
 	listActiveWorktreeMappingMachines func(context.Context, *db.DB) ([]string, error)
 	applyWorktreeMappings             func(context.Context, *db.DB, string) (db.ApplyWorktreeProjectMappingsResult, error)
@@ -84,7 +89,10 @@ type rebuildOperations struct {
 
 var productionRebuildOperations = rebuildOperations{
 	rebuildFTS: func(database *db.DB) error { return database.RebuildFTS() },
-	reopen:     func(database *db.DB) error { return database.Reopen() },
+	rebuildUsageIndexes: func(database *db.DB) error {
+		return database.RebuildUsageMessageIndexes()
+	},
+	reopen: func(database *db.DB) error { return database.Reopen() },
 	listActiveWorktreeMappingMachines: func(
 		ctx context.Context, database *db.DB,
 	) ([]string, error) {
@@ -100,6 +108,9 @@ var productionRebuildOperations = rebuildOperations{
 func (ops rebuildOperations) withDefaults() rebuildOperations {
 	if ops.rebuildFTS == nil {
 		ops.rebuildFTS = productionRebuildOperations.rebuildFTS
+	}
+	if ops.rebuildUsageIndexes == nil {
+		ops.rebuildUsageIndexes = productionRebuildOperations.rebuildUsageIndexes
 	}
 	if ops.reopen == nil {
 		ops.reopen = productionRebuildOperations.reopen
@@ -130,6 +141,7 @@ func phaseSnapshot(name string, stats *PhaseStats) RebuildPhaseStats {
 func mergeSyncStats(dst *SyncStats, src SyncStats) {
 	dst.TotalSessions += src.TotalSessions
 	dst.Synced += src.Synced
+	dst.CwdUpdated += src.CwdUpdated
 	dst.Skipped += src.Skipped
 	dst.Failed += src.Failed
 	dst.OrphanedCopied += src.OrphanedCopied
@@ -149,4 +161,15 @@ func mergeSyncStats(dst *SyncStats, src SyncStats) {
 	)
 	dst.cwdFilteredSessions += src.cwdFilteredSessions
 	dst.cwdFilteredFiles += src.cwdFilteredFiles
+	if !dst.deferredRetryOverflow {
+		if src.deferredRetryOverflow {
+			dst.deferredRetryOverflow = true
+			dst.deferredRetryPaths = nil
+		} else {
+			for _, path := range src.deferredRetryPaths {
+				dst.retainDeferredRetryPath(path)
+			}
+		}
+	}
+	dst.Deferred += src.Deferred
 }

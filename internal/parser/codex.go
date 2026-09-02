@@ -2,7 +2,9 @@ package parser
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
+
 	"errors"
 	"fmt"
 	"io"
@@ -59,6 +61,7 @@ type codexSessionBuilder struct {
 	// implementation keeps the slice-based behavior, the streaming one
 	// batches into a scratch store.
 	sink                        CodexSessionSink
+	projectContext              context.Context
 	resolveParentTurns          codexParentTurnResolver
 	parentTurnIDs               map[string]struct{}
 	firstMessage                string
@@ -209,10 +212,15 @@ type codexPendingEvent struct {
 }
 
 func newCodexSessionBuilder(
-	_ bool, sink CodexSessionSink,
+	ctx context.Context,
+	_ bool,
+	resolveParentTurns codexParentTurnResolver,
+	sink CodexSessionSink,
 ) *codexSessionBuilder {
 	return &codexSessionBuilder{
 		sink:               sink,
+		projectContext:     ctx,
+		resolveParentTurns: resolveParentTurns,
 		project:            "unknown",
 		callNames:          make(map[string]string),
 		agentSpawnCalls:    make(map[string]string),
@@ -354,7 +362,9 @@ func (b *codexSessionBuilder) handleSessionMeta(
 	if cwd := payload.Get("cwd").Str; cwd != "" {
 		b.cwd = cwd
 		branch := payload.Get("git.branch").Str
-		if proj := ExtractProjectFromCwdWithBranch(cwd, branch); proj != "" {
+		if proj := ExtractProjectFromCwdWithBranchContext(
+			b.projectContext, cwd, branch,
+		); proj != "" {
 			b.project = proj
 		} else {
 			b.project = "unknown"
@@ -550,12 +560,6 @@ func (b *codexSessionBuilder) handleSubagentActivity(
 	)
 }
 
-// applyCodexTokenUsage normalizes Codex token usage fields
-// into the Anthropic-style shape expected by the usage and cost
-// queries. Codex reports input_tokens as the full input count
-// (cached portion included), while the downstream cost formula
-// treats input_tokens as the uncached remainder and bills
-// cache_read_input_tokens separately. Subtracting cached here
 func (b *codexSessionBuilder) handleFunctionCall(
 	payload gjson.Result, ts time.Time,
 ) {
@@ -734,11 +738,22 @@ func (b *codexSessionBuilder) handleSubagentNotification(
 func (b *codexSessionBuilder) claimPendingAgentEvents(
 	callID, agentID string,
 ) {
+	_ = b.claimPendingAgentEventsContext(
+		context.Background(), callID, agentID,
+	)
+}
+
+func (b *codexSessionBuilder) claimPendingAgentEventsContext(
+	ctx context.Context, callID, agentID string,
+) error {
 	pending := b.pendingAgentEvents[agentID]
 	if len(pending) == 0 {
-		return
+		return ctx.Err()
 	}
-	for _, ev := range pending {
+	for i, ev := range pending {
+		if err := contextErrEvery(ctx, i); err != nil {
+			return err
+		}
 		b.appendToolResultEvent(callID, ParsedToolResultEvent{
 			AgentID:           ev.agentID,
 			SubagentSessionID: codexSubagentSessionID(ev.agentID),
@@ -749,26 +764,50 @@ func (b *codexSessionBuilder) claimPendingAgentEvents(
 		})
 	}
 	delete(b.pendingAgentEvents, agentID)
+	return ctx.Err()
 }
 
 func (b *codexSessionBuilder) flushPendingAgentResults() {
+	_ = b.flushPendingAgentResultsContext(context.Background())
+}
+
+func (b *codexSessionBuilder) flushPendingAgentResultsContext(
+	ctx context.Context,
+) error {
 	if len(b.pendingAgentEvents) == 0 {
-		return
+		return ctx.Err()
 	}
 	agentIDs := make([]string, 0, len(b.pendingAgentEvents))
 	for agentID := range b.pendingAgentEvents {
 		agentIDs = append(agentIDs, agentID)
 	}
 	sort.Strings(agentIDs)
-	for _, agentID := range agentIDs {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for i, agentID := range agentIDs {
+		if err := contextErrEvery(ctx, i); err != nil {
+			return err
+		}
 		pending := b.pendingAgentEvents[agentID]
 		switch {
 		case b.agentWaitCalls[agentID] != "":
-			b.claimPendingAgentEvents(b.agentWaitCalls[agentID], agentID)
+			if err := b.claimPendingAgentEventsContext(
+				ctx, b.agentWaitCalls[agentID], agentID,
+			); err != nil {
+				return err
+			}
 		case b.agentSpawnCalls[agentID] != "":
-			b.claimPendingAgentEvents(b.agentSpawnCalls[agentID], agentID)
+			if err := b.claimPendingAgentEventsContext(
+				ctx, b.agentSpawnCalls[agentID], agentID,
+			); err != nil {
+				return err
+			}
 		default:
-			for _, ev := range pending {
+			for j, ev := range pending {
+				if err := contextErrEvery(ctx, j); err != nil {
+					return err
+				}
 				key := agentID + "\x00" + ev.status + "\x00" + ev.text
 				b.sink.InsertOrphanMessage(key, ParsedMessage{
 					Ordinal:       ev.ordinal,
@@ -778,10 +817,12 @@ func (b *codexSessionBuilder) flushPendingAgentResults() {
 					Model:         b.model,
 					ContentLength: len(ev.text),
 				})
+
 			}
 			delete(b.pendingAgentEvents, agentID)
 		}
 	}
+	return ctx.Err()
 }
 
 func codexSubagentSessionID(agentID string) string {
@@ -1445,6 +1486,14 @@ func IsCodexExecSessionFile(path string) bool {
 func (p *codexProvider) parseSession(
 	path, machine string, includeExec bool,
 ) (*ParsedSession, []ParsedMessage, error) {
+	return p.parseSessionContext(
+		context.Background(), path, machine, includeExec,
+	)
+}
+
+func (p *codexProvider) parseSessionContext(
+	ctx context.Context, path, machine string, includeExec bool,
+) (*ParsedSession, []ParsedMessage, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open %s: %w", path, err)
@@ -1454,16 +1503,19 @@ func (p *codexProvider) parseSession(
 	if err != nil {
 		return nil, nil, fmt.Errorf("stat %s: %w", path, err)
 	}
-	return p.parseSessionSnapshot(
-		path, machine, includeExec, f, info,
+	return p.parseSessionSnapshotContext(
+		ctx, path, machine, includeExec, f, info,
 	)
 }
 
 // parseSessionWithCursor is parseSession plus the end-of-snapshot
 // continuation cursor (and whether the end is a safe resume boundary).
 func (p *codexProvider) parseSessionWithCursor(
-	path, machine string, includeExec bool,
+	ctx context.Context, path, machine string, includeExec bool,
 ) (*ParsedSession, []ParsedMessage, codexCursorState, bool, []byte, string, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, codexCursorState{}, false, nil, "", "", err
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, codexCursorState{}, false, nil, "", "",
@@ -1476,20 +1528,26 @@ func (p *codexProvider) parseSessionWithCursor(
 			fmt.Errorf("stat %s: %w", path, err)
 	}
 	return p.parseSessionSnapshotWithCursor(
-		path, machine, includeExec, f, info,
+		ctx, path, machine, includeExec, f, info,
 	)
 }
 
 func (p *codexProvider) parentTurnResolver(
-	childPath string,
+	ctx context.Context, childPath string,
 ) codexParentTurnResolver {
 	return func(parentID string) (map[string]struct{}, bool) {
+		if ctx.Err() != nil {
+			return nil, false
+		}
 		parentKey := strings.Join(p.sources.roots, "\x00") + "\x00" + parentID
 		if turnIDs, ok := p.parentTurnCache.GetParent(parentKey); ok {
 			return turnIDs, len(turnIDs) > 0
 		}
 		parentPath := ""
 		for _, root := range p.sources.roots {
+			if ctx.Err() != nil {
+				return nil, false
+			}
 			candidate := p.sources.findSourceFile(root, parentID)
 			if candidate == "" || filepath.Clean(candidate) == filepath.Clean(childPath) {
 				continue
@@ -1510,7 +1568,7 @@ func (p *codexProvider) parentTurnResolver(
 		}
 
 		turnIDs := make(map[string]struct{})
-		_, err = readCodexJSONLFrom(parentPath, 0, func(line string) {
+		_, err = readCodexJSONLFromContext(ctx, parentPath, 0, func(line string) {
 			if gjson.Get(line, "type").Str != codexTypeTurnContext {
 				return
 			}
@@ -1529,6 +1587,15 @@ func (p *codexProvider) parentTurnResolver(
 // session_meta after subagent lineage metadata. Child-only subagents return no
 // replay parent and remain current without resolving their parent transcript.
 func CodexReplayParentID(childPath string) (string, bool) {
+	return codexReplayParentIDContext(context.Background(), childPath)
+}
+
+func codexReplayParentIDContext(
+	ctx context.Context, childPath string,
+) (string, bool) {
+	if ctx.Err() != nil {
+		return "", false
+	}
 	f, err := os.Open(childPath)
 	if err != nil {
 		return "", false
@@ -1537,9 +1604,12 @@ func CodexReplayParentID(childPath string) (string, bool) {
 
 	parentID := ""
 	resolutionNeeded := false
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(checkedContextReader{ctx: ctx, reader: f})
 	scanner.Buffer(make([]byte, 0, 64*1024), maxLineSize)
 	for scanner.Scan() {
+		if ctx.Err() != nil {
+			return "", false
+		}
 		line := strings.TrimSpace(scanner.Text())
 		if !gjson.Valid(line) {
 			continue
@@ -1572,13 +1642,21 @@ func CodexReplayParentID(childPath string) (string, bool) {
 // Limiting the reader prevents an append racing the scan from being folded into
 // a cursor keyed by the earlier size.
 func (p *codexProvider) parseSessionSnapshot(
-	path, machine string,
+	path, machine string, includeExec bool, f *os.File, info os.FileInfo,
+) (*ParsedSession, []ParsedMessage, error) {
+	return p.parseSessionSnapshotContext(
+		context.Background(), path, machine, includeExec, f, info,
+	)
+}
+
+func (p *codexProvider) parseSessionSnapshotContext(
+	ctx context.Context, path, machine string,
 	includeExec bool,
 	f *os.File,
 	info os.FileInfo,
 ) (*ParsedSession, []ParsedMessage, error) {
 	sess, msgs, _, _, _, _, _, err := p.parseSessionSnapshotWithCursor(
-		path, machine, includeExec, f, info,
+		ctx, path, machine, includeExec, f, info,
 	)
 	return sess, msgs, err
 }
@@ -1590,13 +1668,13 @@ func (p *codexProvider) parseSessionSnapshot(
 // snapshot [0, info.Size()) from the same read pass the parser performed;
 // they are meaningful only when safe is true.
 func (p *codexProvider) parseSessionSnapshotWithCursor(
-	path, machine string,
+	ctx context.Context, path, machine string,
 	includeExec bool,
 	f *os.File,
 	info os.FileInfo,
 ) (*ParsedSession, []ParsedMessage, codexCursorState, bool, []byte, string, string, error) {
 	return p.parseCodexSessionSnapshotStreaming(
-		path, machine, includeExec, f, info, NewCodexCollectingSink(0),
+		ctx, path, machine, includeExec, f, info, NewCodexCollectingSink(0),
 	)
 }
 
@@ -1606,24 +1684,43 @@ func (p *codexProvider) parseSessionSnapshotWithCursor(
 // from the sink (for a collecting sink it is the complete transcript; for
 // a staging sink it omits result-event content).
 func (p *codexProvider) parseCodexSessionSnapshotStreaming(
-	path, machine string,
+	ctx context.Context, path, machine string,
 	includeExec bool,
 	f *os.File,
 	info os.FileInfo,
 	sink CodexSessionSink,
 ) (*ParsedSession, []ParsedMessage, codexCursorState, bool, []byte, string, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, codexCursorState{}, false, nil, "", "", err
+	}
 	tee := newCodexHashAnchorTee(io.LimitReader(f, info.Size()))
-	lr := newLineReader(tee, maxLineSize)
+	lr := newLineReaderContext(ctx, tee, maxLineSize)
 	defer releaseLineReader(lr)
-	b := newCodexSessionBuilder(includeExec, sink)
-	b.resolveParentTurns = p.parentTurnResolver(path)
+	b := newCodexSessionBuilder(
+		ctx, includeExec, p.parentTurnResolver(ctx, path), sink,
+	)
+	malformedLines := 0
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, codexCursorState{}, false, nil, "", "", err
+		}
 		line, ok := lr.next()
 		if !ok {
 			break
 		}
 		if !gjson.Valid(line) {
+			var terminator [1]byte
+			if _, err := f.ReadAt(terminator[:], lr.bytesRead-1); err != nil {
+				return nil, nil, codexCursorState{}, false, nil, "", "",
+					fmt.Errorf("checking codex line terminator: %w", err)
+			}
+			// A writer may leave its final JSON record incomplete while the
+			// session is live. Count terminated malformed records, and count an
+			// unterminated tail only when the caller owns a stable snapshot.
+			if terminator[0] == '\n' || p.Config.StableSourceSnapshots {
+				malformedLines++
+			}
 			continue
 		}
 		if b.processLine(line) {
@@ -1637,7 +1734,9 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 			fmt.Errorf("reading codex %s: %w", path, err)
 	}
 
-	b.flushPendingAgentResults()
+	if err := b.flushPendingAgentResultsContext(ctx); err != nil {
+		return nil, nil, codexCursorState{}, false, nil, "", "", err
+	}
 	b.sink.Finalize()
 	b.refreshPendingCallPositions()
 	msgs := b.sink.Messages()
@@ -1675,7 +1774,10 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 	sessionID = "codex:" + sessionID
 
 	userCount := 0
-	for _, m := range msgs {
+	for i, m := range msgs {
+		if err := contextErrEvery(ctx, i); err != nil {
+			return nil, nil, codexCursorState{}, false, nil, "", "", err
+		}
 		if m.Role == RoleUser && m.Content != "" {
 			userCount++
 		}
@@ -1710,6 +1812,7 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 		FirstMessage:       b.firstMessage,
 		SessionName:        sessionName,
 		SessionNamePresent: sessionNamePresent,
+		MalformedLines:     malformedLines,
 		StartedAt:          b.startedAt,
 		EndedAt:            b.endedAt,
 		MessageCount:       len(msgs),
@@ -1725,7 +1828,9 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 		},
 	}
 
-	accumulateMessageTokenUsage(sess, msgs)
+	if err := accumulateMessageTokenUsageContext(ctx, sess, msgs); err != nil {
+		return nil, nil, codexCursorState{}, false, nil, "", "", err
+	}
 
 	var hashState []byte
 	var anchorDigest string
@@ -2001,7 +2106,7 @@ func (p *codexProvider) seedCodexIncrementalState(
 	defer f.Close()
 	seed, err := seedCodexIncrementalStateFromReader(
 		io.LimitReader(f, offset),
-		p.parentTurnResolver(path),
+		p.parentTurnResolver(context.Background(), path),
 	)
 	if err != nil {
 		return codexIncrementalSeed{}, fmt.Errorf(
@@ -2016,8 +2121,9 @@ func seedCodexIncrementalStateFromReader(
 	resolveParentTurns codexParentTurnResolver,
 ) (codexIncrementalSeed, error) {
 	sink := newCodexSeedSink()
-	b := newCodexSessionBuilder(false, sink)
-	b.resolveParentTurns = resolveParentTurns
+	b := newCodexSessionBuilder(
+		context.Background(), false, resolveParentTurns, sink,
+	)
 	lr := newLineReader(r, maxLineSize)
 	defer releaseLineReader(lr)
 	for {
@@ -2068,6 +2174,20 @@ func readCodexJSONLFrom(
 	offset int64,
 	fn func(line string),
 ) (consumed int64, err error) {
+	return readCodexJSONLFromContext(
+		context.Background(), path, offset, fn,
+	)
+}
+
+func readCodexJSONLFromContext(
+	ctx context.Context,
+	path string,
+	offset int64,
+	fn func(line string),
+) (consumed int64, err error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return 0, fmt.Errorf("open %s: %w", path, err)
@@ -2077,7 +2197,7 @@ func readCodexJSONLFrom(
 	if err != nil {
 		return 0, fmt.Errorf("stat %s: %w", path, err)
 	}
-	return readCodexJSONLSection(f, offset, info.Size(), fn)
+	return readCodexJSONLSectionContext(ctx, f, offset, info.Size(), fn)
 }
 
 // readCodexJSONLSection applies the conservative Codex JSONL rules to the
@@ -2089,13 +2209,25 @@ func readCodexJSONLSection(
 	limit int64,
 	fn func(line string),
 ) (consumed int64, err error) {
+	return readCodexJSONLSectionContext(
+		context.Background(), f, offset, limit, fn,
+	)
+}
+
+func readCodexJSONLSectionContext(
+	ctx context.Context,
+	f *os.File,
+	offset int64,
+	limit int64,
+	fn func(line string),
+) (consumed int64, err error) {
 	if offset < 0 || limit < offset {
 		return 0, fmt.Errorf(
 			"invalid codex JSONL section [%d,%d)", offset, limit,
 		)
 	}
 	section := io.NewSectionReader(f, offset, limit-offset)
-	return readCodexJSONLReader(section, section, fn)
+	return readCodexJSONLReaderContext(ctx, section, section, fn)
 }
 
 func readCodexJSONLReader(
@@ -2103,9 +2235,23 @@ func readCodexJSONLReader(
 	at io.ReaderAt,
 	fn func(line string),
 ) (consumed int64, err error) {
-	lr := newLineReader(r, maxLineSize)
+	return readCodexJSONLReaderContext(
+		context.Background(), r, at, fn,
+	)
+}
+
+func readCodexJSONLReaderContext(
+	ctx context.Context,
+	r io.Reader,
+	at io.ReaderAt,
+	fn func(line string),
+) (consumed int64, err error) {
+	lr := newLineReaderContext(ctx, r, maxLineSize)
 	defer releaseLineReader(lr)
 	for {
+		if err := ctx.Err(); err != nil {
+			return consumed, err
+		}
 		line, ok := lr.next()
 		if !ok {
 			break
@@ -2220,7 +2366,7 @@ func (p *codexProvider) parseSessionFromSnapshot(
 		func() (codexIncrementalSeed, error) {
 			return seedCodexIncrementalStateFromReader(
 				io.NewSectionReader(f, 0, offset),
-				p.parentTurnResolver(path),
+				p.parentTurnResolver(context.Background(), path),
 			)
 		},
 		committedUsageTarget,
@@ -2327,8 +2473,11 @@ func (p *codexProvider) parseSessionFromWithSources(
 		}
 	}
 
-	b := newCodexSessionBuilder(includeExec, NewCodexCollectingSink(startOrdinal))
-	b.resolveParentTurns = p.parentTurnResolver(path)
+	b := newCodexSessionBuilder(
+		context.Background(), includeExec,
+		p.parentTurnResolver(context.Background(), path),
+		NewCodexCollectingSink(startOrdinal),
+	)
 	b.codexCursorState = seed
 	if seed.pendingCallsOverflow {
 		return codexIncrementalParseResult{}, errCodexIncrementalNeedsFullParse
@@ -2528,7 +2677,9 @@ func isCodexSubagentNotification(content string) bool {
 }
 
 func codexIncrementalNeedsFullParse(line string) bool {
-	b := newCodexSessionBuilder(false, NewCodexCollectingSink(0))
+	b := newCodexSessionBuilder(
+		context.Background(), false, nil, NewCodexCollectingSink(0),
+	)
 	return b.codexIncrementalNeedsFullParse(line)
 }
 

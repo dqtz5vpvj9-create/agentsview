@@ -20,6 +20,18 @@ import (
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
 
+func TestPaddedUTCBoundClampsBeforeYearOne(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t,
+		"0001-01-01T00:00:00Z",
+		paddedUTCBound("0001-01-01T00:00:00Z", -14),
+	)
+	assert.Equal(t,
+		"2026-03-10T10:00:00Z",
+		paddedUTCBound("2026-03-11T00:00:00Z", -14),
+	)
+}
+
 type usageProbeDriver struct{}
 
 type usageProbeConn struct {
@@ -91,6 +103,11 @@ func (c *usageProbeConn) QueryContext(
 	c.state.mu.Unlock()
 
 	normalized := strings.ToLower(query)
+	if strings.Contains(normalized, "from genai_pricing") {
+		return &usageProbeRows{columns: []string{
+			"version", "source_ref", "source", "data_json", "updated_at",
+		}}, nil
+	}
 	if strings.Contains(normalized, "from model_pricing") {
 		return &usageProbeRows{
 			columns: []string{
@@ -98,18 +115,20 @@ func (c *usageProbeConn) QueryContext(
 				"input_microdollars_per_mtok",
 				"output_microdollars_per_mtok",
 				"cache_creation_microdollars_per_mtok",
+				"cache_creation_1h_microdollars_per_mtok",
 				"cache_read_microdollars_per_mtok",
 				"updated_at",
 				"above_input_tokens",
 				"band_input_microdollars_per_mtok",
 				"band_output_microdollars_per_mtok",
 				"band_cache_creation_microdollars_per_mtok",
+				"band_cache_creation_1h_microdollars_per_mtok",
 				"band_cache_read_microdollars_per_mtok",
 				"band_updated_at",
 			},
 			values: [][]driver.Value{{
-				"claude-sonnet", int64(3000000), int64(15000000), int64(3750000), int64(300000), "2026-06-08",
-				nil, nil, nil, nil, nil, nil,
+				"claude-sonnet", int64(3000000), int64(15000000), int64(3750000), int64(0), int64(300000), "2026-06-08",
+				nil, nil, nil, nil, nil, nil, nil,
 			}},
 		}, nil
 	}
@@ -169,7 +188,9 @@ func (c *usageProbeConn) QueryContext(
 				"message_ordinal",
 				"usage_source",
 				"ts",
+				"pricing_ts",
 				"model",
+				"provider_id",
 				"token_usage",
 				"web_search_requests",
 				"input_tokens",
@@ -203,7 +224,9 @@ func usageProbeUsageRow(
 		int64(0),
 		"message",
 		ts,
+		ts,
 		"claude-sonnet",
+		"",
 		`{"input_tokens":100,"output_tokens":50}`,
 		int64(0),
 		int64(0),
@@ -652,6 +675,7 @@ func TestPGActivityReportRowStatusCanonicalizesKimiAliasByTimestamp(t *testing.T
 					usageSource: "provider",
 					model:       "daimon-kimi-code",
 					ts:          sql.NullTime{Time: tt.timestamp, Valid: true},
+					pricingTS:   sql.NullTime{Time: tt.timestamp, Valid: true},
 					inputTokens: 1_000_000,
 				},
 				resolver,
@@ -695,6 +719,10 @@ func TestPGActivityReportRowStatusPrefersExactCustomKimiAlias(t *testing.T) {
 			usageSource: "provider",
 			model:       "daimon-kimi-code",
 			ts: sql.NullTime{
+				Time:  pricingpkg.KimiModelEraCutoff,
+				Valid: true,
+			},
+			pricingTS: sql.NullTime{
 				Time:  pricingpkg.KimiModelEraCutoff,
 				Valid: true,
 			},
@@ -785,4 +813,46 @@ func TestPGDailyUsageAmountsPrefersExactCustomKimiAlias(t *testing.T) {
 	resolutions := block.Models["kimi-for-coding"].Resolutions
 	require.Len(t, resolutions, 1)
 	assert.Equal(t, "kimi-for-coding", resolutions[0].PricedModel)
+}
+
+func TestPGDailyUsageAmountsForwardsProviderToBilling(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: "posit-model",
+		Rates:        export.ModelRates{InputPerMTok: money.MustParseDollars("1")},
+	}})
+	row := func(providerID string) pgDailyUsageScanRow {
+		return pgDailyUsageScanRow{
+			usageSource: "provider", model: "posit-model", providerID: providerID,
+			pricingTS: sql.NullTime{
+				Time: time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC), Valid: true,
+			},
+			inputTokens: 1_000_000,
+		}
+	}
+	_, _, _, _, positCost, _, err := pgDailyUsageAmounts(row("positai"), resolver)
+	require.NoError(t, err)
+	_, _, _, _, plainCost, _, err := pgDailyUsageAmounts(row("claude"), resolver)
+	require.NoError(t, err)
+	assert.Equal(t, money.MustParseDollars("1.1"), positCost)
+	assert.Equal(t, money.MustParseDollars("1"), plainCost)
+}
+
+func TestPGDailyUsageAmountsUsesBilledRatesForReportedCacheSavings(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: "posit-model",
+		Rates: export.ModelRates{
+			InputPerMTok:     money.MustParseDollars("1"),
+			CacheReadPerMTok: money.MustParseDollars("0.1"),
+		},
+	}})
+
+	_, _, _, _, cost, savings, err := pgDailyUsageAmounts(pgDailyUsageScanRow{
+		usageSource: "provider", model: "posit-model", providerID: "positai",
+		inputTokens: 1_000_000, cacheReadInputTokens: 1_000_000,
+		cost:       sql.NullInt64{Int64: 77, Valid: true},
+		costSource: "provider-reported",
+	}, resolver)
+	require.NoError(t, err)
+	assert.Equal(t, money.Money{Microdollars: 77}, cost)
+	assert.Equal(t, money.Money{Microdollars: 990_000}, savings)
 }

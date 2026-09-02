@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
 
@@ -118,6 +119,20 @@ func TestParseCodexSession_Basic(t *testing.T) {
 	assert.Equal(t, "/Users/alice/code/my-api", sess.Cwd)
 	assert.Equal(t, 2, len(msgs))
 	assertSessionMeta(t, sess, "codex:abc-123", "my_api", AgentCodex)
+}
+
+func TestParseCodexSession_TracksMalformedMiddleRecord(t *testing.T) {
+	content := loadFixture(t, "codex/standard_session.jsonl")
+	lineEnd := strings.IndexByte(content, '\n')
+	require.Positive(t, lineEnd)
+	content = content[:lineEnd+1] + `{"type":"event_msg"` + "\n" +
+		content[lineEnd+1:]
+
+	sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+	require.NotNil(t, sess)
+	assert.Equal(t, 1, sess.MalformedLines)
+	assert.Len(t, msgs, 2)
 }
 
 func TestParseCodexSession_SubagentLineage(t *testing.T) {
@@ -503,6 +518,30 @@ func TestParseCodexSession_ExecOriginator(t *testing.T) {
 	})
 }
 
+func TestCodexBuilderCanUseLexicalProjectDiscovery(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repository")
+	cwd := filepath.Join(repo, "recorded-cwd")
+	require.NoError(t, os.MkdirAll(filepath.Join(repo, ".git"), 0o755))
+	require.NoError(t, os.MkdirAll(cwd, 0o755))
+
+	origGuard := probeGitRootForCwd
+	t.Cleanup(func() { probeGitRootForCwd = origGuard })
+	probeGitRootForCwd = func(string) bool {
+		assert.Fail(t, "Codex lexical attribution must not probe the filesystem")
+		return true
+	}
+
+	ctx := WithoutFilesystemProjectDiscovery(t.Context())
+	builder := newCodexSessionBuilder(
+		ctx, false, nil, NewCodexCollectingSink(0),
+	)
+	builder.handleSessionMeta(gjson.Parse(`{"id":"abc","cwd":`+
+		fmt.Sprintf("%q", cwd)+`}`), time.Time{})
+
+	assert.Equal(t, "recorded_cwd", builder.project)
+}
+
 func TestCodexInsertMessage_PreservesChronologyOnSameOrdinal(t *testing.T) {
 	s := NewCodexCollectingSink(0)
 	s.messages = []ParsedMessage{{
@@ -638,7 +677,9 @@ func TestParseCodexSession_FunctionCalls(t *testing.T) {
 		// gate must not request a full parse for them (P2 contract).
 		line := `{"timestamp":"2026-07-08T03:20:43.376Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_abc","output":"Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess."}}`
 
-		b := newCodexSessionBuilder(false, NewCodexCollectingSink(0))
+		b := newCodexSessionBuilder(
+			context.Background(), false, nil, NewCodexCollectingSink(0),
+		)
 		b.rememberToolCall("call_abc", "exec_command", &ParsedToolCallPosition{MessageOrdinal: 1, CallIndex: 0})
 		assert.False(t, b.codexIncrementalNeedsFullParse(line))
 	})
@@ -1464,10 +1505,10 @@ func TestParseCodexSession_TokenUsage(t *testing.T) {
 		// input_tokens=10000 as the full input (cached included);
 		// after normalization the stored input_tokens is the
 		// uncached remainder (10000-6000=4000).
-		assert.NotEmpty(t, msgs[1].TokenUsage)
-		assert.Contains(t, string(msgs[1].TokenUsage), `"input_tokens":4000`)
-		assert.Contains(t, string(msgs[1].TokenUsage), `"output_tokens":500`)
-		assert.Contains(t, string(msgs[1].TokenUsage), `"cache_read_input_tokens":6000`)
+		assert.Equal(t,
+			`{"cache_read_input_tokens":6000,"input_tokens":4000,"output_tokens":500}`,
+			string(msgs[1].TokenUsage),
+		)
 		assert.Equal(t, 500, msgs[1].OutputTokens)
 		assert.Equal(t, 10000, msgs[1].ContextTokens) // 4000+6000
 		assert.True(t, msgs[1].HasOutputTokens)

@@ -6,7 +6,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"log"
 	"os"
@@ -21,6 +21,7 @@ import (
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
+	"go.kenn.io/agentsview/internal/pricing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1511,6 +1512,69 @@ func TestSyncModelPricingPreservesExistingMirrorRows(t *testing.T) {
 	assert.Equal(t, 2.0, output)
 }
 
+func TestSyncModelPricingRetiresOpenRouterRows(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	require.NoError(t, local.ReconcileModelPricing(
+		[]db.ModelPricing{{
+			ModelPattern: "minimax/minimax-m3",
+			InputPerMTok: money.MustParseDollars("9"),
+			Bands: []db.PricingBand{{
+				AboveInputTokens: 1000,
+				InputPerMTok:     money.MustParseDollars("10"),
+			}},
+		}},
+		nil,
+		db.PricingMeta{
+			Key:   pricing.OpenRouterModelsMetaKey,
+			Value: `["minimax/minimax-m3"]`,
+		},
+	))
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	require.NoError(t, syncer.syncModelPricing(ctx))
+
+	// LiteLLM now covers the model: the local refresh retires the
+	// OpenRouter row and rewrites the ownership sentinel.
+	require.NoError(t, local.ReconcileModelPricing(
+		[]db.ModelPricing{{
+			ModelPattern: "minimax/MiniMax-M3",
+			InputPerMTok: money.MustParseDollars("2"),
+		}},
+		[]string{"minimax/minimax-m3"},
+		db.PricingMeta{
+			Key: pricing.OpenRouterModelsMetaKey, Value: `[]`,
+		},
+	))
+	require.NoError(t, syncer.syncModelPricing(ctx))
+
+	var count int
+	require.NoError(t, syncer.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM model_pricing WHERE model_pattern = ?`,
+		"minimax/minimax-m3",
+	).Scan(&count))
+	assert.Zero(t, count, "retired row removed from the mirror")
+	require.NoError(t, syncer.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM model_pricing_bands WHERE model_pattern = ?`,
+		"minimax/minimax-m3",
+	).Scan(&count))
+	assert.Zero(t, count, "retired row's bands removed from the mirror")
+
+	var input int64
+	require.NoError(t, syncer.DB().QueryRowContext(ctx,
+		`SELECT input_microdollars_per_mtok FROM model_pricing
+		 WHERE model_pattern = ?`,
+		"minimax/MiniMax-M3",
+	).Scan(&input))
+	assert.Equal(t, int64(2_000_000), input, "replacement row mirrored")
+	var meta string
+	require.NoError(t, syncer.DB().QueryRowContext(ctx,
+		`SELECT updated_at FROM model_pricing WHERE model_pattern = ?`,
+		pricing.OpenRouterModelsMetaKey,
+	).Scan(&meta))
+	assert.Equal(t, `[]`, meta, "ownership sentinel mirrored by value")
+}
+
 func TestSyncModelPricingSkipsUnchangedMirrorRows(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
@@ -2163,8 +2227,9 @@ func TestReadStatusFromConfigCountsAllSourceMachines(t *testing.T) {
 }
 
 type syncFixture struct {
-	alphaID string
-	betaID  string
+	alphaID   string
+	alphaPath string
+	betaID    string
 }
 
 func newLocalDB(t *testing.T) *db.DB {
@@ -2426,11 +2491,14 @@ func seedDuckDBSyncFixture(t *testing.T, local *db.DB) syncFixture {
 	}}))
 	alphaID := "duck-sync-alpha"
 	betaID := "duck-sync-beta"
+	alphaPath := filepath.Join(t.TempDir(), "alpha.jsonl")
 	alphaSecret := "secret token sk-duckdb"
 	callIndex := 0
+	alphaSession := syncSession(alphaID, "alpha", "alpha first", "2026-01-10T00:00:00.000Z", 2)
+	alphaSession.FilePath = &alphaPath
 	writes := []db.SessionBatchWrite{
 		{
-			Session: syncSession(alphaID, "alpha", "alpha first", "2026-01-10T00:00:00.000Z", 2),
+			Session: alphaSession,
 			Messages: []db.Message{
 				syncMessage(alphaID, 0, "user", "alpha first", "2026-01-10T00:00:00.000Z"),
 				syncMessage(alphaID, 1, "assistant", alphaSecret, "2026-01-10T00:01:00.000Z",
@@ -2493,7 +2561,7 @@ func seedDuckDBSyncFixture(t *testing.T, local *db.DB) syncFixture {
 	note := "pin alpha"
 	_, err = local.PinMessage(alphaID, msgs[0].ID, &note)
 	require.NoError(t, err)
-	return syncFixture{alphaID: alphaID, betaID: betaID}
+	return syncFixture{alphaID: alphaID, alphaPath: alphaPath, betaID: betaID}
 }
 
 func syncSession(id, project, first, ts string, messageCount int) db.Session {

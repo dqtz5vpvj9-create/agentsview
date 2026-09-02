@@ -6,7 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"flag"
 	"fmt"
 	"io"
@@ -36,12 +36,12 @@ func mustRate(dollars string) money.Money {
 }
 
 const (
-	defaultSnapshotRef      = "db257992fb8e3048af8c1cec9da738c28b4fe603"
-	defaultSnapshotSHA256   = "0e89b636ccf858edbf95a3f6188476b6eab6cf21f66d16a65c2184229ef81cbe"
+	defaultSnapshotRef      = "9b749891c4e15f302ffec7cd30029bbe5774cf84"
+	defaultSnapshotSHA256   = "f899bb4d8f99cf19e4c63b929d8ba17eafef27e231c000af13bd3d0c8ba6e3d9"
 	defaultSnapshotBranch   = "litellm-pricing-snapshot"
 	defaultSnapshotFile     = "litellm_snapshot.json.gz"
 	defaultSnapshotBaseURL  = "https://raw.githubusercontent.com/kenn-io/agentsview"
-	defaultLiteLLMSourceRef = "551e5d097c11f08fd2400a25a651b1844fcf89c2"
+	defaultLiteLLMSourceRef = "418c7c6012d7c39a9d4a28c72cabe1995595ad2b"
 )
 
 var immutableGitRefPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -447,74 +447,84 @@ func appendModelOverlay(models []catalog.ModelPricing) []catalog.ModelPricing {
 
 	overlay := map[string]catalog.ModelPricing{
 		"claude-opus-4-6": {
-			ModelPattern:         "claude-opus-4-6",
-			InputPerMTok:         mustRate("5.0"),
-			OutputPerMTok:        mustRate("25.0"),
-			CacheCreationPerMTok: mustRate("6.25"),
-			CacheReadPerMTok:     mustRate("0.50"),
+			ModelPattern:           "claude-opus-4-6",
+			InputPerMTok:           mustRate("5.0"),
+			OutputPerMTok:          mustRate("25.0"),
+			CacheCreationPerMTok:   mustRate("6.25"),
+			CacheCreation1hPerMTok: mustRate("10.0"),
+			CacheReadPerMTok:       mustRate("0.50"),
 		},
 		"claude-opus-4-7": {
-			ModelPattern:         "claude-opus-4-7",
-			InputPerMTok:         mustRate("5.0"),
-			OutputPerMTok:        mustRate("25.0"),
-			CacheCreationPerMTok: mustRate("6.25"),
-			CacheReadPerMTok:     mustRate("0.50"),
+			ModelPattern:           "claude-opus-4-7",
+			InputPerMTok:           mustRate("5.0"),
+			OutputPerMTok:          mustRate("25.0"),
+			CacheCreationPerMTok:   mustRate("6.25"),
+			CacheCreation1hPerMTok: mustRate("10.0"),
+			CacheReadPerMTok:       mustRate("0.50"),
 		},
 		"claude-opus-4-8": {
-			ModelPattern:         "claude-opus-4-8",
-			InputPerMTok:         mustRate("5.0"),
-			OutputPerMTok:        mustRate("25.0"),
-			CacheCreationPerMTok: mustRate("6.25"),
-			CacheReadPerMTok:     mustRate("0.50"),
+			ModelPattern:           "claude-opus-4-8",
+			InputPerMTok:           mustRate("5.0"),
+			OutputPerMTok:          mustRate("25.0"),
+			CacheCreationPerMTok:   mustRate("6.25"),
+			CacheCreation1hPerMTok: mustRate("10.0"),
+			CacheReadPerMTok:       mustRate("0.50"),
 		},
 		"claude-opus-4-20250514": {
-			ModelPattern:         "claude-opus-4-20250514",
-			InputPerMTok:         mustRate("15.0"),
-			OutputPerMTok:        mustRate("75.0"),
-			CacheCreationPerMTok: mustRate("18.75"),
-			CacheReadPerMTok:     mustRate("1.50"),
+			ModelPattern:           "claude-opus-4-20250514",
+			InputPerMTok:           mustRate("15.0"),
+			OutputPerMTok:          mustRate("75.0"),
+			CacheCreationPerMTok:   mustRate("18.75"),
+			CacheCreation1hPerMTok: mustRate("30.0"),
+			CacheReadPerMTok:       mustRate("1.50"),
 		},
 		"claude-fable-5": {
-			ModelPattern:         "claude-fable-5",
-			InputPerMTok:         mustRate("10.0"),
-			OutputPerMTok:        mustRate("50.0"),
-			CacheCreationPerMTok: mustRate("12.50"),
-			CacheReadPerMTok:     mustRate("1.00"),
+			ModelPattern:           "claude-fable-5",
+			InputPerMTok:           mustRate("10.0"),
+			OutputPerMTok:          mustRate("50.0"),
+			CacheCreationPerMTok:   mustRate("12.50"),
+			CacheCreation1hPerMTok: mustRate("20.0"),
+			CacheReadPerMTok:       mustRate("1.00"),
 		},
 		"claude-sonnet-4-6": {
-			ModelPattern:         "claude-sonnet-4-6",
-			InputPerMTok:         mustRate("3.0"),
-			OutputPerMTok:        mustRate("15.0"),
-			CacheCreationPerMTok: mustRate("3.75"),
-			CacheReadPerMTok:     mustRate("0.30"),
+			ModelPattern:           "claude-sonnet-4-6",
+			InputPerMTok:           mustRate("3.0"),
+			OutputPerMTok:          mustRate("15.0"),
+			CacheCreationPerMTok:   mustRate("3.75"),
+			CacheCreation1hPerMTok: mustRate("6.0"),
+			CacheReadPerMTok:       mustRate("0.30"),
 		},
 		"claude-sonnet-4-20250514": {
-			ModelPattern:         "claude-sonnet-4-20250514",
-			InputPerMTok:         mustRate("3.0"),
-			OutputPerMTok:        mustRate("15.0"),
-			CacheCreationPerMTok: mustRate("3.75"),
-			CacheReadPerMTok:     mustRate("0.30"),
+			ModelPattern:           "claude-sonnet-4-20250514",
+			InputPerMTok:           mustRate("3.0"),
+			OutputPerMTok:          mustRate("15.0"),
+			CacheCreationPerMTok:   mustRate("3.75"),
+			CacheCreation1hPerMTok: mustRate("6.0"),
+			CacheReadPerMTok:       mustRate("0.30"),
 		},
 		"claude-sonnet-4-5-20250514": {
-			ModelPattern:         "claude-sonnet-4-5-20250514",
-			InputPerMTok:         mustRate("3.0"),
-			OutputPerMTok:        mustRate("15.0"),
-			CacheCreationPerMTok: mustRate("3.75"),
-			CacheReadPerMTok:     mustRate("0.30"),
+			ModelPattern:           "claude-sonnet-4-5-20250514",
+			InputPerMTok:           mustRate("3.0"),
+			OutputPerMTok:          mustRate("15.0"),
+			CacheCreationPerMTok:   mustRate("3.75"),
+			CacheCreation1hPerMTok: mustRate("6.0"),
+			CacheReadPerMTok:       mustRate("0.30"),
 		},
 		"claude-haiku-4-5-20251001": {
-			ModelPattern:         "claude-haiku-4-5-20251001",
-			InputPerMTok:         mustRate("1.0"),
-			OutputPerMTok:        mustRate("5.0"),
-			CacheCreationPerMTok: mustRate("1.25"),
-			CacheReadPerMTok:     mustRate("0.10"),
+			ModelPattern:           "claude-haiku-4-5-20251001",
+			InputPerMTok:           mustRate("1.0"),
+			OutputPerMTok:          mustRate("5.0"),
+			CacheCreationPerMTok:   mustRate("1.25"),
+			CacheCreation1hPerMTok: mustRate("2.0"),
+			CacheReadPerMTok:       mustRate("0.10"),
 		},
 		"claude-haiku-3-5-20241022": {
-			ModelPattern:         "claude-haiku-3-5-20241022",
-			InputPerMTok:         mustRate("0.80"),
-			OutputPerMTok:        mustRate("4.0"),
-			CacheCreationPerMTok: mustRate("1.0"),
-			CacheReadPerMTok:     mustRate("0.08"),
+			ModelPattern:           "claude-haiku-3-5-20241022",
+			InputPerMTok:           mustRate("0.80"),
+			OutputPerMTok:          mustRate("4.0"),
+			CacheCreationPerMTok:   mustRate("1.0"),
+			CacheCreation1hPerMTok: mustRate("1.6"),
+			CacheReadPerMTok:       mustRate("0.08"),
 		},
 		"gpt-5.5": {
 			ModelPattern:     "gpt-5.5",

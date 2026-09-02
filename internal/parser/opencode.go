@@ -4,7 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -470,6 +471,16 @@ func parseOpenCodeDBSession(
 
 	projectWorktree := strings.TrimSpace(projects[s.projectID])
 	cwd := resolveOpenCodeWorktree(s.directory, projectWorktree)
+	if cwd == "" &&
+		(strings.TrimSpace(s.directory) == "" ||
+			strings.TrimSpace(s.directory) == string(filepath.Separator) ||
+			strings.TrimSpace(s.directory) == "/") &&
+		(strings.TrimSpace(projectWorktree) == string(filepath.Separator) ||
+			strings.TrimSpace(projectWorktree) == "/") {
+		// SQLite's global project uses / as its declared worktree. Preserve
+		// that source value; file-backed metadata applies the stricter policy.
+		cwd = "/"
+	}
 	if !openCodeUsableWorktree(projectWorktree) {
 		projectWorktree = cwd
 	}
@@ -488,7 +499,10 @@ func resolveOpenCodeWorktree(
 	if dir := strings.TrimSpace(sessionDirectory); openCodeUsableWorktree(dir) {
 		return dir
 	}
-	return strings.TrimSpace(projectWorktree)
+	if worktree := strings.TrimSpace(projectWorktree); openCodeUsableWorktree(worktree) {
+		return worktree
+	}
+	return ""
 }
 
 func openCodeUsableWorktree(path string) bool {
@@ -499,6 +513,46 @@ func openCodeUsableWorktree(path string) bool {
 	return path != string(filepath.Separator) && path != "/"
 }
 
+type openCodeProjectFile struct {
+	Worktree string `json:"worktree"`
+}
+
+func openCodeProjectPath(sessionPath string) string {
+	root := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(sessionPath))))
+	projectID := filepath.Base(filepath.Dir(sessionPath))
+	return filepath.Join(root, "storage", "project", projectID+".json")
+}
+
+// resolveOpenCodeStorageWorktree applies the file-backed session precedence
+// and reads only the project metadata named by the session path.
+func resolveOpenCodeStorageWorktree(
+	sessionPath, sessionDirectory string,
+) (string, error) {
+	sessionDirectory = strings.TrimSpace(sessionDirectory)
+	if openCodeUsableWorktree(sessionDirectory) {
+		return resolveOpenCodeWorktree(sessionDirectory, ""), nil
+	}
+	projectPath := openCodeProjectPath(sessionPath)
+	projectWorktree := ""
+	raw, err := os.ReadFile(projectPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf(
+				"reading opencode project file %s: %w", projectPath, err,
+			)
+		}
+	} else {
+		var project openCodeProjectFile
+		if err := json.Unmarshal(raw, &project); err != nil {
+			return "", fmt.Errorf(
+				"decoding opencode project file %s: %w", projectPath, err,
+			)
+		}
+		projectWorktree = project.Worktree
+	}
+	return resolveOpenCodeWorktree(sessionDirectory, projectWorktree), nil
+}
+
 // parseOpenCodeStorageFile parses a file-backed OpenCode storage
 // session rooted at storage/session/<project>/<session>.json. The
 // OpenCode-format provider owns this path; Kilo and MiMoCode reuse it
@@ -506,81 +560,53 @@ func openCodeUsableWorktree(path string) bool {
 func parseOpenCodeStorageFile(
 	sessionPath, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
-	raw, err := os.ReadFile(sessionPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"reading opencode session file %s: %w",
-			sessionPath, err,
-		)
-	}
-
-	var sf openCodeStorageSessionFile
-	if err := json.Unmarshal(raw, &sf); err != nil {
-		return nil, nil, fmt.Errorf(
-			"decoding opencode session file %s: %w",
-			sessionPath, err,
-		)
-	}
-	if sf.ID == "" {
-		return nil, nil, fmt.Errorf(
-			"opencode session file %s missing id",
-			sessionPath,
-		)
-	}
-
-	root := filepath.Dir(filepath.Dir(filepath.Dir(
-		filepath.Dir(sessionPath),
-	)))
-	// OpenCode session sync replaces the full stored transcript.
-	// If a child JSON is truncated mid-write, skipping it here
-	// would silently drop previously persisted content until the
-	// next successful sync, so malformed children abort the parse.
-	msgs, err := loadOpenCodeStorageMessages(root, sf.ID)
+	snapshot, err := loadOpenCodeStorageSnapshot(sessionPath, true)
 	if err != nil {
 		return nil, nil, err
 	}
-	parts, err := loadOpenCodeStorageParts(root, msgs)
-	if err != nil {
-		return nil, nil, err
-	}
-	fileMtime, err := OpenCodeSourceMtime(sessionPath)
-	if err != nil {
-		return nil, nil, err
-	}
-
 	sess, parsed, err := buildOpenCodeParsedSession(
-		openCodeSessionRow{
-			id:          sf.ID,
-			parentID:    sf.ParentID,
-			title:       sf.Title,
-			timeCreated: sf.Time.Created,
-			timeUpdated: sf.Time.Updated,
-		},
-		sf.Directory,
-		sf.Directory,
-		sessionPath,
-		fileMtime,
+		snapshot.session,
+		snapshot.worktree,
+		snapshot.worktree,
+		snapshot.sessionPath,
+		snapshot.fileMtime,
 		machine,
-		msgs,
-		parts,
+		snapshot.messages,
+		snapshot.parts,
 	)
 	if err != nil || sess == nil {
 		return sess, parsed, err
 	}
-	sess.File.Hash = buildOpenCodeSessionFingerprint(
-		openCodeSessionRow{
-			id:          sf.ID,
-			parentID:    sf.ParentID,
-			title:       sf.Title,
-			timeCreated: sf.Time.Created,
-			timeUpdated: sf.Time.Updated,
-		},
-		sf.Directory,
-		sf.Directory,
-		msgs,
-		parts,
-	)
+	sess.File.Size = snapshot.fileSize
+	sess.File.Hash = snapshot.fingerprint()
 	return sess, parsed, nil
+}
+
+// openCodeStorageSessionFingerprint hashes raw storage rows without parsing messages.
+func openCodeStorageSessionFingerprint(sessionPath string) (string, error) {
+	snapshot, err := loadOpenCodeStorageSnapshot(sessionPath, false)
+	if err != nil {
+		return "", err
+	}
+	return openCodeStorageFingerprintFromSnapshot(snapshot)
+}
+
+func openCodeStorageFingerprintFromSnapshot(
+	snapshot openCodeStorageSnapshot,
+) (string, error) {
+	if !snapshot.hasMaterializedMessages() {
+		// Empty or still-in-progress sessions intentionally map to SkipNoSession;
+		// fingerprinting must preserve that normal outcome.
+		return "", nil
+	}
+	hash := snapshot.fingerprint()
+	if !HasOpenCodeStorageFingerprint(hash) {
+		return "", fmt.Errorf(
+			"opencode storage session %s has no content fingerprint",
+			snapshot.sessionPath,
+		)
+	}
+	return hash, nil
 }
 
 func openOpenCodeDB(dbPath string) (*sql.DB, error) {
@@ -1333,7 +1359,7 @@ func applyOpenCodeTokenUsage(
 		"cache_read_input_tokens":     fields.cacheRead,
 		"cache_creation_input_tokens": fields.cacheCreate,
 	}
-	j, err := json.Marshal(normalized)
+	j, err := json.Marshal(normalized, json.Deterministic(true))
 	if err != nil {
 		return
 	}
@@ -1503,15 +1529,15 @@ func extractOpenCodeText(data string) string {
 
 // openCodeToolData is the JSON structure for a tool part's data.
 type openCodeToolData struct {
-	ToolName string          `json:"tool"`
-	CallID   string          `json:"callID"`
-	State    json.RawMessage `json:"state"`
+	ToolName string         `json:"tool"`
+	CallID   string         `json:"callID"`
+	State    jsontext.Value `json:"state"`
 }
 
 // openCodeToolState holds the nested state of a tool call.
 type openCodeToolState struct {
-	Input    json.RawMessage `json:"input"`
-	Metadata json.RawMessage `json:"metadata"`
+	Input    jsontext.Value `json:"input"`
+	Metadata jsontext.Value `json:"metadata"`
 }
 
 // openCodeToolMetadata holds the optional metadata from a tool state.
@@ -1640,6 +1666,119 @@ type openCodeStorageSessionFile struct {
 	ParentID  string              `json:"parentID"`
 	Title     string              `json:"title"`
 	Time      openCodeStorageTime `json:"time"`
+}
+
+type openCodeStorageSnapshot struct {
+	sessionPath string
+	fileSize    int64
+	fileMtime   int64
+	session     openCodeSessionRow
+	directory   string
+	worktree    string
+	messages    []openCodeMessageRow
+	parts       map[string][]openCodePartRow
+}
+
+func loadOpenCodeStorageSnapshot(
+	sessionPath string,
+	includeMtime bool,
+) (openCodeStorageSnapshot, error) {
+	raw, err := os.ReadFile(sessionPath)
+	if err != nil {
+		return openCodeStorageSnapshot{}, fmt.Errorf(
+			"reading opencode session file %s: %w",
+			sessionPath, err,
+		)
+	}
+
+	var sf openCodeStorageSessionFile
+	if err := json.Unmarshal(raw, &sf); err != nil {
+		return openCodeStorageSnapshot{}, fmt.Errorf(
+			"decoding opencode session file %s: %w",
+			sessionPath, err,
+		)
+	}
+	if sf.ID == "" {
+		return openCodeStorageSnapshot{}, fmt.Errorf(
+			"opencode session file %s missing id",
+			sessionPath,
+		)
+	}
+
+	root := filepath.Dir(filepath.Dir(filepath.Dir(
+		filepath.Dir(sessionPath),
+	)))
+	msgs, err := loadOpenCodeStorageMessages(root, sf.ID)
+	if err != nil {
+		return openCodeStorageSnapshot{}, err
+	}
+	parts, err := loadOpenCodeStorageParts(root, msgs)
+	if err != nil {
+		return openCodeStorageSnapshot{}, err
+	}
+	var fileMtime int64
+	if includeMtime {
+		fileMtime, err = OpenCodeSourceMtime(sessionPath)
+		if err != nil {
+			return openCodeStorageSnapshot{}, err
+		}
+	}
+	worktree, err := resolveOpenCodeStorageWorktree(sessionPath, sf.Directory)
+	if err != nil {
+		return openCodeStorageSnapshot{}, err
+	}
+
+	return openCodeStorageSnapshot{
+		sessionPath: sessionPath,
+		fileSize:    int64(len(raw)),
+		fileMtime:   fileMtime,
+		session: openCodeSessionRow{
+			id:          sf.ID,
+			parentID:    sf.ParentID,
+			title:       sf.Title,
+			timeCreated: sf.Time.Created,
+			timeUpdated: sf.Time.Updated,
+		},
+		directory: sf.Directory,
+		worktree:  worktree,
+		messages:  msgs,
+		parts:     parts,
+	}, nil
+}
+
+func (s openCodeStorageSnapshot) fingerprint() string {
+	return buildOpenCodeSessionFingerprint(
+		s.session,
+		s.directory,
+		s.worktree,
+		s.messages,
+		s.parts,
+	)
+}
+
+func (s openCodeStorageSnapshot) hasMaterializedMessages() bool {
+	for _, msg := range s.messages {
+		var md openCodeMessageData
+		if json.Unmarshal([]byte(msg.data), &md) != nil ||
+			normalizeOpenCodeRole(md.Role) == "" {
+			continue
+		}
+		for _, part := range s.parts[msg.id] {
+			switch extractOpenCodePartType(part.data) {
+			case "tool":
+				return true
+			case "text":
+				if strings.TrimSpace(extractOpenCodeText(part.data)) != "" {
+					return true
+				}
+			case "reasoning":
+				if extractOpenCodeText(part.data) != "" {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 type openCodeStorageMessageFile struct {
@@ -2016,6 +2155,15 @@ func openCodeStorageSessionMtime(
 
 	messageDir := filepath.Join(root, "storage", "message", sessionID)
 	fileMtime = max(fileMtime, statMtime(messageDir))
+	var session struct {
+		Directory string `json:"directory"`
+	}
+	if raw, readErr := os.ReadFile(sessionPath); readErr == nil {
+		if json.Unmarshal(raw, &session) == nil &&
+			!openCodeUsableWorktree(strings.TrimSpace(session.Directory)) {
+			fileMtime = max(fileMtime, statMtime(openCodeProjectPath(sessionPath)))
+		}
+	}
 	msgEntries, err := os.ReadDir(messageDir)
 	if err != nil {
 		if os.IsNotExist(err) {

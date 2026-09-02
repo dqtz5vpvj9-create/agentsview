@@ -5,7 +5,8 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -677,6 +678,17 @@ func TestOpenCreatesFile(t *testing.T) {
 	require.NoError(t, err, "db file not created")
 }
 
+func TestOpenIsolatedStartsNoWALCheckpointLoop(t *testing.T) {
+	d, err := OpenIsolated(filepath.Join(t.TempDir(), "capture.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, d.Close()) })
+
+	d.checkpointMu.Lock()
+	stop := d.checkpointStop
+	d.checkpointMu.Unlock()
+	assert.Nil(t, stop)
+}
+
 func TestOpenDataVersionBump_PreservesData(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
@@ -1008,10 +1020,40 @@ func TestMigration_ToolResultEventsTable(t *testing.T) {
 		"expected tool_result_events table after reopen")
 }
 
-func TestCurrentDataVersionClaudeIDEEnvelopeSplit(t *testing.T) {
-	assert.Equal(t, 88, CurrentDataVersion(),
-		"version 88 splits Claude IDE envelopes off mixed prompts after "+
-			"the Codex fork replay boundary reparse")
+func TestCurrentDataVersionIncludesOpenCodeProjectMetadataChange(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 89,
+		"version 89 is the data-version boundary for file-backed OpenCode metadata changes")
+	t.Logf("CurrentDataVersion=%d", CurrentDataVersion())
+}
+
+func TestCurrentDataVersionGrokMessageTimestamps(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 90,
+		"version 90 is the data-version boundary for Grok message timestamps")
+}
+
+func TestCurrentDataVersionPositAssistantCacheAccounting(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 91,
+		"version 91 is the data-version boundary for Posit Assistant cache accounting")
+}
+
+func TestCurrentDataVersionPositAssistantUsageEventsSidecar(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 93,
+		"version 93 is the data-version boundary for Posit Assistant usage-events")
+}
+
+func TestCurrentDataVersionDevinMessageNodeTokenUsage(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 94,
+		"Devin message_nodes token usage requires re-parsing fallback sessions")
+}
+
+func TestCurrentDataVersionPositAssistantProviderIdentity(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 95,
+		"Posit Assistant provider identity requires re-parsing usage rows")
+}
+
+func TestCurrentDataVersionAntigravityCLICwdAndWorktreeProject(t *testing.T) {
+	assert.Equal(t, 96, CurrentDataVersion(),
+		"Antigravity CLI cwd and worktree project recovery require a sequential backfill")
 }
 
 func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {
@@ -4213,7 +4255,7 @@ func TestWriteSessionIncrementalLateResultAndCommittedUsageAreAtomic(t *testing.
 		}},
 		MessageTokenUsageUpdates: []MessageTokenUsageUpdate{{
 			Ordinal:          0,
-			TokenUsage:       json.RawMessage(`{"input_tokens":100000,"output_tokens":250}`),
+			TokenUsage:       jsontext.Value(`{"input_tokens":100000,"output_tokens":250}`),
 			ContextTokens:    100000,
 			OutputTokens:     250,
 			HasContextTokens: true,
@@ -5832,6 +5874,7 @@ func TestCopyOrphanedDataFromReconcilesTranscriptRevisions(t *testing.T) {
 	ids := []string{
 		"unchanged", "changed", "tool-changed",
 		"compact-changed", "subtype-changed",
+		"usage-changed", "claude-identity-changed", "source-identity-changed",
 	}
 	for _, id := range ids {
 		insertSession(t, srcDB, id, "proj")
@@ -5842,11 +5885,23 @@ func TestCopyOrphanedDataFromReconcilesTranscriptRevisions(t *testing.T) {
 		asstMsg("tool-changed", 0, "tool"),
 		userMsg("compact-changed", 0, "boundary"),
 		userMsg("subtype-changed", 0, "system event"),
+		asstMsg("usage-changed", 0, "same response"),
+		asstMsg("claude-identity-changed", 0, "same response"),
+		asstMsg("source-identity-changed", 0, "same response"),
 	)
 	_, err := srcDB.getWriter().Exec(`
 		UPDATE messages SET is_system = 1
 		WHERE session_id = 'subtype-changed'`)
 	requireNoError(t, err, "mark source system message")
+	_, err = srcDB.getWriter().Exec(`
+		UPDATE messages SET token_usage = '{"input_tokens":10}'
+		WHERE session_id = 'usage-changed';
+		UPDATE messages
+		SET claude_message_id = 'msg-old', claude_request_id = 'req-old'
+		WHERE session_id = 'claude-identity-changed';
+		UPDATE messages SET source_uuid = 'source-old'
+		WHERE session_id = 'source-identity-changed'`)
+	requireNoError(t, err, "seed source usage identities")
 	_, err = srcDB.getWriter().Exec(`
 		INSERT INTO tool_calls
 			(message_id, session_id, tool_name, category, input_json, call_index)
@@ -5871,6 +5926,9 @@ func TestCopyOrphanedDataFromReconcilesTranscriptRevisions(t *testing.T) {
 		asstMsg("tool-changed", 0, "tool"),
 		userMsg("compact-changed", 0, "boundary"),
 		userMsg("subtype-changed", 0, "system event"),
+		asstMsg("usage-changed", 0, "same response"),
+		asstMsg("claude-identity-changed", 0, "same response"),
+		asstMsg("source-identity-changed", 0, "same response"),
 	)
 	_, err = dstDB.getWriter().Exec(`
 		UPDATE messages
@@ -5878,7 +5936,14 @@ func TestCopyOrphanedDataFromReconcilesTranscriptRevisions(t *testing.T) {
 		WHERE session_id = 'compact-changed';
 		UPDATE messages
 		SET is_system = 1, source_subtype = 'resume'
-		WHERE session_id = 'subtype-changed'`)
+		WHERE session_id = 'subtype-changed';
+		UPDATE messages SET token_usage = '{"input_tokens":20}'
+		WHERE session_id = 'usage-changed';
+		UPDATE messages
+		SET claude_message_id = 'msg-new', claude_request_id = 'req-new'
+		WHERE session_id = 'claude-identity-changed';
+		UPDATE messages SET source_uuid = 'source-new'
+		WHERE session_id = 'source-identity-changed'`)
 	requireNoError(t, err, "change destination display fields")
 	_, err = dstDB.getWriter().Exec(`
 		INSERT INTO tool_calls
@@ -5911,7 +5976,10 @@ func TestCopyOrphanedDataFromReconcilesTranscriptRevisions(t *testing.T) {
 	require.NotNil(t, toolChanged.TranscriptRevision)
 	assert.Equal(t, "8", *toolChanged.TranscriptRevision)
 
-	for _, id := range []string{"compact-changed", "subtype-changed"} {
+	for _, id := range []string{
+		"compact-changed", "subtype-changed", "usage-changed",
+		"claude-identity-changed", "source-identity-changed",
+	} {
 		session, err := dstDB.GetSession(context.Background(), id)
 		requireNoError(t, err, "GetSession "+id)
 		require.NotNil(t, session)
@@ -5983,7 +6051,7 @@ func TestCopyOrphanedDataFrom_PreservesCopiedDetails(t *testing.T) {
 	})
 	tokenMsg := asstMsg("token", 0, "response")
 	tokenMsg.Model = "claude-opus-4-20250514"
-	tokenMsg.TokenUsage = json.RawMessage(`{"output_tokens":500}`)
+	tokenMsg.TokenUsage = jsontext.Value(`{"output_tokens":500}`)
 	tokenMsg.ContextTokens = 80000
 	tokenMsg.OutputTokens = 500
 	tokenMsg.HasContextTokens = true
@@ -7516,7 +7584,7 @@ func TestSoftDeleteSessions(t *testing.T) {
 	assert.Equal(t, 0, n, "empty: rows=")
 }
 
-func TestSoftDeleteConvertsSourceMissingTombstonesToUserTrash(t *testing.T) {
+func TestSoftDeleteKeepsSourceMissingStateIndependent(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
 	paths := map[string]string{
@@ -7529,7 +7597,7 @@ func TestSoftDeleteConvertsSourceMissingTombstonesToUserTrash(t *testing.T) {
 			s.FilePath = &path
 		})
 		baselineSessionSource(t, d, defaultMachine, "claude", path)
-		changed, err := d.SoftDeleteSessionSourceOwnership(
+		changed, err := d.MarkSessionSourceMissing(
 			ctx, defaultMachine, "claude", id, path,
 		)
 		require.NoError(t, err)
@@ -7545,8 +7613,8 @@ func TestSoftDeleteConvertsSourceMissingTombstonesToUserTrash(t *testing.T) {
 		full, err := d.GetSessionFull(ctx, id)
 		require.NoError(t, err)
 		require.NotNil(t, full)
-		assert.Nil(t, full.DeletionCause,
-			"an explicit user deletion must replace the recoverable source tombstone")
+		assert.NotNil(t, full.SourceMissingAt)
+		assert.Nil(t, full.DeletionCause)
 		assert.True(t, d.IsSessionTrashed(id))
 	}
 }
@@ -9028,7 +9096,7 @@ func TestSessionsTerminationStatusIndex(t *testing.T) {
 		count)
 }
 
-func TestMessagesUsageCoveringIndex(t *testing.T) {
+func TestMessagesUsageIndexes(t *testing.T) {
 	d := testDB(t)
 
 	var count int
@@ -9038,17 +9106,17 @@ func TestMessagesUsageCoveringIndex(t *testing.T) {
 	).Scan(&count)
 	requireNoError(t, err, "probing idx_messages_usage_covering")
 
-	require.Equal(t, 1, count,
-		"expected idx_messages_usage_covering to exist, got count=%d",
+	require.Equal(t, 0, count,
+		"expected superseded idx_messages_usage_covering to be absent, got count=%d",
 		count)
 
 	err = d.getReader().QueryRow(
 		`SELECT count(*) FROM sqlite_master
 		 WHERE type = 'index' AND name = 'idx_messages_usage_timestamp'`,
 	).Scan(&count)
-	requireNoError(t, err, "probing legacy idx_messages_usage_timestamp")
-	require.Equal(t, 0, count,
-		"expected idx_messages_usage_timestamp to be dropped")
+	requireNoError(t, err, "probing idx_messages_usage_timestamp")
+	require.Equal(t, 1, count,
+		"expected idx_messages_usage_timestamp to exist")
 }
 
 // TestMigration_TerminationStatusColumn simulates upgrading from a

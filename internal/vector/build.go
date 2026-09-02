@@ -54,6 +54,12 @@ type BuildOptions struct {
 	IncludeAutomated bool
 	// BatchSize is the encode batch size (config batch_size).
 	BatchSize int
+	// ModelContextTokens is the maximum tokens accepted for one input.
+	// MaxBatchTokens is the provider's total input-token cap per request.
+	// When both are positive, batching charges every input the full model
+	// context so provider-side truncation cannot push a request over its cap.
+	ModelContextTokens int
+	MaxBatchTokens     int
 	// Concurrency is the number of documents encoded in parallel (config
 	// concurrency). Values <= 0 encode sequentially.
 	Concurrency int
@@ -185,10 +191,10 @@ func (ix *Index) Build(
 		db:    ix.db,
 		spec:  ix.spec,
 	}
-	fillStats, fillErr := kitvec.Fill[string, string](ctx, fillStore, target, wrapped, kitvec.FillOptions[string]{
-		Split:       ix.split,
-		Batch:       kitvec.BatchOptions{BatchSize: o.BatchSize, Concurrency: 1},
-		Concurrency: o.Concurrency,
+	fillStats, fillErr := kitvec.Fill[string, string](ctx, fillStore, target, wrapped,
+		kitvec.WithFillSplit[string](ix.split),
+		kitvec.WithFillBatch[string](o.encodeBatchOptions()...),
+		kitvec.WithFillConcurrency[string](o.Concurrency),
 		// A positive BatchSize packs chunks from several documents into one
 		// encode call, so a permanent rejection arrives without knowing which
 		// document caused it. Permitting isolation lets kit re-encode each
@@ -196,9 +202,9 @@ func (ix *Index) Build(
 		// whole fill aborts and one poison document wedges every later build,
 		// which is what OnEncodeError exists to prevent. Transient failures
 		// still abort untouched: they are not worth N extra probe calls.
-		ShouldIsolateBatchError: isPermanentEncodeError,
-		OnEncodeError:           skipPermanentEncodeError,
-	})
+		kitvec.WithFillBatchErrorIsolation[string](isPermanentEncodeError),
+		kitvec.WithFillEncodeError[string](skipPermanentEncodeError),
+	)
 	finish()
 	result.Fill = fillStats
 	if fillErr != nil {
@@ -269,7 +275,7 @@ func (ix *Index) buildInvalidRepair(
 	wrapped, finish := ix.wrapProgress(validatingEncoder(enc), total, o.Progress)
 	fill, fillErr := fillRepairQueue(ctx, store, target, wrapped, repairFillOptions{
 		Split:       ix.split,
-		Batch:       kitvec.BatchOptions{BatchSize: o.BatchSize, Concurrency: 1},
+		Batch:       o.encodeBatchOptions(),
 		Concurrency: o.Concurrency,
 	})
 	finish()
@@ -295,6 +301,23 @@ func (ix *Index) buildInvalidRepair(
 			"invalid vector repair incomplete: %d targets remain queued", remaining)
 	}
 	return result, nil
+}
+
+// encodeBatchOptions configures kit to treat the model context window as the
+// conservative upper bound for every input. Providers may truncate oversized
+// inputs to that length, so the bound keeps the request within their aggregate
+// token cap without depending on provider tokenization.
+func (o BuildOptions) encodeBatchOptions() []kitvec.BatchOption {
+	options := []kitvec.BatchOption{
+		kitvec.WithBatchSize(o.BatchSize),
+		kitvec.WithBatchConcurrency(1),
+	}
+	if o.ModelContextTokens > 0 && o.MaxBatchTokens > 0 {
+		options = append(options, kitvec.WithBatchTokenBudget(
+			o.MaxBatchTokens, o.ModelContextTokens,
+		))
+	}
+	return options
 }
 
 // repairRemaining preserves the accumulated committed target count as a
@@ -326,7 +349,7 @@ func validatingEncoder(enc kitvec.EncodeFunc) kitvec.EncodeFunc {
 	}
 }
 
-// skipPermanentEncodeError implements kitvec.FillOptions.OnEncodeError: a
+// skipPermanentEncodeError handles WithFillEncodeError: a
 // document the embeddings endpoint permanently rejects for input-specific
 // reasons (e.g. a token-window overflow or a content-policy rejection) is
 // skipped — kit stamps it for the generation with no vectors so it stops being

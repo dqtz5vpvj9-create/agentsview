@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -103,18 +104,16 @@ func newVerifiedSourceArchiveWithRewriter(
 	root := t.TempDir()
 	database := openTestDB(t)
 	provider := &verifiedSourceCountingProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{
-				Type: parser.AgentCodex, DisplayName: "Codex",
-				IDPrefix: "codex:", FileBased: true,
-			},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				WatchSources:         parser.CapabilitySupported,
-				ClassifyChangedPath:  parser.CapabilitySupported,
-				CompositeFingerprint: parser.CapabilitySupported,
-				VerifiedLocalStat:    parser.CapabilitySupported,
-			}},
+		Def: parser.AgentDef{
+			Type: parser.AgentCodex, DisplayName: "Codex",
+			IDPrefix: "codex:", FileBased: true,
 		},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			WatchSources:         parser.CapabilitySupported,
+			ClassifyChangedPath:  parser.CapabilitySupported,
+			CompositeFingerprint: parser.CapabilitySupported,
+			VerifiedLocalStat:    parser.CapabilitySupported,
+		}},
 		root:    root,
 		sources: make(map[string]parser.SourceRef, count),
 	}
@@ -333,18 +332,16 @@ func TestVerifiedSourceGateDoesNotBorrowRepairState(t *testing.T) {
 
 	newProvider := func(agent parser.AgentType) *verifiedSourceCountingProvider {
 		return &verifiedSourceCountingProvider{
-			ProviderBase: parser.ProviderBase{
-				Def: parser.AgentDef{
-					Type: agent, DisplayName: string(agent),
-					IDPrefix: string(agent) + ":", FileBased: true,
-				},
-				Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-					WatchSources:         parser.CapabilitySupported,
-					ClassifyChangedPath:  parser.CapabilitySupported,
-					CompositeFingerprint: parser.CapabilitySupported,
-					VerifiedLocalStat:    parser.CapabilitySupported,
-				}},
+			Def: parser.AgentDef{
+				Type: agent, DisplayName: string(agent),
+				IDPrefix: string(agent) + ":", FileBased: true,
 			},
+			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+				WatchSources:         parser.CapabilitySupported,
+				ClassifyChangedPath:  parser.CapabilitySupported,
+				CompositeFingerprint: parser.CapabilitySupported,
+				VerifiedLocalStat:    parser.CapabilitySupported,
+			}},
 			root: root,
 			sources: map[string]parser.SourceRef{
 				filepath.Clean(path): {
@@ -436,8 +433,23 @@ func TestVerifiedSourceGateRechecksAfterStatAndWatcherInvalidation(t *testing.T)
 
 	info, err := os.Stat(file.Path)
 	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(file.Path, []byte("changed\n"), 0o600))
-	require.NoError(t, os.Chtimes(file.Path, info.ModTime(), info.ModTime()))
+	baselineChangeTime, ok := fileChangeTime(file.Path, info)
+	require.True(t, ok, "native change time unavailable")
+	changeTime := baselineChangeTime
+	deadline := time.Now().Add(2 * time.Second)
+	for changeTime == baselineChangeTime && time.Now().Before(deadline) {
+		require.NoError(t, os.WriteFile(file.Path, []byte("changed\n"), 0o600))
+		require.NoError(t, os.Chtimes(file.Path, info.ModTime(), info.ModTime()))
+		changedInfo, statErr := os.Stat(file.Path)
+		require.NoError(t, statErr)
+		changeTime, ok = fileChangeTime(file.Path, changedInfo)
+		require.True(t, ok, "native change time unavailable after rewrite")
+		if changeTime == baselineChangeTime {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	require.NotEqual(t, baselineChangeTime, changeTime,
+		"fixture must cross a native change-time tick")
 	runVerifiedSourcePass(t, engine, files)
 	assert.Equal(t, 1, provider.fingerprintCalls,
 		"same-size rewrite with restored mtime must deep-verify")
@@ -491,20 +503,18 @@ func TestVerifiedSourceGateLegacyClaudeRowMustEstablishFingerprint(t *testing.T)
 	))
 
 	provider := &verifiedSourceCountingProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{
-				Type: parser.AgentClaude, DisplayName: "Claude",
-				IDPrefix: "claude:", FileBased: true,
+		Def: parser.AgentDef{
+			Type: parser.AgentClaude, DisplayName: "Claude",
+			IDPrefix: "claude:", FileBased: true,
+		},
+		Caps: parser.Capabilities{
+			Source: parser.SourceCapabilities{
+				IncrementalAppend: parser.CapabilitySupported,
+				VerifiedLocalStat: parser.CapabilitySupported,
 			},
-			Caps: parser.Capabilities{
-				Source: parser.SourceCapabilities{
-					IncrementalAppend: parser.CapabilitySupported,
-					VerifiedLocalStat: parser.CapabilitySupported,
-				},
-				Sync: parser.ProviderSyncSemantics{
-					FingerprintHashInCacheKey:           true,
-					FingerprintHashRequiredForFreshness: true,
-				},
+			Sync: parser.ProviderSyncSemantics{
+				FingerprintHashInCacheKey:           true,
+				FingerprintHashRequiredForFreshness: true,
 			},
 		},
 		root:    root,

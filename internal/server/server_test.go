@@ -5,7 +5,8 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"mime/multipart"
@@ -605,6 +606,36 @@ func TestOpenAPIEndpointDocumentsExistingAPIRoutes(t *testing.T) {
 	assert.Contains(t, spec.Paths["/api/v1/session-stats"], "get")
 }
 
+func TestTypedRoutesRejectDuplicateJSONMembers(t *testing.T) {
+	te := setup(t)
+
+	w := te.post(t, "/api/v1/config/terminal", `{"mode":"auto","mode":"clipboard"}`)
+
+	assertStatus(t, w, http.StatusBadRequest)
+}
+
+func TestOpenAPIEndpointDocumentsTokenUsageAsArbitraryJSON(t *testing.T) {
+	te := setup(t)
+
+	w := te.get(t, "/api/openapi.json")
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var spec struct {
+		Components struct {
+			Schemas map[string]struct {
+				Properties map[string]jsontext.Value `json:"properties"`
+			} `json:"schemas"`
+		} `json:"components"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &spec))
+
+	messageSchema, ok := spec.Components.Schemas["DbMessage"]
+	require.True(t, ok, "spec missing DbMessage schema")
+	tokenUsage, ok := messageSchema.Properties["token_usage"]
+	require.True(t, ok, "DbMessage schema missing token_usage")
+	assert.JSONEq(t, `{}`, string(tokenUsage))
+}
+
 func TestOpenAPIEndpointKeepsUsageSummaryContract(t *testing.T) {
 	te := setup(t)
 
@@ -912,7 +943,7 @@ func TestOpenAPIEndpointDocumentsBatchDeleteSessionIDsAsNonNullableArray(t *test
 			Schemas map[string]struct {
 				Required   []string `json:"required"`
 				Properties map[string]struct {
-					Type json.RawMessage `json:"type"`
+					Type jsontext.Value `json:"type"`
 				} `json:"properties"`
 			} `json:"schemas"`
 		} `json:"components"`
@@ -1170,6 +1201,20 @@ func (te *testEnv) upload(
 	w := httptest.NewRecorder()
 	te.handler.ServeHTTP(w, req)
 	return w
+}
+
+func claudeTranscriptWithMessageCount(count int) string {
+	b := testjsonl.NewSessionBuilder()
+	base := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC)
+	for i := range count {
+		timestamp := base.Add(time.Duration(i) * time.Second).Format(time.RFC3339)
+		if i%2 == 0 {
+			b.AddClaudeUser(timestamp, fmt.Sprintf("question %d", i/2))
+		} else {
+			b.AddClaudeAssistant(timestamp, fmt.Sprintf("answer %d", i/2))
+		}
+	}
+	return b.String()
 }
 
 // decode unmarshals the response body into a typed struct.
@@ -1451,7 +1496,7 @@ func TestListSessions_Empty(t *testing.T) {
 
 	// Verify raw JSON has "sessions":[] not "sessions":null.
 	var raw struct {
-		Sessions json.RawMessage `json:"sessions"`
+		Sessions jsontext.Value `json:"sessions"`
 	}
 	if err := json.Unmarshal(
 		w.Body.Bytes(), &raw,
@@ -1485,6 +1530,35 @@ func TestListSessions_WithData(t *testing.T) {
 		t.Fatalf("expected 3 sessions, got %d",
 			len(resp.Sessions))
 	}
+}
+
+func TestListSessions_IncludesSourcePathOnlyWhenRequested(t *testing.T) {
+	te := setup(t)
+	sourcePath := filepath.Join(t.TempDir(), "session.jsonl")
+	te.seedSession(t, "s1", "my-app", 5, func(s *db.Session) {
+		s.FilePath = &sourcePath
+	})
+
+	decodeSession := func(t *testing.T, path string) map[string]jsontext.Value {
+		t.Helper()
+		w := te.get(t, path)
+		assertStatus(t, w, http.StatusOK)
+		var raw struct {
+			Sessions []map[string]jsontext.Value `json:"sessions"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
+		require.Len(t, raw.Sessions, 1)
+		return raw.Sessions[0]
+	}
+
+	withoutSource := decodeSession(t, "/api/v1/sessions")
+	assert.NotContains(t, withoutSource, "file_path")
+
+	withSource := decodeSession(t, "/api/v1/sessions?include_source=true")
+	require.Contains(t, withSource, "file_path")
+	var gotPath string
+	require.NoError(t, json.Unmarshal(withSource["file_path"], &gotPath))
+	assert.Equal(t, sourcePath, gotPath)
 }
 
 func TestListSessions_ProjectFilter(t *testing.T) {
@@ -3652,7 +3726,7 @@ func TestSettingsDisabledProvidersDefaultToEmptyArray(t *testing.T) {
 	w := te.get(t, "/api/v1/settings")
 	assertStatus(t, w, http.StatusOK)
 	var got struct {
-		DisabledAgents json.RawMessage `json:"disabled_agents"`
+		DisabledAgents jsontext.Value `json:"disabled_agents"`
 	}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
 	assert.JSONEq(t, `[]`, string(got.DisabledAgents))
@@ -4110,6 +4184,47 @@ func TestUploadSession_ExcludedOrTrashedConflict(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUploadSession_RejectsShorterReplacementWithoutConsent(t *testing.T) {
+	te := setup(t)
+	const sessionID = "upload-shorter"
+	query := "project=myproj&machine=remote"
+	longTranscript := claudeTranscriptWithMessageCount(96)
+	shortTranscript := claudeTranscriptWithMessageCount(24)
+
+	w := te.upload(t, sessionID+".jsonl", longTranscript, query)
+	assertStatus(t, w, http.StatusOK)
+	destPath := filepath.Join(
+		te.dataDir, "uploads", "myproj", sessionID+".jsonl",
+	)
+	requireSessionMessages := func(want int) {
+		t.Helper()
+		messages, err := te.db.GetAllMessages(t.Context(), sessionID)
+		require.NoError(t, err)
+		require.Len(t, messages, want)
+	}
+	requireArchive := func(want string) {
+		t.Helper()
+		content, err := os.ReadFile(destPath)
+		require.NoError(t, err)
+		require.Equal(t, want, string(content))
+	}
+	requireSessionMessages(96)
+	requireArchive(longTranscript)
+
+	w = te.upload(t, sessionID+".jsonl", shortTranscript, query)
+	assertStatus(t, w, http.StatusConflict)
+	assertErrorResponse(t, w,
+		"session upload rejected: session upload-shorter has 96 messages, upload has 24; retry with allow_shorter=true")
+	requireSessionMessages(96)
+	requireArchive(longTranscript)
+
+	w = te.upload(t, sessionID+".jsonl", shortTranscript,
+		query+"&allow_shorter=true")
+	assertStatus(t, w, http.StatusOK)
+	requireSessionMessages(24)
+	requireArchive(shortTranscript)
 }
 
 func TestUploadSession_MultiSessionConflictDoesNotPartiallyWrite(t *testing.T) {
@@ -5249,7 +5364,7 @@ func TestHandleToolCalls_Basic(t *testing.T) {
 		ToolCalls []service.ToolCall `json:"tool_calls"`
 		Count     int                `json:"count"`
 	}
-	require.NoError(t, json.NewDecoder(w.Body).Decode(&body))
+	require.NoError(t, json.UnmarshalRead(w.Body, &body))
 	require.Equal(t, 2, body.Count)
 	require.Len(t, body.ToolCalls, 2)
 	assert.Equal(t, "Read", body.ToolCalls[0].ToolName)

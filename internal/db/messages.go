@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"log"
@@ -23,7 +23,7 @@ const (
 		COALESCE(timestamp, '') AS timestamp,
 		has_thinking, has_tool_use, content_length,
 		is_system,
-		model, token_usage, context_tokens, output_tokens,
+		model, token_usage, context_tokens, output_tokens, provider_id,
 		has_context_tokens, has_output_tokens,
 		claude_message_id, claude_request_id,
 		source_type, source_subtype, prompt_source, source_uuid,
@@ -33,7 +33,7 @@ const (
 		thinking_text,
 		timestamp, has_thinking, has_tool_use, content_length,
 		is_system,
-		model, token_usage, context_tokens, output_tokens,
+		model, token_usage, context_tokens, output_tokens, provider_id,
 		has_context_tokens, has_output_tokens,
 		claude_message_id, claude_request_id,
 		source_type, source_subtype, prompt_source, source_uuid,
@@ -51,7 +51,7 @@ const (
 	// Keep multi-row INSERT statements below SQLite's historic
 	// 999-variable limit so binaries built against older SQLite
 	// versions still work.
-	messageInsertRowsPerStmt         = 38 // 26 params per row
+	messageInsertRowsPerStmt         = 36 // 27 params per row
 	toolCallInsertRowsPerStmt        = 83 // 12 params per row (999/12 = 83)
 	toolResultEventInsertRowsPerStmt = 80 // 12 params per row
 )
@@ -425,29 +425,30 @@ type Message struct {
 	Content   string `json:"content"`
 	// ThinkingText holds the concatenated text of all thinking
 	// blocks for this message; "" if none.
-	ThinkingText      string          `json:"thinking_text"`
-	Timestamp         string          `json:"timestamp"`
-	HasThinking       bool            `json:"has_thinking"`
-	HasToolUse        bool            `json:"has_tool_use"`
-	ContentLength     int             `json:"content_length"`
-	Model             string          `json:"model"`
-	TokenUsage        json.RawMessage `json:"token_usage,omitempty"`
-	ContextTokens     int             `json:"context_tokens"`
-	OutputTokens      int             `json:"output_tokens"`
-	HasContextTokens  bool            `json:"has_context_tokens"`
-	HasOutputTokens   bool            `json:"has_output_tokens"`
-	ClaudeMessageID   string          `json:"claude_message_id,omitempty"`
-	ClaudeRequestID   string          `json:"claude_request_id,omitempty"`
-	ToolCalls         []ToolCall      `json:"tool_calls,omitempty"`
-	ToolResults       []ToolResult    `json:"-"`         // transient, for pairing
-	IsSystem          bool            `json:"is_system"` // persisted, filters search/analytics
-	SourceType        string          `json:"source_type,omitempty"`
-	SourceSubtype     string          `json:"source_subtype,omitempty"`
-	PromptSource      string          `json:"prompt_source,omitempty"`
-	SourceUUID        string          `json:"source_uuid,omitempty"`
-	SourceParentUUID  string          `json:"source_parent_uuid,omitempty"`
-	IsSidechain       bool            `json:"is_sidechain,omitempty"`
-	IsCompactBoundary bool            `json:"is_compact_boundary,omitempty"`
+	ThinkingText      string         `json:"thinking_text"`
+	Timestamp         string         `json:"timestamp"`
+	HasThinking       bool           `json:"has_thinking"`
+	HasToolUse        bool           `json:"has_tool_use"`
+	ContentLength     int            `json:"content_length"`
+	Model             string         `json:"model"`
+	ProviderID        string         `json:"provider_id,omitempty"`
+	TokenUsage        jsontext.Value `json:"token_usage,omitempty"`
+	ContextTokens     int            `json:"context_tokens"`
+	OutputTokens      int            `json:"output_tokens"`
+	HasContextTokens  bool           `json:"has_context_tokens"`
+	HasOutputTokens   bool           `json:"has_output_tokens"`
+	ClaudeMessageID   string         `json:"claude_message_id,omitempty"`
+	ClaudeRequestID   string         `json:"claude_request_id,omitempty"`
+	ToolCalls         []ToolCall     `json:"tool_calls,omitempty"`
+	ToolResults       []ToolResult   `json:"-"`         // transient, for pairing
+	IsSystem          bool           `json:"is_system"` // persisted, filters search/analytics
+	SourceType        string         `json:"source_type,omitempty"`
+	SourceSubtype     string         `json:"source_subtype,omitempty"`
+	PromptSource      string         `json:"prompt_source,omitempty"`
+	SourceUUID        string         `json:"source_uuid,omitempty"`
+	SourceParentUUID  string         `json:"source_parent_uuid,omitempty"`
+	IsSidechain       bool           `json:"is_sidechain,omitempty"`
+	IsCompactBoundary bool           `json:"is_compact_boundary,omitempty"`
 }
 
 type ModelCount struct {
@@ -690,6 +691,33 @@ func (db *DB) GetAllMessages(
 		return nil, err
 	}
 	return msgs, nil
+}
+
+// ListMessageSourceUUIDs returns the non-empty source_uuid values of a
+// session's messages, in ordinal order. The sync engine uses it to verify
+// that a truncated shared-container reparse still contains every archived
+// message before letting it replace the stored transcript.
+func (db *DB) ListMessageSourceUUIDs(
+	ctx context.Context, sessionID string,
+) ([]string, error) {
+	rows, err := db.getReader().QueryContext(ctx, `
+		SELECT source_uuid
+		FROM messages
+		WHERE session_id = ? AND source_uuid != ''
+		ORDER BY ordinal ASC`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("querying message source uuids: %w", err)
+	}
+	defer rows.Close()
+	var uuids []string
+	for rows.Next() {
+		var uuid string
+		if err := rows.Scan(&uuid); err != nil {
+			return nil, fmt.Errorf("scanning message source uuid: %w", err)
+		}
+		uuids = append(uuids, uuid)
+	}
+	return uuids, rows.Err()
 }
 
 func (db *DB) GetResumeModelCounts(
@@ -1052,7 +1080,7 @@ func parseEndedAt(s string) (time.Time, error) {
 // transaction. Returns a slice of message IDs parallel to the
 // input msgs slice. The caller must hold db.mu.
 func insertMessagesTx(
-	tx *sql.Tx, msgs []Message,
+	tx transactionQueries, msgs []Message,
 ) ([]int64, error) {
 	ids := make([]int64, len(msgs))
 	nextID, err := nextMessageIDTx(tx)
@@ -1063,7 +1091,7 @@ func insertMessagesTx(
 	for start := 0; start < len(msgs); start += messageInsertRowsPerStmt {
 		end := min(start+messageInsertRowsPerStmt, len(msgs))
 		batch := msgs[start:end]
-		args := make([]any, 0, len(batch)*26)
+		args := make([]any, 0, len(batch)*27)
 		for i, m := range batch {
 			id := nextID + int64(start+i)
 			ids[start+i] = id
@@ -1073,7 +1101,7 @@ func insertMessagesTx(
 		query := fmt.Sprintf(
 			"INSERT INTO messages (id, %s) VALUES %s",
 			insertMessageCols,
-			multiRowPlaceholders(len(batch), 26),
+			multiRowPlaceholders(len(batch), 27),
 		)
 		if _, err := tx.Exec(query, args...); err != nil {
 			first := batch[0].Ordinal
@@ -1087,7 +1115,7 @@ func insertMessagesTx(
 	return ids, nil
 }
 
-func nextMessageIDTx(tx *sql.Tx) (int64, error) {
+func nextMessageIDTx(tx transactionQueries) (int64, error) {
 	var n sql.NullInt64
 	if err := tx.QueryRow("SELECT MAX(id) FROM messages").Scan(&n); err != nil {
 		return 0, fmt.Errorf("reading next message id: %w", err)
@@ -1117,7 +1145,7 @@ func multiRowPlaceholders(rows, cols int) string {
 }
 
 func insertToolCallsChunkTx(
-	tx *sql.Tx, calls []ToolCall,
+	tx transactionQueries, calls []ToolCall,
 ) error {
 	args := make([]any, 0, len(calls)*12)
 	for _, tc := range calls {
@@ -1151,7 +1179,7 @@ func insertToolCallsChunkTx(
 }
 
 func insertToolResultEventsChunkTx(
-	tx *sql.Tx, rows []toolResultEventRow,
+	tx transactionQueries, rows []toolResultEventRow,
 ) error {
 	args := make([]any, 0, len(rows)*12)
 	for _, r := range rows {
@@ -1193,7 +1221,7 @@ func insertToolResultEventsChunkTx(
 // duplicates event content. Empty-content events contribute nothing,
 // matching SummarizeToolResultEvents.
 func upsertToolCallAgentStateRows(
-	tx *sql.Tx, rows []toolResultEventRow,
+	tx transactionQueries, rows []toolResultEventRow,
 ) error {
 	args := make([]any, 0, len(rows)*6)
 	for _, r := range rows {
@@ -1246,7 +1274,7 @@ func nilIfZero(n int) any {
 // insertToolCallsTx batch-inserts tool calls within an
 // existing transaction.
 func insertToolCallsTx(
-	tx *sql.Tx, calls []ToolCall,
+	tx transactionQueries, calls []ToolCall,
 ) error {
 	for start := 0; start < len(calls); start += toolCallInsertRowsPerStmt {
 		end := min(start+toolCallInsertRowsPerStmt, len(calls))
@@ -1258,7 +1286,7 @@ func insertToolCallsTx(
 }
 
 func insertToolResultEventsTx(
-	tx *sql.Tx, rows []toolResultEventRow,
+	tx transactionQueries, rows []toolResultEventRow,
 ) error {
 	for start := 0; start < len(rows); start += toolResultEventInsertRowsPerStmt {
 		end := min(start+toolResultEventInsertRowsPerStmt, len(rows))
@@ -1311,7 +1339,8 @@ func (db *DB) InsertMessages(msgs []Message) error {
 	if err := insertToolResultEventsTx(tx, events); err != nil {
 		return err
 	}
-	for _, sessionID := range messageSessionIDs(msgs) {
+	sessionIDs := messageSessionIDs(msgs)
+	for _, sessionID := range sessionIDs {
 		if err := bumpTranscriptRevisionTx(tx, sessionID); err != nil {
 			return err
 		}
@@ -1324,7 +1353,11 @@ func (db *DB) InsertMessages(msgs []Message) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	db.notifyUsageSessions(sessionIDs)
+	return nil
 }
 
 // invalidateSessionSignalsTx zeroes quality_signal_version so the
@@ -1574,6 +1607,7 @@ func (db *DB) WriteSessionIncremental(
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("committing incremental write tx: %w", err)
 	}
+	db.notifyUsageSessions([]string{sessionID})
 	return signalsMaintained, nil
 }
 
@@ -1741,8 +1775,10 @@ func (db *DB) ReplaceSessionMessages(
 	// clear them and reset the scan state (empty version => secrets scan
 	// --backfill re-scans). ReplaceSessionContent does not call this method; it
 	// supplies fresh findings via replaceSecretFindingsTx directly.
-	if err := replaceSecretFindingsTx(tx, sessionID, nil, 0, ""); err != nil {
-		return err
+	if transcriptChanged {
+		if err := replaceSecretFindingsTx(tx, sessionID, nil, 0, ""); err != nil {
+			return err
+		}
 	}
 	if err := invalidateSessionSignalsTx(tx, sessionID); err != nil {
 		return err
@@ -1755,6 +1791,7 @@ func (db *DB) ReplaceSessionMessages(
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	db.notifyUsageSessions([]string{sessionID})
 	pendingRecallRevocations.flush()
 	return nil
 }
@@ -1794,22 +1831,46 @@ func replaceSessionMessagesTx(
 	return restorePinsTx(tx, sessionID, pins)
 }
 
-func bumpTranscriptRevisionTx(tx *sql.Tx, sessionID string) error {
+// bumpTranscriptRevisionTx advances the transcript revision for a
+// mutated existing session. Touching local_modified_at fires the
+// sync_marker trigger so push targets re-select the session.
+func bumpTranscriptRevisionTx(tx transactionQueries, sessionID string) error {
+	return bumpTranscriptRevision(tx, sessionID, true)
+}
+
+// bumpInsertedTranscriptRevisionTx advances the revision for a session
+// inserted in this same transaction. The INSERT trigger already stamped
+// sync_marker, so skipping the local_modified_at touch avoids a
+// redundant trigger recompute on every bulk-loaded session.
+func bumpInsertedTranscriptRevisionTx(tx transactionQueries, sessionID string) error {
+	return bumpTranscriptRevision(tx, sessionID, false)
+}
+
+func bumpTranscriptRevision(
+	tx transactionQueries, sessionID string, touchModified bool,
+) error {
 	// Advancing the revision also revokes secret-scan freshness in the same
 	// transaction: the mutated transcript has content the recorded scan
 	// never saw, and consumers that require a current scan (extraction's
 	// privacy boundary) must fail closed until a rescan re-stamps it. The
 	// incremental sync path re-scans in a separate later write; the atomic
 	// replace path re-stamps inside this same transaction.
-	result, err := tx.Exec(
-		`UPDATE sessions
+	query := `UPDATE sessions
+		 SET transcript_revision = CAST(
+			CAST(transcript_revision AS INTEGER) + 1 AS TEXT
+		 ),
+		     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+		     secrets_rules_version = ''
+		 WHERE id = ?`
+	if !touchModified {
+		query = `UPDATE sessions
 		 SET transcript_revision = CAST(
 			CAST(transcript_revision AS INTEGER) + 1 AS TEXT
 		 ),
 		     secrets_rules_version = ''
-		 WHERE id = ?`,
-		sessionID,
-	)
+		 WHERE id = ?`
+	}
+	result, err := tx.Exec(query, sessionID)
 	if err != nil {
 		return fmt.Errorf(
 			"bumping transcript revision for %s: %w", sessionID, err,
@@ -1830,7 +1891,7 @@ func bumpTranscriptRevisionTx(tx *sql.Tx, sessionID string) error {
 	return nil
 }
 
-func sessionHasFTSTx(tx *sql.Tx) (bool, error) {
+func sessionHasFTSTx(tx transactionQueries) (bool, error) {
 	var ftsCount int
 	if err := tx.QueryRow(
 		`SELECT count(*) FROM sqlite_master
@@ -1842,7 +1903,7 @@ func sessionHasFTSTx(tx *sql.Tx) (bool, error) {
 }
 
 func deleteSessionMessageRowsTx(
-	tx *sql.Tx, sessionID string,
+	tx transactionQueries, sessionID string,
 ) error {
 	hasFTS, err := sessionHasFTSTx(tx)
 	if err != nil {
@@ -1879,7 +1940,7 @@ func deleteSessionMessageRowsTx(
 	return nil
 }
 
-func deleteSessionMessagesTx(tx *sql.Tx, sessionID string) error {
+func deleteSessionMessagesTx(tx transactionQueries, sessionID string) error {
 	if _, err := tx.Exec(
 		"DELETE FROM tool_calls WHERE session_id = ?",
 		sessionID,
@@ -2040,12 +2101,13 @@ func (db *DB) replaceSessionContent(
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	db.notifyUsageSessions([]string{sessionID})
 	pendingRecallRevocations.flush()
 	return nil
 }
 
 func updateSessionAutomationFromMessagesTx(
-	tx *sql.Tx, sessionID string,
+	tx transactionQueries, sessionID string,
 ) error {
 	want, rowAutomated, ok, err := sessionAutomationStateTx(
 		tx, sessionID,
@@ -2060,7 +2122,7 @@ func updateSessionAutomationFromMessagesTx(
 }
 
 func setSessionAutomationFromMessagesTx(
-	tx *sql.Tx, sessionID string,
+	tx transactionQueries, sessionID string,
 ) error {
 	want, rowAutomated, ok, err := sessionAutomationStateTx(
 		tx, sessionID,
@@ -2072,7 +2134,7 @@ func setSessionAutomationFromMessagesTx(
 }
 
 func sessionAutomationStateTx(
-	tx *sql.Tx, sessionID string,
+	tx transactionQueries, sessionID string,
 ) (want, rowAutomated, ok bool, err error) {
 	var (
 		firstMessage     sql.NullString
@@ -2118,7 +2180,7 @@ func sessionAutomationStateTx(
 }
 
 func setSessionAutomationTx(
-	tx *sql.Tx, sessionID string, isAutomated bool,
+	tx transactionQueries, sessionID string, isAutomated bool,
 ) error {
 	if _, err := tx.Exec(`
 		UPDATE sessions
@@ -2135,7 +2197,7 @@ func setSessionAutomationTx(
 	return nil
 }
 
-func savePinsTx(tx *sql.Tx, sessionID string) ([]savedPin, error) {
+func savePinsTx(tx transactionQueries, sessionID string) ([]savedPin, error) {
 	// Save existing pins before deletion. The ON DELETE CASCADE on
 	// pinned_messages.message_id would otherwise wipe them when
 	// messages are deleted below. source_uuid comes from the joined
@@ -2221,7 +2283,7 @@ func savePinsTx(tx *sql.Tx, sessionID string) ([]savedPin, error) {
 }
 
 func restorePinsTx(
-	tx *sql.Tx, sessionID string, pins []savedPin,
+	tx transactionQueries, sessionID string, pins []savedPin,
 ) error {
 	// Re-attach saved pins only when the old and new message identities
 	// are both unambiguous. A unique source_uuid may move to another
@@ -2249,7 +2311,7 @@ func restorePinsTx(
 }
 
 func restorePinBySourceUUIDTx(
-	tx *sql.Tx, sessionID string, sp savedPin,
+	tx transactionQueries, sessionID string, sp savedPin,
 ) error {
 	if sp.sourceUUIDCount == 1 {
 		res, err := tx.Exec(`
@@ -2338,7 +2400,7 @@ func restorePinBySourceUUIDTx(
 // edit to the pinned message itself — means the pinned message can no
 // longer be identified and the pin is dropped.
 func restoreLegacyPinByRankTx(
-	tx *sql.Tx, sessionID string, sp savedPin,
+	tx transactionQueries, sessionID string, sp savedPin,
 ) error {
 	_, err := tx.Exec(`
 		INSERT OR IGNORE INTO pinned_messages
@@ -2620,6 +2682,7 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 			&m.IsSystem,
 			&m.Model, &tokenUsage,
 			&m.ContextTokens, &m.OutputTokens,
+			&m.ProviderID,
 			&m.HasContextTokens, &m.HasOutputTokens,
 			&m.ClaudeMessageID, &m.ClaudeRequestID,
 			&m.SourceType, &m.SourceSubtype, &m.PromptSource, &m.SourceUUID,
@@ -2629,7 +2692,7 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 			return nil, fmt.Errorf("scanning message: %w", err)
 		}
 		if tokenUsage != "" {
-			m.TokenUsage = json.RawMessage(tokenUsage)
+			m.TokenUsage = jsontext.Value(tokenUsage)
 		}
 		msgs = append(msgs, m)
 	}
@@ -2711,7 +2774,7 @@ func isStrippableControl(r rune) bool {
 // metadata-only changes invalidate the fast path.
 func (db *DB) MessageTokenFingerprint(sessionID string) (string, error) {
 	rows, err := db.getReader().Query(
-		`SELECT ordinal, model, token_usage, context_tokens,
+		`SELECT ordinal, model, provider_id, token_usage, context_tokens,
 			output_tokens, has_context_tokens, has_output_tokens,
 			claude_message_id, claude_request_id,
 			source_type, source_subtype, prompt_source, source_uuid,
@@ -2730,7 +2793,7 @@ func (db *DB) MessageTokenFingerprint(sessionID string) (string, error) {
 	for rows.Next() {
 		var r tokenFingerprintRow
 		if err := rows.Scan(
-			&r.ordinal, &r.model, &r.tokenUsage, &r.contextTokens,
+			&r.ordinal, &r.model, &r.providerID, &r.tokenUsage, &r.contextTokens,
 			&r.outputTokens, &r.hasContextTokens, &r.hasOutputTokens,
 			&r.claudeMessageID, &r.claudeRequestID,
 			&r.sourceType, &r.sourceSubtype, &r.promptSource, &r.sourceUUID,
@@ -2968,24 +3031,14 @@ func (db *DB) SetToolCallSubagentSession(
 		if err := bumpTranscriptRevisionTx(tx, sessionID); err != nil {
 			return err
 		}
-		// Bump local_modified_at so the sync_marker trigger fires and push
-		// targets re-select the session: the linkage lands in mirrored
-		// data (tool_calls.subagent_session_id and transcript_revision)
-		// but touches no sync_marker signal on its own (see
-		// LinkSubagentSessions for the same pattern).
-		if _, err := tx.Exec(
-			`UPDATE sessions
-			    SET local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-			  WHERE id = ?`,
-			sessionID,
-		); err != nil {
-			return fmt.Errorf(
-				"bumping local_modified_at for %s after subagent link: %w",
-				sessionID, err,
-			)
-		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if changed {
+		db.notifyUsageSessions([]string{sessionID})
+	}
+	return nil
 }
 
 func applyToolCallSubagentLinkTx(
@@ -3362,6 +3415,7 @@ func (db *DB) GetMessageByOrdinal(
 		&m.IsSystem,
 		&m.Model, &tokenUsage,
 		&m.ContextTokens, &m.OutputTokens,
+		&m.ProviderID,
 		&m.HasContextTokens, &m.HasOutputTokens,
 		&m.ClaudeMessageID, &m.ClaudeRequestID,
 		&m.SourceType, &m.SourceSubtype, &m.PromptSource, &m.SourceUUID,
@@ -3374,7 +3428,7 @@ func (db *DB) GetMessageByOrdinal(
 		return nil, err
 	}
 	if tokenUsage != "" {
-		m.TokenUsage = json.RawMessage(tokenUsage)
+		m.TokenUsage = jsontext.Value(tokenUsage)
 	}
 	return &m, nil
 }

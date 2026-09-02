@@ -1,7 +1,7 @@
 package parser
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"sort"
 
 	"github.com/tidwall/gjson"
@@ -280,7 +280,7 @@ func applyCodexTokenUsage(msg *ParsedMessage, raw string) {
 		"output_tokens":           output,
 		"cache_read_input_tokens": cached,
 	}
-	j, err := json.Marshal(normalized)
+	j, err := json.Marshal(normalized, json.Deterministic(true))
 	if err != nil {
 		return
 	}

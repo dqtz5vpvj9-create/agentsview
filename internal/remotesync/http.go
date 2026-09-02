@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -175,17 +175,24 @@ func (hs HTTPSync) fetchManifest(
 	if err := ValidateProtocolHeader(resp.Header); err != nil {
 		return Manifest{}, false, err
 	}
-	reader := io.Reader(resp.Body)
+	bodyReader := &httpBodyReader{r: resp.Body}
+	reader := io.Reader(bodyReader)
 	if resp.Header.Get("Content-Encoding") == "gzip" {
-		gz, err := gzip.NewReader(resp.Body)
+		gz, err := gzip.NewReader(bodyReader)
 		if err != nil {
+			if bodyReader.err != nil {
+				err = bodyReader.err
+			}
 			return Manifest{}, false, fmt.Errorf("decode manifest gzip: %w", err)
 		}
 		defer gz.Close()
 		reader = gz
 	}
 	var manifest Manifest
-	if err := json.NewDecoder(reader).Decode(&manifest); err != nil {
+	if err := json.UnmarshalRead(reader, &manifest); err != nil {
+		if bodyReader.err != nil {
+			err = bodyReader.err
+		}
 		return Manifest{}, false, fmt.Errorf("decode remote manifest: %w", err)
 	}
 	return manifest, true, nil
@@ -299,7 +306,11 @@ func (hs HTTPSync) fetchTargets(
 		return TargetSet{}, err
 	}
 	var targets TargetSet
-	if err := json.NewDecoder(resp.Body).Decode(&targets); err != nil {
+	bodyReader := &httpBodyReader{r: resp.Body}
+	if err := json.UnmarshalRead(bodyReader, &targets); err != nil {
+		if bodyReader.err != nil {
+			err = bodyReader.err
+		}
 		return TargetSet{}, fmt.Errorf("decode remote targets: %w", err)
 	}
 	return targets, nil

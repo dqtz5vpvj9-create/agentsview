@@ -287,6 +287,11 @@ populates per-project, per-agent, and per-machine breakdown arrays for every
 day, making costs from shared multi-machine archives separable without another
 query.
 
+On large archives, aggregate usage reads are served from a local cache of daily
+totals that stays exact as sessions sync. The first query after an install,
+upgrade, or cache deletion is slower while that cache builds; subsequent queries
+are fast.
+
 ## How Costs Are Computed
 
 Every message parsed from a session file stores its raw `token_usage` JSON
@@ -321,11 +326,18 @@ The default window is the last 30 days; pass `--all` to scan the full history.
 ### Pricing Source
 
 Model rates come from the
-[LiteLLM model pricing catalog](https://github.com/BerriAI/litellm), which is
-fetched on each `usage` invocation and upserted into the `model_pricing` table.
-If the fetch fails — no network, or LiteLLM is down — AgentsView falls back to
-an embedded copy of the catalog so offline use keeps working. Pass `--offline`
-to skip the fetch entirely and always use the embedded fallback.
+[LiteLLM model pricing catalog](https://github.com/BerriAI/litellm), with the
+[OpenRouter model catalog](https://openrouter.ai/docs/api/api-reference/models/get-models)
+layered underneath for models LiteLLM does not list. Both are fetched together
+(hourly at most on `usage` invocations, daily by the server) and merged into the
+`model_pricing` table; when both catalogs list a model, LiteLLM's rate wins, and
+an OpenRouter row is dropped once LiteLLM picks the model up. If the LiteLLM
+fetch fails, AgentsView keeps the last stored rates; if only the OpenRouter
+fetch fails, the fresh LiteLLM rates are still stored and the stored OpenRouter
+rates are kept. Fresh databases are seeded from
+an embedded LiteLLM snapshot so offline use works before any refresh completes.
+Pass `--offline` to skip the fetch entirely and always use the embedded
+fallback.
 
 The embedded fallback is updated with AgentsView releases, so the numbers are as
 current as your installed version. For up-to-the-minute rates, leave `--offline`
@@ -384,17 +396,29 @@ output_microdollars_per_mtok = 800_000
 | `input_microdollars_per_mtok`          | Integer microdollars per million input tokens (defaults to `0` if omitted)  |
 | `output_microdollars_per_mtok`         | Integer microdollars per million output tokens (defaults to `0` if omitted) |
 | `cache_creation_microdollars_per_mtok` | Integer microdollars per million cache-creation tokens (optional)           |
+| `cache_creation_1h_microdollars_per_mtok` | Integer microdollars per million 1-hour-TTL cache-creation tokens (optional; when omitted or `0`, 1h writes bill at `cache_creation_microdollars_per_mtok`) |
 | `cache_read_microdollars_per_mtok`     | Integer microdollars per million cache-read tokens (optional)               |
 
 The table key is the model name as it appears in your session data (match the
 string the agent itself writes, dots and all — quote the key if it contains
-special characters). Custom rates take precedence over both the LiteLLM fetch
-and the embedded fallback, and apply to the Usage dashboard, the
-`agentsview usage` CLI, and `pg serve` alike. A custom entry replaces the full
-rate row for that model, so omitted fields are treated as zero rather than
-falling through to LiteLLM. A custom row is flat and suppresses any fetched
-request bands for that model. Models without a custom entry continue to resolve
-through LiteLLM as before.
+special characters). Custom rates take precedence over LiteLLM, OpenRouter, and
+the embedded fallback, and apply to the Usage dashboard, the `agentsview usage`
+CLI, and `pg serve` alike. A custom entry replaces the full rate row for that
+model, so omitted fields are treated as zero rather than falling through to
+another catalog. A custom row is flat and suppresses any fetched request bands
+for that model. Models without a custom entry continue to resolve through the
+stored catalog.
+
+### Posit Assistant Billing
+
+For usage rows whose stored provider ID is exactly `positai`, AgentsView
+estimates computed token costs and cache savings at 110% of the selected
+catalog rates. Model, timestamp, and request-band selection happen before the
+adjustment. Rows with empty or other provider IDs — including observed
+`anthropic` bring-your-own-provider rows in the same session — use base rates.
+
+Custom pricing overrides are not adjusted. Explicit reported costs remain
+authoritative, and fixed web-search fees remain at their published face value.
 
 ### Copilot CLI Token Metrics
 
@@ -595,7 +619,7 @@ to X" still works.
 
 ```json
 {
-  "schema_version": 5,
+  "schema_version": 6,
   "pricing": {
     "source": "fetched",
     "table_version": "2026-07-03T12:00:00Z",
@@ -618,6 +642,7 @@ to X" still works.
             "input_cost_per_mtok": {"microdollars": 2500000},
             "output_cost_per_mtok": {"microdollars": 15000000},
             "cache_write_cost_per_mtok": {"microdollars": 0},
+            "cache_write_1h_cost_per_mtok": {"microdollars": 0},
             "cache_read_cost_per_mtok": {"microdollars": 250000},
             "cost_source": "computed",
             "bands": [
@@ -626,6 +651,7 @@ to X" still works.
                 "input_cost_per_mtok": {"microdollars": 5000000},
                 "output_cost_per_mtok": {"microdollars": 22500000},
                 "cache_write_cost_per_mtok": {"microdollars": 0},
+                "cache_write_1h_cost_per_mtok": {"microdollars": 0},
                 "cache_read_cost_per_mtok": {"microdollars": 500000}
               }
             ],
@@ -721,10 +747,13 @@ with request-pricing bands and application counts. Version 5 selects complete
 Claude snapshots before generic deduplication and charges the maximum observed
 server-side web-search count. Versions 4 and 5 are contract bumps because
 version 4 changed band-selection pricing semantics and digest canonicalization,
-while version 5 changes snapshot and server-tool accounting. The two
-transitional releases must not be treated as v1-compatible. The commands do not
-provide an earlier-version output mode. Consumers should require the expected
-`schema_version` and ignore unknown additive fields.
+while version 5 changes snapshot and server-tool accounting. Version 6 applies
+provider-specific billing identity to computed usage and preserves reported
+costs and custom pricing overrides; consumers must not treat v5 and v6 costs as
+interchangeable. The two transitional releases must not be treated as
+v1-compatible. The commands do not provide an earlier-version output mode.
+Consumers should require the expected `schema_version` and ignore unknown
+additive fields.
 
 | Change                                                                                | Requires `schema_version` bump? |
 | ------------------------------------------------------------------------------------- | ------------------------------- |
@@ -750,8 +779,11 @@ distinct model names reported in payload rows, not by canonical pricing names or
 every row in the pricing table. Each reported-model entry has an aggregate
 `cost_source` and a `resolutions` array. A resolution reports `priced_model`,
 `matched_pattern`, `input_cost_per_mtok`, `output_cost_per_mtok`,
-`cache_write_cost_per_mtok`, `cache_read_cost_per_mtok`, `cost_source`, `bands`,
-and `application`. Resolutions are sorted by `priced_model` and then
+`cache_write_cost_per_mtok`, `cache_write_1h_cost_per_mtok`,
+`cache_read_cost_per_mtok`, `cost_source`, `bands`, and `application`.
+`cache_write_1h_cost_per_mtok` is the 1-hour-TTL cache-write rate; zero means
+the catalog publishes no separate 1h rate and 1h writes bill at
+`cache_write_cost_per_mtok`. Resolutions are sorted by `priced_model` and then
 `matched_pattern`.
 
 Each `bands` item is a complete rate tuple with an exclusive
@@ -1018,7 +1050,7 @@ Usage reports read from the same local SQLite database that powers the
 stored on each message row in the `messages` table; pricing is cached in a small
 `model_pricing` table that's refreshed on each `usage` invocation.
 
-No data leaves your machine. The only outbound request is the LiteLLM pricing
-fetch, which you can disable with `--offline`. See
+Session data stays on your machine. The only outbound requests are the LiteLLM
+and OpenRouter pricing fetches, which you can disable with `--offline`. See
 [Privacy and Telemetry](/configuration/#privacy-and-telemetry) for the full
 picture.

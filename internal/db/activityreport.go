@@ -4,7 +4,7 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"sort"
 	"time"
@@ -157,6 +157,9 @@ type sqliteSessionUsageOrderedRow struct {
 func (db *DB) GetSessionUsageRows(
 	ctx context.Context, ids []string,
 ) (*activity.SessionUsageRows, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -167,10 +170,16 @@ func (db *DB) GetSessionUsageRows(
 	rateResolver := export.NewPricingResolver(pricing)
 	sessionOrder := make(map[string]int, len(ids))
 	for i, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		sessionOrder[id] = i
 	}
 	var rowsAcc []sqliteSessionUsageOrderedRow
 	err = queryChunked(ids, func(chunk []string) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		ph, args := inPlaceholders(chunk)
 		query := usageRowSelect() + ` AND u.session_id IN ` + ph
 		rows, queryErr := db.getReader().QueryContext(ctx, query, args...)
@@ -179,6 +188,9 @@ func (db *DB) GetSessionUsageRows(
 		}
 		defer rows.Close()
 		for rows.Next() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			r, scanErr := scanUsageRow(rows)
 			if scanErr != nil {
 				return fmt.Errorf("scanning session usage rows: %w", scanErr)
@@ -200,24 +212,38 @@ func (db *DB) GetSessionUsageRows(
 	if err != nil {
 		return nil, err
 	}
-	sort.SliceStable(rowsAcc, func(i, j int) bool {
-		return sqliteSessionUsageRowLess(rowsAcc[i], rowsAcc[j], sessionOrder)
+	err = stableSortContext(ctx, rowsAcc, func(a, b sqliteSessionUsageOrderedRow) bool {
+		return sqliteSessionUsageRowLess(a, b, sessionOrder)
 	})
+	if err != nil {
+		return nil, err
+	}
 	snapshotRows := make([]activity.UsageRow, len(rowsAcc))
 	rowContributes := make([]bool, len(rowsAcc))
 	rawOutputTokensBySession := make(map[string]int)
 	for i, o := range rowsAcc {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok :=
 			sqliteSessionUsageRowTokens(o.scan)
 		snapshotRows[i] = activity.UsageRow{
-			SessionID:      o.scan.sessionID,
-			Timestamp:      o.scan.ts,
-			MessageOrdinal: o.ordinal,
-			OutputTokens:   outputTok,
+			SessionID:           o.scan.sessionID,
+			Timestamp:           o.scan.ts,
+			MessageOrdinal:      o.ordinal,
+			UsageSource:         o.scan.usageSource,
+			InputTokens:         inputTok,
+			OutputTokens:        outputTok,
+			CacheCreationTokens: cacheCrTok,
+			CacheReadTokens:     cacheRdTok,
 			WebSearchRequests: usageRowWebSearchRequests(
 				o.scan.usageSource, o.scan.tokenJSON),
+			Agent:           o.scan.agent,
+			ProviderID:      o.scan.providerID,
 			ClaudeMessageID: o.scan.claudeMessageID,
 			ClaudeRequestID: o.scan.claudeRequestID,
+			SourceUUID:      o.scan.sourceUUID,
+			UsageDedupKey:   o.scan.usageDedupKey,
 		}
 		rowContributes[i] = activity.UsageDataContributes(
 			o.scan.cost.Valid, inputTok, outputTok, reasoningTok,
@@ -225,13 +251,24 @@ func (db *DB) GetSessionUsageRows(
 			usageRowWebSearchRequests(o.scan.usageSource, o.scan.tokenJSON))
 		rawOutputTokensBySession[o.scan.sessionID] += outputTok
 	}
-	snapshotMask, snapshotAttribution, snapshotWebSearchRequests :=
-		activity.ClaudeSnapshotSurvivorSelection(snapshotRows)
+	canonicalTokenCoverageBySession, err :=
+		activity.CanonicalSessionTokenCoverageContext(ctx, snapshotRows)
+	if err != nil {
+		return nil, err
+	}
+	snapshotMask, snapshotAttribution, snapshotWebSearchRequests, err :=
+		activity.ClaudeSnapshotSurvivorSelectionContext(ctx, snapshotRows)
+	if err != nil {
+		return nil, err
+	}
 	seen := make(map[usageDedupToken]struct{})
 	deduplicatedOutputTokens := make(map[string]int)
 	discardedContributingSessions := make(map[string]struct{})
 	out := make([]activity.UsageRow, 0, len(rowsAcc))
 	for i, o := range rowsAcc {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if !snapshotMask[i] {
 			deduplicatedOutputTokens[o.scan.sessionID] +=
 				snapshotRows[i].OutputTokens
@@ -293,6 +330,7 @@ func (db *DB) GetSessionUsageRows(
 			Priced:          priced,
 			Contributes:     contributes,
 			Agent:           r.agent,
+			ProviderID:      r.providerID,
 			ClaudeMessageID: r.claudeMessageID,
 			ClaudeRequestID: r.claudeRequestID,
 			SourceUUID:      r.sourceUUID,
@@ -306,12 +344,68 @@ func (db *DB) GetSessionUsageRows(
 			WebSearchRequests:   snapshotWebSearchRequests[i],
 		})
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return &activity.SessionUsageRows{
-		Rows:                          out,
-		RawOutputTokensBySession:      rawOutputTokensBySession,
-		DeduplicatedOutputTokens:      deduplicatedOutputTokens,
-		DiscardedContributingSessions: discardedContributingSessions,
+		Rows:                            out,
+		RawOutputTokensBySession:        rawOutputTokensBySession,
+		DeduplicatedOutputTokens:        deduplicatedOutputTokens,
+		DiscardedContributingSessions:   discardedContributingSessions,
+		CanonicalTokenCoverageBySession: canonicalTokenCoverageBySession,
 	}, nil
+}
+
+func stableSortContext[T any](
+	ctx context.Context, values []T, less func(a, b T) bool,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(values) < 2 {
+		return nil
+	}
+	scratch := make([]T, len(values))
+	source, target := values, scratch
+	for width := 1; width < len(values); width *= 2 {
+		for left := 0; left < len(values); left += 2 * width {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			middle := min(left+width, len(values))
+			right := min(left+2*width, len(values))
+			i, j := left, middle
+			for k := left; k < right; k++ {
+				if k&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
+				if j >= right || i < middle && !less(source[j], source[i]) {
+					target[k] = source[i]
+					i++
+				} else {
+					target[k] = source[j]
+					j++
+				}
+			}
+		}
+		source, target = target, source
+		if width > len(values)/2 {
+			break
+		}
+	}
+	if &source[0] != &values[0] {
+		for i := range values {
+			if i&255 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			values[i] = source[i]
+		}
+	}
+	return ctx.Err()
 }
 
 // nullInt64Pointer converts a nullable message ordinal into the pointer
@@ -400,6 +494,8 @@ func activityReportProjectLabels(
 // partially-parsed session that began before the range but has messages
 // inside it is not dropped. COALESCE short-circuits, so the correlated
 // MAX subquery runs only for the rare sessions missing an ended_at.
+// A terminal tool event can outlive ended_at metadata, so it independently
+// keeps the session eligible when it reaches the report range.
 func (db *DB) activityReportSessions(
 	ctx context.Context, f AnalyticsFilter, rangeStartUTC, rangeEndUTC string,
 ) ([]activity.SessionMeta, []string, error) {
@@ -415,7 +511,7 @@ func (db *DB) activityReportSessionsFrom(
 	rangeStartUTC, rangeEndUTC string,
 ) ([]activity.SessionMeta, []string, error) {
 	where, args := f.buildWhereWithDate("", false, "s.id")
-	args = append(args, rangeStartUTC, rangeEndUTC)
+	args = append(args, rangeStartUTC, rangeStartUTC, rangeEndUTC)
 
 	// Each Title candidate is NULLIF'd independently (not a nested
 	// COALESCE-then-NULLIF) so an empty display_name cannot mask a real
@@ -432,10 +528,20 @@ func (db *DB) activityReportSessionsFrom(
 		COALESCE(s.is_automated, 0)
 	FROM sessions s
 	WHERE ` + where + `
-		AND COALESCE(NULLIF(s.ended_at, ''),
-			(SELECT MAX(m.timestamp) FROM messages m
-				WHERE m.session_id = s.id AND m.timestamp != ''),
-			NULLIF(s.started_at, ''), s.created_at) >= ?
+		AND (COALESCE(NULLIF(s.ended_at, ''),
+				(SELECT MAX(m.timestamp) FROM messages m
+					WHERE m.session_id = s.id AND m.timestamp != ''),
+				NULLIF(s.started_at, ''), s.created_at) >= ?
+			OR EXISTS (
+				SELECT 1 FROM tool_result_events tre
+				WHERE tre.session_id = s.id
+					AND tre.source = 'tool_execution'
+					AND tre.status IN ('completed', 'errored')
+					AND tre.timestamp IS NOT NULL
+					AND tre.timestamp != ''
+					AND agentsview_timestamp_unix_micro(tre.timestamp) IS NOT NULL
+					AND tre.timestamp >= ?
+			))
 		AND COALESCE(NULLIF(s.started_at, ''), s.created_at) < ?`
 
 	rows, err := q.QueryContext(ctx, query, args...)
@@ -601,6 +707,148 @@ WHERE m.session_id IN (SELECT value FROM json_each(?))
 ORDER BY agentsview_timestamp_unix_micro(m.timestamp),
 	m.session_id, m.ordinal`
 
+const activityReportTerminalCandidatesSQL = `WITH
+	session_ids AS (
+		SELECT value AS session_id FROM json_each(?)
+	),
+	terminal_events AS (
+		SELECT tre.session_id, tre.tool_call_message_ordinal AS ordinal,
+			tre.call_index, tre.event_index, tre.timestamp
+		FROM tool_result_events tre
+		JOIN session_ids ids ON ids.session_id = tre.session_id
+		WHERE tre.source = 'tool_execution'
+			AND tre.status IN ('completed', 'errored')
+			AND tre.timestamp IS NOT NULL
+			AND tre.timestamp != ''
+			AND agentsview_timestamp_unix_micro(tre.timestamp) IS NOT NULL
+			AND agentsview_timestamp_unix_micro(tre.timestamp) >= ?
+	),
+	terminal_sessions AS (
+		SELECT DISTINCT session_id FROM terminal_events
+	),
+	ordered_terminal AS (
+		SELECT te.*,
+			LEAD(te.ordinal) OVER terminal_order AS next_terminal_ordinal,
+			LEAD(te.timestamp) OVER terminal_order AS next_terminal_timestamp
+		FROM terminal_events te
+		WINDOW terminal_order AS (
+			PARTITION BY te.session_id
+			ORDER BY agentsview_timestamp_unix_micro(te.timestamp),
+				te.call_index, te.event_index
+		)
+	),
+	terminal_with_message AS (
+		SELECT ot.*, next_message.ordinal AS next_message_ordinal,
+			next_message.timestamp AS next_message_timestamp,
+			next_message.role AS next_message_role,
+			next_message.model AS next_message_model
+		FROM ordered_terminal ot
+		LEFT JOIN messages next_message ON next_message.id = (
+			SELECT next.id
+			FROM messages next INDEXED BY idx_messages_velocity
+			WHERE next.session_id = ot.session_id
+				AND next.ordinal > ot.ordinal
+				AND next.timestamp IS NOT NULL
+				AND next.timestamp != ''
+				AND agentsview_timestamp_unix_micro(next.timestamp) >
+					agentsview_timestamp_unix_micro(ot.timestamp)
+			ORDER BY next.ordinal
+			LIMIT 1
+		)
+	),
+	last_messages AS (
+		SELECT m.session_id, m.ordinal, m.timestamp
+		FROM terminal_sessions ts
+		JOIN messages m ON m.id = (
+			SELECT latest.id
+			FROM messages latest INDEXED BY idx_messages_velocity
+			WHERE latest.session_id = ts.session_id
+				AND latest.timestamp IS NOT NULL
+				AND latest.timestamp != ''
+				AND agentsview_timestamp_unix_micro(latest.timestamp) IS NOT NULL
+			ORDER BY latest.ordinal DESC
+			LIMIT 1
+		)
+	),
+	first_tail_events AS (
+		SELECT lm.session_id, lm.ordinal, lm.timestamp,
+			te.call_index, te.event_index, te.timestamp AS terminal_timestamp,
+			ROW_NUMBER() OVER (
+				PARTITION BY lm.session_id
+				ORDER BY agentsview_timestamp_unix_micro(te.timestamp),
+					te.call_index, te.event_index
+			) AS row_num
+		FROM last_messages lm
+		JOIN terminal_events te ON te.session_id = lm.session_id
+		WHERE agentsview_timestamp_unix_micro(te.timestamp) >
+				agentsview_timestamp_unix_micro(lm.timestamp)
+	),
+	candidates AS (
+		SELECT twm.session_id, twm.ordinal AS start_ordinal,
+			CASE
+				WHEN twm.next_terminal_timestamp IS NOT NULL AND
+					(twm.next_message_timestamp IS NULL OR
+					 agentsview_timestamp_unix_micro(twm.next_terminal_timestamp) <
+					 agentsview_timestamp_unix_micro(twm.next_message_timestamp))
+				THEN twm.next_terminal_ordinal
+				ELSE twm.next_message_ordinal
+			END AS end_ordinal,
+			twm.timestamp AS start_timestamp,
+			CASE
+				WHEN twm.next_terminal_timestamp IS NOT NULL AND
+					(twm.next_message_timestamp IS NULL OR
+					 agentsview_timestamp_unix_micro(twm.next_terminal_timestamp) <
+					 agentsview_timestamp_unix_micro(twm.next_message_timestamp))
+				THEN twm.next_terminal_timestamp
+				ELSE twm.next_message_timestamp
+			END AS end_timestamp,
+			CASE
+				WHEN twm.next_terminal_timestamp IS NOT NULL AND
+					(twm.next_message_timestamp IS NULL OR
+					 agentsview_timestamp_unix_micro(twm.next_terminal_timestamp) <
+					 agentsview_timestamp_unix_micro(twm.next_message_timestamp))
+				THEN 'tool'
+				ELSE twm.next_message_role
+			END AS closing_role,
+			CASE
+				WHEN twm.next_terminal_timestamp IS NOT NULL AND
+					(twm.next_message_timestamp IS NULL OR
+					 agentsview_timestamp_unix_micro(twm.next_terminal_timestamp) <
+					 agentsview_timestamp_unix_micro(twm.next_message_timestamp))
+				THEN ''
+				ELSE twm.next_message_model
+			END AS closing_model,
+			twm.call_index, twm.event_index
+		FROM terminal_with_message twm
+
+		UNION ALL
+
+		SELECT fte.session_id, fte.ordinal, fte.ordinal,
+			fte.timestamp, fte.terminal_timestamp, 'tool', '',
+			fte.call_index, fte.event_index
+		FROM first_tail_events fte
+		WHERE fte.row_num = 1
+	)
+SELECT candidate.session_id, candidate.start_ordinal, candidate.end_ordinal,
+	candidate.start_timestamp, candidate.end_timestamp,
+	candidate.closing_role, candidate.closing_model,
+	COALESCE((
+		SELECT prior.model
+		FROM messages prior
+		WHERE prior.session_id = candidate.session_id
+			AND prior.ordinal <= candidate.start_ordinal
+			AND prior.role = 'assistant'
+			AND prior.model != ''
+		ORDER BY prior.ordinal DESC
+		LIMIT 1
+	), 'unknown')
+FROM candidates candidate
+WHERE candidate.end_timestamp IS NOT NULL
+	AND agentsview_timestamp_unix_micro(candidate.start_timestamp) < ?
+ORDER BY agentsview_timestamp_unix_micro(candidate.start_timestamp),
+	candidate.session_id, candidate.start_ordinal,
+	candidate.call_index, candidate.event_index`
+
 func (db *DB) activityReportCandidateSource(
 	ids []string, q activity.Query,
 ) activity.CandidateSource {
@@ -622,44 +870,87 @@ func (db *DB) activityReportCandidateSource(
 		upper := upperTime.UnixMicro()
 		paddedLower := paddedUTCBound(lowerTime.Format(time.RFC3339), -14)
 		paddedUpper := paddedUTCBound(upperTime.Format(time.RFC3339), 14)
-		args := []any{string(encodedIDs), paddedLower, paddedUpper, lower, upper}
-		rows, err := db.getReader().QueryContext(
-			ctx, activityReportCandidatesSQL, args...,
-		)
-		if err != nil {
-			return fmt.Errorf("querying activity report candidates: %w", err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
+		scanCandidate := func(
+			row interface{ Scan(dest ...any) error },
+		) (activity.IntervalCandidate, error) {
 			var candidate activity.IntervalCandidate
 			var start, end string
-			if err := rows.Scan(
+			if err := row.Scan(
 				&candidate.SessionID, &candidate.StartOrdinal,
 				&candidate.EndOrdinal, &start, &end,
 				&candidate.ClosingRole, &candidate.ClosingModel,
 				&candidate.PriorModel,
 			); err != nil {
-				return fmt.Errorf("scanning activity report candidate: %w", err)
+				return candidate, fmt.Errorf(
+					"scanning activity report candidate: %w", err)
 			}
-			var err error
 			candidate.Start, err = time.Parse(time.RFC3339Nano, start)
 			if err != nil {
-				return fmt.Errorf("parsing activity candidate start: %w", err)
+				return candidate, fmt.Errorf(
+					"parsing activity candidate start: %w", err)
 			}
 			candidate.End, err = time.Parse(time.RFC3339Nano, end)
 			if err != nil {
-				return fmt.Errorf("parsing activity candidate end: %w", err)
+				return candidate, fmt.Errorf(
+					"parsing activity candidate end: %w", err)
 			}
 			candidate.Start = candidate.Start.UTC()
 			candidate.End = candidate.End.UTC()
-			if err := yield(candidate); err != nil {
-				return err
-			}
+			return candidate, nil
 		}
-		return rows.Err()
+
+		terminalRows, err := db.getReader().QueryContext(
+			ctx, activityReportTerminalCandidatesSQL,
+			string(encodedIDs), lower, upper,
+		)
+		if err != nil {
+			return fmt.Errorf("querying activity report terminal candidates: %w", err)
+		}
+		var terminal []activity.IntervalCandidate
+		for terminalRows.Next() {
+			candidate, scanErr := scanCandidate(terminalRows)
+			if scanErr != nil {
+				terminalRows.Close()
+				return scanErr
+			}
+			terminal = append(terminal, candidate)
+		}
+		if err := terminalRows.Err(); err != nil {
+			terminalRows.Close()
+			return err
+		}
+		if err := terminalRows.Close(); err != nil {
+			return err
+		}
+
+		messageSource := func(
+			ctx context.Context,
+			yield func(activity.IntervalCandidate) error,
+		) error {
+			rows, queryErr := db.getReader().QueryContext(
+				ctx, activityReportCandidatesSQL,
+				string(encodedIDs), paddedLower, paddedUpper, lower, upper,
+			)
+			if queryErr != nil {
+				return fmt.Errorf(
+					"querying activity report candidates: %w", queryErr)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				candidate, scanErr := scanCandidate(rows)
+				if scanErr != nil {
+					return scanErr
+				}
+				if err := yield(candidate); err != nil {
+					return err
+				}
+			}
+			return rows.Err()
+		}
+		return activity.MergeCandidateSlice(terminal, messageSource)(ctx, yield)
 	}
 }
 
@@ -784,6 +1075,7 @@ func (db *DB) loadActivityReportUsageCandidatesFrom(
 					MessageOrdinal:  ord,
 					UsageSource:     r.usageSource,
 					Agent:           r.agent,
+					ProviderID:      r.providerID,
 					ClaudeMessageID: r.claudeMessageID,
 					ClaudeRequestID: r.claudeRequestID,
 					SourceUUID:      r.sourceUUID,
@@ -1034,13 +1326,16 @@ func sqliteActivityReportRowStatus(
 func sqliteActivityReportRowStatusWithWebSearchRequests(
 	r dailyUsageScanRow, webSearches int, pricing *export.PricingResolver,
 ) (cost money.Money, priced, contributes bool, err error) {
-	pricedModel, lookup := pricing.Resolve(
-		r.model, usageLookupModel(r.model, r.ts))
-	var inTok, outTok, crTok, rdTok int
+	pricedModel, lookup := pricing.ResolveAt(
+		r.model, usageLookupModel(r.model, r.pricingTS),
+		usagePricingTimestamp(r.pricingTS),
+	)
+	var inTok, outTok, crTok, cr1hTok, rdTok int
 	reasoningTok := r.reasoningTokens
 	if r.usageSource == "message" {
 		inTok, outTok, crTok, rdTok, reasoningTok =
 			clampedUsageTokenCountersWithReasoning(r.tokenJSON)
+		cr1hTok = clampedCacheCreation1hTokens(r.tokenJSON)
 	} else {
 		inTok, outTok, crTok, rdTok = usageEventRowTokens(
 			r.usageSource,
@@ -1064,10 +1359,16 @@ func sqliteActivityReportRowStatusWithWebSearchRequests(
 		}
 		return fee, false, true, nil
 	}
+	pricedModel, lookup, err = pricing.ResolveBilledAt(
+		r.providerID, r.model, usageLookupModel(r.model, r.pricingTS),
+		usagePricingTimestamp(r.pricingTS))
+	if err != nil {
+		return money.Money{}, false, false, err
+	}
 	requestScoped := usageRowIsRequestScoped(r.usageSource, r.messageOrdinal)
 	cost, err = lookup.Rates.CostForTokensScoped(
 		requestScoped,
-		inTok, outTok, reasoningTok, crTok, rdTok)
+		inTok, outTok, reasoningTok, crTok, cr1hTok, rdTok)
 	if err != nil {
 		return money.Money{}, false, false,
 			fmt.Errorf("pricing activity usage for model %q: %w", r.model, err)

@@ -3,7 +3,7 @@ package sync
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"os"
 	"path/filepath"
 	"testing"
@@ -25,7 +25,7 @@ func writeTraeSyncDB(t *testing.T, path, reply string) {
 	require.NoError(t, db.Ping())
 	_, err = db.Exec(`CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)`)
 	require.NoError(t, err)
-	value, err := json.Marshal(map[string]any{"list": []any{traeSyncSession("rewrite", reply)}})
+	value, err := json.Marshal(map[string]any{"list": []any{traeSyncSession("rewrite", reply)}}, json.Deterministic(true))
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO ItemTable(key, value) VALUES (?, ?)`, "memento/icube-ai-agent-storage", value)
 	require.NoError(t, err)
@@ -55,7 +55,7 @@ func rewriteTraeSyncDB(t *testing.T, path, reply string, mtime time.Time) {
 	t.Helper()
 	db, err := sql.Open("sqlite3", path)
 	require.NoError(t, err)
-	value, err := json.Marshal(map[string]any{"list": []any{traeSyncSession("rewrite", reply)}})
+	value, err := json.Marshal(map[string]any{"list": []any{traeSyncSession("rewrite", reply)}}, json.Deterministic(true))
 	require.NoError(t, err)
 	_, err = db.Exec(`UPDATE ItemTable SET value = ? WHERE key = ?`, value, "memento/icube-ai-agent-storage")
 	require.NoError(t, err)
@@ -67,7 +67,7 @@ func setTraeSyncDBSessions(t *testing.T, path string, sessions []any, mtime time
 	t.Helper()
 	db, err := sql.Open("sqlite3", path)
 	require.NoError(t, err)
-	value, err := json.Marshal(map[string]any{"list": sessions})
+	value, err := json.Marshal(map[string]any{"list": sessions}, json.Deterministic(true))
 	require.NoError(t, err)
 	_, err = db.Exec(`UPDATE ItemTable SET value = ? WHERE key = ?`, value, "memento/icube-ai-agent-storage")
 	require.NoError(t, err)
@@ -89,7 +89,7 @@ func seedTraeSyncWALDB(t *testing.T, path string, sessions []any) {
 	require.NoError(t, err)
 	_, err = db.Exec(`CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)`)
 	require.NoError(t, err)
-	value, err := json.Marshal(map[string]any{"list": sessions})
+	value, err := json.Marshal(map[string]any{"list": sessions}, json.Deterministic(true))
 	require.NoError(t, err)
 	_, err = db.Exec(
 		`INSERT INTO ItemTable(key, value) VALUES (?, ?)`,
@@ -125,7 +125,7 @@ func TestTraeEncryptedLayoutReportsUnsupportedSource(t *testing.T) {
 				value, err := json.Marshal(map[string]any{"list": []any{map[string]any{
 					"sessionId": "stub",
 					"messages":  []any{},
-				}}})
+				}}}, json.Deterministic(true))
 				require.NoError(t, err)
 				_, err = db.Exec(`INSERT INTO ItemTable(key, value) VALUES (?, ?)`, "memento/icube-ai-agent-storage", value)
 				require.NoError(t, err)
@@ -157,6 +157,9 @@ func TestTraeEncryptedLayoutReportsUnsupportedSource(t *testing.T) {
 			require.NoError(t, res.err)
 			assert.True(t, res.skip)
 			assert.False(t, res.forceReplace)
+			assert.True(t, res.suppressPresenceSweep)
+			assert.Zero(t, res.providerFailureCount)
+			assert.Zero(t, res.providerWideFailureCount)
 			assert.Empty(t, res.results)
 
 			var stats SyncStats
@@ -165,6 +168,213 @@ func TestTraeEncryptedLayoutReportsUnsupportedSource(t *testing.T) {
 			assert.Equal(t, 1, stats.Anomalies.UnsupportedSourceLayoutsByAgent[string(parser.AgentTrae)])
 		})
 	}
+}
+
+func TestReconcileTraeUnsupportedSiblingPreservesArchiveAuthority(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "Trae", "User")
+	globalPath := filepath.Join(root, "globalStorage", "state.vscdb")
+	unsupportedPath := filepath.Join(root, "workspaceStorage", "unsupported", "state.vscdb")
+	writeTraeSyncDB(t, globalPath, "supported reply")
+	writeTraeSyncDB(t, unsupportedPath, "unsupported reply")
+	workspaceInfo, err := os.Stat(unsupportedPath)
+	require.NoError(t, err)
+	setTraeSyncDBSessions(t, unsupportedPath, []any{
+		traeSyncSession("unsupported", "unsupported reply"),
+	}, workspaceInfo.ModTime())
+	database := dbtest.OpenTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentTrae: {root}},
+		Machine:   "devbox",
+	})
+	t.Cleanup(engine.Close)
+
+	initial := engine.SyncAll(t.Context(), nil)
+	assert.Equal(t, 2, initial.Synced, "both siblings must be discovered and synced")
+	assert.Zero(t, initial.Failed)
+	supported, err := database.GetSession(t.Context(), "trae:rewrite")
+	require.NoError(t, err)
+	assert.NotNil(t, supported, "supported sibling must be seeded")
+	unsupported, err := database.GetSession(t.Context(), "trae:unsupported")
+	require.NoError(t, err)
+	assert.NotNil(t, unsupported, "unsupported sibling must be seeded")
+
+	require.NoError(t, os.Remove(unsupportedPath))
+	writeTraeSyncDBWithoutStorageKey(t, unsupportedPath)
+	writeTraeSyncModularData(t, root)
+
+	stats, _, err := engine.ReconcileWatchRootsWithStats(
+		t.Context(), nil, true, nil,
+	)
+	require.NoError(t, err)
+	assert.Zero(t, stats.Failed)
+	assert.Zero(t, engine.LastReconciliationResult().ProviderFailures)
+	assert.Equal(t, 1, stats.Anomalies.UnsupportedSourceLayoutsTotal)
+	unsupported, err = database.GetSession(t.Context(), "trae:unsupported")
+	require.NoError(t, err)
+	assert.NotNil(t, unsupported, "unsupported container member must remain active")
+
+	globalInfo, err := os.Stat(globalPath)
+	require.NoError(t, err)
+	setTraeSyncDBSessions(t, globalPath, []any{}, globalInfo.ModTime().Add(time.Second))
+
+	stats, _, err = engine.ReconcileWatchRootsWithStats(
+		t.Context(), nil, true, nil,
+	)
+	require.NoError(t, err)
+	assert.Zero(t, stats.Failed)
+	assert.Zero(t, engine.LastReconciliationResult().ProviderFailures)
+
+	supported, err = database.GetSession(t.Context(), "trae:rewrite")
+	require.NoError(t, err)
+	assert.NotNil(t, supported, "supported sibling removal remains browsable")
+	unsupported, err = database.GetSession(t.Context(), "trae:unsupported")
+	require.NoError(t, err)
+	assert.NotNil(t, unsupported, "unsupported container member must remain active")
+}
+
+func TestReconcileTraeUnsupportedContainerRemovalPreservesArchive(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "Trae", "User")
+	globalPath := filepath.Join(root, "globalStorage", "state.vscdb")
+	unsupportedPath := filepath.Join(root, "workspaceStorage", "unsupported", "state.vscdb")
+	writeTraeSyncDB(t, globalPath, "supported reply")
+	writeTraeSyncDB(t, unsupportedPath, "unsupported reply")
+	workspaceInfo, err := os.Stat(unsupportedPath)
+	require.NoError(t, err)
+	setTraeSyncDBSessions(t, unsupportedPath, []any{
+		traeSyncSession("unsupported", "unsupported reply"),
+	}, workspaceInfo.ModTime())
+	database := dbtest.OpenTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentTrae: {root}},
+		Machine:   "devbox",
+	})
+	t.Cleanup(engine.Close)
+
+	initial := engine.SyncAll(t.Context(), nil)
+	assert.Equal(t, 2, initial.Synced)
+	assert.Zero(t, initial.Failed)
+	seeded, err := database.GetSession(t.Context(), "trae:unsupported")
+	require.NoError(t, err)
+	assert.NotNil(t, seeded)
+
+	require.NoError(t, os.Remove(unsupportedPath))
+	stats, _, err := engine.ReconcileWatchRootsWithStats(
+		t.Context(), nil, true, nil,
+	)
+	require.NoError(t, err)
+	assert.Zero(t, stats.Failed)
+	assert.Zero(t, engine.LastReconciliationResult().ProviderFailures)
+
+	preserved, err := database.GetSession(t.Context(), "trae:unsupported")
+	require.NoError(t, err)
+	assert.NotNil(t, preserved, "vanished unsupported container must preserve its archive member")
+}
+
+func TestWatchBatchTraeMissingContainerPreservesArchive(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "Trae", "User")
+	path := filepath.Join(root, "globalStorage", "state.vscdb")
+	writeTraeSyncDB(t, path, "archived reply")
+	database := dbtest.OpenTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentTrae: {root}},
+		Machine:   "devbox",
+	})
+	t.Cleanup(engine.Close)
+
+	initial := engine.SyncAll(t.Context(), nil)
+	require.Equal(t, 1, initial.Synced)
+	require.Zero(t, initial.Failed)
+	require.NoError(t, os.Remove(path))
+
+	err := ApplyWatchBatch(t.Context(), engine, WatchBatch{
+		Paths: []string{path, path + "-wal"},
+	}, nil)
+	require.NoError(t, err)
+	assert.Zero(t, engine.LastSyncStats().Failed)
+
+	active, err := database.GetSession(t.Context(), "trae:rewrite")
+	require.NoError(t, err)
+	assert.NotNil(t, active,
+		"a vanished persistent container cannot prove member deletion")
+	archived, err := database.GetSessionFull(t.Context(), "trae:rewrite")
+	require.NoError(t, err)
+	require.NotNil(t, archived)
+	assert.Nil(t, archived.DeletionCause)
+}
+
+func TestReconcileTraeCompleteContainerTombstonesRemovedMember(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "Trae", "User")
+	path := filepath.Join(root, "globalStorage", "state.vscdb")
+	writeTraeSyncDB(t, path, "first reply")
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	setTraeSyncDBSessions(t, path, []any{
+		traeSyncSession("removed", "first reply"),
+		traeSyncSession("kept", "second reply"),
+	}, info.ModTime())
+	database := dbtest.OpenTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentTrae: {root}},
+		Machine:   "devbox",
+	})
+	t.Cleanup(engine.Close)
+
+	initial := engine.SyncAll(t.Context(), nil)
+	assert.Equal(t, 2, initial.Synced)
+	assert.Zero(t, initial.Failed)
+
+	info, err = os.Stat(path)
+	require.NoError(t, err)
+	setTraeSyncDBSessions(t, path, []any{
+		traeSyncSession("kept", "second reply"),
+	}, info.ModTime().Add(time.Second))
+	stats, _, err := engine.ReconcileWatchRootsWithStats(
+		t.Context(), nil, true, nil,
+	)
+	require.NoError(t, err)
+	assert.Zero(t, stats.Failed)
+
+	kept, err := database.GetSession(t.Context(), "trae:kept")
+	require.NoError(t, err)
+	assert.NotNil(t, kept, "remaining container member must stay active")
+	removed, err := database.GetSession(t.Context(), "trae:removed")
+	require.NoError(t, err)
+	assert.NotNil(t, removed, "removed container member must remain browsable")
+	archived, err := database.GetSessionFull(t.Context(), "trae:removed")
+	require.NoError(t, err)
+	assertSourceMissingState(t, archived)
+}
+
+func TestReconcileTraeEmptyContainerTombstonesLastMember(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "Trae", "User")
+	path := filepath.Join(root, "globalStorage", "state.vscdb")
+	writeTraeSyncDB(t, path, "last reply")
+	database := dbtest.OpenTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentTrae: {root}},
+		Machine:   "devbox",
+	})
+	t.Cleanup(engine.Close)
+
+	initial := engine.SyncAll(t.Context(), nil)
+	assert.Equal(t, 1, initial.Synced)
+	assert.Zero(t, initial.Failed)
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	setTraeSyncDBSessions(t, path, []any{}, info.ModTime().Add(time.Second))
+	stats, _, err := engine.ReconcileWatchRootsWithStats(
+		t.Context(), nil, true, nil,
+	)
+	require.NoError(t, err)
+	assert.Zero(t, stats.Failed)
+
+	active, err := database.GetSession(t.Context(), "trae:rewrite")
+	require.NoError(t, err)
+	assert.NotNil(t, active, "last removed member must remain browsable")
+	archived, err := database.GetSessionFull(t.Context(), "trae:rewrite")
+	require.NoError(t, err)
+	assertSourceMissingState(t, archived)
 }
 
 func TestProcessFileProviderTraeSameSizeSameMtimeRewriteReparses(t *testing.T) {

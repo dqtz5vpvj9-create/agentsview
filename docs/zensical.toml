@@ -23,6 +23,7 @@ nav = [
   {"Session Intelligence" = "session-intelligence.md"},
   {"MCP Server" = "mcp.md"},
   {"Token Usage & Costs" = "token-usage.md"},
+  {"One-shot CI Capture" = "one-shot-capture.md"},
   {"Chat Import" = "chat-import.md"},
   {"Quality" = "quality.md"},
   {"CLI Reference" = "commands.md"},
@@ -37,6 +38,7 @@ nav = [
   {"Artifact Folder Sync" = "artifact-sync.md"},
   {"Filesystem Session Sync" = "filesystem-sync.md"},
   {"PostgreSQL Sync" = "pg-sync.md"},
+  {"Hosted Raw Sync (In Development)" = "hosted-raw-sync.md"},
   {"DuckDB Mirror" = "duckdb.md"},
 ]
 

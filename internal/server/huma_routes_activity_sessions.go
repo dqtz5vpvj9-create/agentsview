@@ -13,9 +13,10 @@ type activityReportSessionsInput struct {
 	ReportID      string           `path:"report_id" required:"true" doc:"Signed Activity report ID"`
 	Limit         int              `query:"limit" minimum:"0" maximum:"500" doc:"Maximum session rows"`
 	Cursor        string           `query:"cursor" doc:"Opaque page cursor"`
-	Sort          string           `query:"sort" doc:"Sort: agent_minutes, cost, first_active, project, or agent"`
+	Sort          string           `query:"sort" enum:"agent_minutes,cost,first_active,project,agent" doc:"Session sort"`
 	Direction     string           `query:"direction" enum:"asc,desc" doc:"Sort direction"`
-	Bucket        optionalIntParam `query:"bucket" minimum:"0" doc:"Optional timeline bucket index"`
+	BucketStart   optionalIntParam `query:"bucket_start" minimum:"0" doc:"First timeline bucket in the half-open range"`
+	BucketEnd     optionalIntParam `query:"bucket_end" minimum:"1" doc:"Exclusive end of the timeline bucket range"`
 	IncludeReport bool             `query:"include_report" doc:"Include full report metadata for stateless clients"`
 }
 
@@ -111,9 +112,15 @@ func (s *Server) humaActivityReportSessions(
 	options := activity.SessionPageOptions{
 		Limit: in.Limit, Sort: activity.SessionSort(in.Sort), Direction: in.Direction,
 	}
-	if in.Bucket.IsSet {
-		bucket := in.Bucket.Value
-		options.Bucket = &bucket
+	if in.BucketStart.IsSet != in.BucketEnd.IsSet {
+		return nil, apiError(http.StatusBadRequest,
+			"activity report bucket range requires both start and end")
+	}
+	if in.BucketStart.IsSet {
+		options.BucketRange = &activity.BucketRange{
+			Start: in.BucketStart.Value,
+			End:   in.BucketEnd.Value,
+		}
 	}
 	var continuation *activity.SessionPageOptions
 	var cursorOffset int
@@ -121,19 +128,19 @@ func (s *Server) humaActivityReportSessions(
 		cursor, cursorErr := decodeActivityToken[activitySessionCursorPayload](
 			tokenStore, in.Cursor,
 		)
-		if cursorErr != nil || cursor.Version != activityReportTokenVersion ||
-			cursor.Schema != export.ActivityReportSchemaVersion ||
-			cursor.Digest != digest || cursor.Offset < 0 {
+		if cursorErr != nil || !validActivitySessionCursor(cursor, digest) {
 			return nil, apiError(http.StatusBadRequest, "invalid activity session cursor")
 		}
 		continuation = &activity.SessionPageOptions{
-			Sort: cursor.Sort, Direction: cursor.Direction, Bucket: cursor.Bucket,
+			Sort: cursor.Sort, Direction: cursor.Direction,
+			BucketRange: cursor.BucketRange,
 		}
 		cursorOffset = cursor.Offset
 	}
 	options, err = activity.ResolveSessionPageOptions(
 		options, continuation, activity.SessionPageOptionPresence{
-			Sort: in.Sort != "", Direction: in.Direction != "", Bucket: in.Bucket.IsSet,
+			Sort: in.Sort != "", Direction: in.Direction != "",
+			BucketRange: in.BucketStart.IsSet,
 		},
 	)
 	if err != nil {
@@ -142,8 +149,9 @@ func (s *Server) humaActivityReportSessions(
 		}
 		return nil, apiError(http.StatusBadRequest, err.Error())
 	}
-	if options.Bucket != nil &&
-		(*options.Bucket < 0 || *options.Bucket >= artifacts.Report.BucketCount) {
+	if options.BucketRange != nil &&
+		(options.BucketRange.Start < 0 ||
+			options.BucketRange.End > artifacts.Report.BucketCount) {
 		if in.Cursor != "" {
 			return nil, apiError(http.StatusBadRequest, "invalid activity session cursor")
 		}
@@ -162,10 +170,10 @@ func (s *Server) humaActivityReportSessions(
 	}
 	if page.HasNext {
 		page.NextCursor, err = encodeActivityToken(tokenStore, activitySessionCursorPayload{
-			Version: activityReportTokenVersion,
+			Version: activitySessionCursorVersion,
 			Schema:  export.ActivityReportSchemaVersion,
 			Digest:  digest, Offset: page.Next, Sort: options.Sort,
-			Direction: options.Direction, Bucket: options.Bucket,
+			Direction: options.Direction, BucketRange: options.BucketRange,
 		})
 		if err != nil {
 			return nil, internalError("activity session cursor error", err)

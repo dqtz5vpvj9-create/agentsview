@@ -6,7 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -232,8 +232,7 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 	progress.Finish()
 	reportRemoteFailures(failures)
 	if blocked != nil {
-		var pending *remotesync.PendingCleanupError
-		if errors.As(blocked, &pending) {
+		if _, ok := errors.AsType[*remotesync.PendingCleanupError](blocked); ok {
 			log.Printf("remote HTTP sync blocked by pending cleanup: %v", blocked)
 			fmt.Fprintf(os.Stderr,
 				"sync: remote HTTP cleanup remains pending: %s\n",
@@ -300,7 +299,8 @@ func (p *remoteProgressPrinter) Print(progress sync.Progress) {
 	if label == "" {
 		return
 	}
-	if strings.HasPrefix(label, "Synced ") {
+	if strings.HasPrefix(label, "Synced ") ||
+		strings.HasPrefix(label, "Skipped ") {
 		p.finishCurrent()
 		fmt.Fprintf(p.w, "  %s\n", label)
 		return
@@ -379,7 +379,7 @@ func syncLocalAndRemotes(
 ) ([]remoteHostFailure, error) {
 	didResync := localSync()
 	full := cfgFull || didResync
-	return runRemoteHosts(hosts, full, remoteSync)
+	return runRemoteHosts(hosts, full, nil, remoteSync)
 }
 
 func runRemoteSync(
@@ -460,14 +460,14 @@ var httpRemoteCleanupRegistry = new(remotesync.CleanupRegistry)
 var errUnifiedRebuildAborted = sync.ErrUnifiedRebuildAborted
 
 type preparedHTTPRebuildCLI interface {
-	BorrowRebuildContributors() ([]sync.RebuildContributor, func(), error)
+	BorrowRebuildOptions() (sync.RebuildOptions, func(), error)
 	Close() error
 }
 
 var prepareHTTPRebuildCLI = func(
 	ctx context.Context, syncs []remotesync.HTTPSync,
 ) (preparedHTTPRebuildCLI, error) {
-	return remotesync.PrepareHTTPSyncs(ctx, syncs)
+	return remotesync.PrepareAvailableHTTPSyncs(ctx, syncs)
 }
 
 var runLocalSyncWithRebuildCLI = runLocalSyncWithRebuild
@@ -565,18 +565,27 @@ type remoteHostFailure struct {
 // runRemoteHosts syncs each configured host in declared order via syncFn and
 // continues past host-attributable failures. A pending cleanup from an earlier
 // host stops iteration and is returned separately because the callback for the
-// current host never ran. The helper performs no logging so callers own all
-// output.
+// current host never ran. Unavailable configured HTTP hosts are omitted from
+// the returned failures.
 func runRemoteHosts(
 	hosts []config.RemoteHost, full bool,
+	progress sync.ProgressFunc,
 	syncFn func(config.RemoteHost, bool) error,
 ) ([]remoteHostFailure, error) {
 	var failures []remoteHostFailure
 	for _, rh := range hosts {
 		if err := syncFn(rh, full); err != nil {
-			var pending *remotesync.PendingCleanupError
-			if errors.As(err, &pending) {
+			if pending, ok := errors.AsType[*remotesync.PendingCleanupError](err); ok {
 				return failures, pending
+			}
+			if rh.Transport == config.RemoteTransportHTTP &&
+				remotesync.IsHostUnavailable(err) {
+				if progress != nil {
+					progress(sync.Progress{
+						Detail: "Skipped offline remote host " + rh.Host,
+					})
+				}
+				continue
 			}
 			failures = append(failures, remoteHostFailure{
 				Host: rh,
@@ -646,7 +655,7 @@ func runConfiguredLocalAndRemotes(
 				func(forceFull bool) error {
 					var blocked error
 					failures, blocked = runRemoteHosts(
-						hosts, forceFull,
+						hosts, forceFull, progress,
 						func(rh config.RemoteHost, remoteFull bool) error {
 							_, err := runRemoteSyncTransport(
 								ctx, appCfg, database, rh, remoteFull,
@@ -671,11 +680,11 @@ func runConfiguredLocalAndRemotes(
 				if prepared == nil {
 					return sync.RebuildOptions{}, nil, nil
 				}
-				contributors, release, err := prepared.BorrowRebuildContributors()
+				options, release, err := prepared.BorrowRebuildOptions()
 				if err != nil {
 					return sync.RebuildOptions{}, prepared, err
 				}
-				return sync.RebuildOptions{Contributors: contributors},
+				return options,
 					&preparedHTTPRebuildLeaseCLI{
 						prepared: prepared,
 						release:  release,
@@ -688,7 +697,7 @@ func runConfiguredLocalAndRemotes(
 				}
 				var blocked error
 				failures, blocked = runRemoteHosts(
-					remoteHosts, forceFull,
+					remoteHosts, forceFull, progress,
 					func(rh config.RemoteHost, remoteFull bool) error {
 						_, err := runRemoteSyncTransport(
 							ctx, appCfg, database, rh, remoteFull,
@@ -711,8 +720,7 @@ func runConfiguredLocalAndRemotes(
 	if coordinatorErr == nil {
 		return didResync, failures, nil
 	}
-	var pending *remotesync.PendingCleanupError
-	if errors.As(coordinatorErr, &pending) {
+	if _, ok := errors.AsType[*remotesync.PendingCleanupError](coordinatorErr); ok {
 		return didResync, failures, coordinatorErr
 	}
 	if failure, ok := configuredHTTPCoordinatorFailure(
@@ -778,20 +786,17 @@ func configuredHTTPCoordinatorFailure(
 	hosts []config.RemoteHost,
 	err error,
 ) (remoteHostFailure, bool) {
-	var pending *remotesync.PendingCleanupError
-	if errors.As(err, &pending) {
+	if _, ok := errors.AsType[*remotesync.PendingCleanupError](err); ok {
 		return remoteHostFailure{}, false
 	}
 	primary := primaryCoordinatorError(err)
 	var hostName string
 	failureErr := primary
-	var contributorErr *sync.RebuildContributorError
-	if errors.As(primary, &contributorErr) {
+	if contributorErr, ok := errors.AsType[*sync.RebuildContributorError](primary); ok {
 		hostName = contributorErr.Contributor
 		failureErr = contributorErr.Err
 	} else {
-		var hostErr *remotesync.HostError
-		if errors.As(primary, &hostErr) {
+		if hostErr, ok := errors.AsType[*remotesync.HostError](primary); ok {
 			hostName = hostErr.Host
 		}
 	}
@@ -860,6 +865,9 @@ func runLocalSyncAuthoritative(
 	}
 	if !stats.AuthoritativeDiscoveryComplete() {
 		return didResync, errors.New("local sync discovery incomplete")
+	}
+	if !stats.ProcessingComplete() {
+		return didResync, errors.New("local sync processing incomplete")
 	}
 	return didResync, nil
 }
@@ -990,6 +998,9 @@ func coordinateLocalSync(
 		}
 		return didResync, stats, errUnifiedRebuildAborted
 	}
+	if !stats.ProcessingComplete() {
+		return didResync, stats, errors.New("local sync processing incomplete")
+	}
 	return didResync, stats, nil
 }
 
@@ -1060,7 +1071,7 @@ func runDaemonSync(
 		resp.Header.Get("Content-Type"), "application/json",
 	) {
 		var stats sync.SyncStats
-		if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		if err := json.UnmarshalRead(resp.Body, &stats); err != nil {
 			return sync.SyncStats{}, err
 		}
 		return stats, nil
@@ -1119,7 +1130,7 @@ func runDaemonRemoteSync(
 		return parseDaemonRemoteSyncSSE(resp.Body, onProgress)
 	}
 	var out daemonRemoteSyncResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &out); err != nil {
 		return nil, err
 	}
 	return daemonRemoteSyncResult(out)

@@ -2,7 +2,8 @@ package sync
 
 import (
 	"context"
-	"encoding/json"
+	"database/sql"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/testjsonl"
 
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -26,9 +28,11 @@ func TestMergeSyncStatsIncludesAdditiveRebuildFields(t *testing.T) {
 		RebuildPhases:  []RebuildPhaseStats{{Contributor: "local", BatchedWrites: 1}},
 	}
 	src := SyncStats{
-		OrphanedCopied: 3,
-		Tombstoned:     2,
-		RebuildPhases:  []RebuildPhaseStats{{Contributor: "remote", BatchedWrites: 2}},
+		OrphanedCopied:     3,
+		Tombstoned:         2,
+		RebuildPhases:      []RebuildPhaseStats{{Contributor: "remote", BatchedWrites: 2}},
+		Deferred:           1,
+		deferredRetryPaths: []string{"remote.jsonl"},
 	}
 
 	mergeSyncStats(&dst, src)
@@ -40,6 +44,8 @@ func TestMergeSyncStatsIncludesAdditiveRebuildFields(t *testing.T) {
 		{Contributor: "local", BatchedWrites: 1},
 		{Contributor: "remote", BatchedWrites: 2},
 	}, dst.RebuildPhases)
+	assert.Equal(t, 1, dst.Deferred)
+	assert.Equal(t, []string{"remote.jsonl"}, dst.deferredRetryPaths)
 }
 
 func TestResyncAllLegacyOmitsContributorDiagnostics(t *testing.T) {
@@ -97,6 +103,7 @@ func TestResyncContributorsRunInOrderWithCumulativeProgress(t *testing.T) {
 
 	order := []string{}
 	progressByContributor := map[string]Progress{}
+	finalizingByContributor := map[string][]Progress{}
 	labelProgress := func(name string) func(Progress) Progress {
 		return func(p Progress) Progress {
 			p.Detail = name
@@ -106,6 +113,11 @@ func TestResyncContributorsRunInOrderWithCumulativeProgress(t *testing.T) {
 	onProgress := func(p Progress) {
 		if p.Detail == "A" || p.Detail == "B" {
 			progressByContributor[p.Detail] = p
+			if p.Phase == PhaseFinalizing {
+				finalizingByContributor[p.Detail] = append(
+					finalizingByContributor[p.Detail], p,
+				)
+			}
 		}
 	}
 	ftsCalls := 0
@@ -162,6 +174,15 @@ func TestResyncContributorsRunInOrderWithCumulativeProgress(t *testing.T) {
 		Phase: PhaseDone, Detail: "B", Resync: true,
 		SessionsTotal: 3, SessionsDone: 3, MessagesIndexed: 3,
 	}, progressByContributor["B"])
+	for _, contributor := range []string{"A", "B"} {
+		events := finalizingByContributor[contributor]
+		require.NotEmpty(t, events)
+		for _, event := range events {
+			assert.Zero(t, event.SessionsTotal)
+			assert.Zero(t, event.SessionsDone)
+			assert.Zero(t, event.MessagesIndexed)
+		}
+	}
 }
 
 func TestResyncAbortsWhenContributorLosesHistoricalSource(t *testing.T) {
@@ -205,6 +226,36 @@ func TestResyncAbortsWhenContributorLosesHistoricalSource(t *testing.T) {
 	remote, err := database.GetSession(context.Background(), "remote~remote")
 	require.NoError(t, err)
 	assert.NotNil(t, remote, "aborted rebuild must preserve the active archive")
+}
+
+func TestResyncPreservesAllOfflineRemoteHistoryAsOrphans(t *testing.T) {
+	localRoot := t.TempDir()
+	database, err := db.Open(filepath.Join(t.TempDir(), "archive.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	missingPath := filepath.Join(t.TempDir(), "offline-session.jsonl")
+	require.NoError(t, database.UpsertSession(db.Session{
+		ID: "offline~session", Project: "archive", Machine: "offline",
+		Agent: "claude", FilePath: &missingPath, MessageCount: 1,
+	}))
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {localRoot}},
+		Machine:   "collector",
+	})
+	t.Cleanup(engine.Close)
+
+	stats, err := engine.ResyncAllWithOptions(
+		context.Background(), nil, RebuildOptions{
+			UnavailableContributorIDPrefixes: []string{"offline~"},
+		},
+	)
+
+	require.NoError(t, err)
+	assert.False(t, stats.Aborted, "offline contributor history is not local safety loss")
+	assert.Equal(t, 1, stats.OrphanedCopied)
+	preserved, err := database.GetSession(context.Background(), "offline~session")
+	require.NoError(t, err)
+	assert.NotNil(t, preserved, "offline remote history must survive as an orphan")
 }
 
 func TestResyncAbortsWhenLabeledLocalSourceDisappearsAlongsideHealthyContributor(
@@ -519,23 +570,20 @@ func TestResyncContributorCancellationPreservesArchiveAndCleansTempDB(t *testing
 	require.NoError(t, os.Remove(oldPath))
 
 	provider := &blockingRebuildProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: parser.AgentCowork},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				DiscoverSources: parser.CapabilitySupported,
-			}},
-		},
+		Def: parser.AgentDef{Type: parser.AgentCowork},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			DiscoverSources: parser.CapabilitySupported,
+		}},
 		started: make(chan struct{}),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	firstHookCalls := 0
 	secondHookCalls := 0
-	secondProvider := &trackingRebuildProvider{ProviderBase: parser.ProviderBase{
+	secondProvider := &trackingRebuildProvider{
 		Def: parser.AgentDef{Type: parser.AgentCowork},
 		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
 			DiscoverSources: parser.CapabilitySupported,
-		}},
-	}}
+		}}}
 	result := make(chan struct {
 		stats SyncStats
 		err   error
@@ -612,6 +660,158 @@ func TestResyncContributorCancellationPreservesArchiveAndCleansTempDB(t *testing
 	assert.NoFileExists(t, database.Path()+resyncTempSuffix+"-shm")
 }
 
+type incompleteContributorProvider struct {
+	parser.ProviderBase
+	source parser.SourceRef
+}
+
+func (p *incompleteContributorProvider) Discover(context.Context) ([]parser.SourceRef, error) {
+	return []parser.SourceRef{p.source}, nil
+}
+
+func (p *incompleteContributorProvider) Fingerprint(
+	context.Context, parser.SourceRef,
+) (parser.SourceFingerprint, error) {
+	return parser.SourceFingerprint{Key: p.source.FingerprintKey, Size: 1, MTimeNS: 1}, nil
+}
+
+func (p *incompleteContributorProvider) Parse(
+	context.Context, parser.ParseRequest,
+) (parser.ParseOutcome, error) {
+	return issue1476DeferredOutcome(p.source.Key, parser.AgentCodex), nil
+}
+
+type incompleteContributorFactory struct {
+	provider *incompleteContributorProvider
+}
+
+func (f incompleteContributorFactory) Definition() parser.AgentDef {
+	return f.provider.Definition()
+}
+
+func (f incompleteContributorFactory) Capabilities() parser.Capabilities {
+	return f.provider.Capabilities()
+}
+
+func (f incompleteContributorFactory) NewProvider(
+	cfg parser.ProviderConfig,
+) parser.Provider {
+	clone := *f.provider
+	clone.Config = cfg.Clone()
+	return &clone
+}
+
+func TestSyncThenRunWithRebuildRejectsIncompleteContributor(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "deferred.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte("{}\n"), 0o600))
+	source := parser.SourceRef{
+		Provider: parser.AgentCodex, Key: path, DisplayPath: path,
+		FingerprintKey: path,
+	}
+	provider := &incompleteContributorProvider{
+		source: source,
+	}
+	provider.ProviderBase = parser.ProviderBase{
+		Def: parser.AgentDef{Type: parser.AgentCodex, FileBased: true},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			DiscoverSources: parser.CapabilitySupported,
+		}},
+	}
+	engine := NewEngine(openTestDB(t), EngineConfig{Machine: "local"})
+	t.Cleanup(engine.Close)
+
+	var afterFailureCalls, afterSyncCalls, workCalls int
+	stats, err := engine.SyncThenRunWithRebuild(
+		t.Context(), true, nil,
+		func() (RebuildOptions, RebuildCleanup, error) {
+			return RebuildOptions{Contributors: []RebuildContributor{{
+				Name: "deferred",
+				Config: EngineConfig{
+					AgentDirs: map[parser.AgentType][]string{
+						parser.AgentCodex: {root},
+					},
+					Machine: "remote", IDPrefix: "remote~", Ephemeral: true,
+					ProviderFactories: []parser.ProviderFactory{
+						incompleteContributorFactory{provider: provider},
+					},
+					ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+						parser.AgentCodex: parser.ProviderMigrationProviderAuthoritative,
+					},
+				},
+				AfterSync: func(*Engine, *db.DB) error {
+					afterSyncCalls++
+					return nil
+				},
+				AfterFailure: func(_ *Engine, active *db.DB) error {
+					afterFailureCalls++
+					assert.Same(t, engine.db, active)
+					return nil
+				},
+			}}}, nil, nil
+		},
+		nil,
+		func(bool, bool) error {
+			workCalls++
+			return nil
+		},
+	)
+
+	require.NoError(t, err)
+	assert.True(t, stats.Aborted)
+	assert.Equal(t, 1, stats.Deferred)
+	assert.Equal(t, 1, afterFailureCalls)
+	assert.Zero(t, afterSyncCalls,
+		"incomplete contributor data must not run AfterSync")
+	assert.Zero(t, workCalls,
+		"an incomplete rebuild must not run downstream work")
+}
+
+func TestResyncAllRejectsDeferredLocalReplacement(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "deferred.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte("{}\n"), 0o600))
+	source := parser.SourceRef{
+		Provider: parser.AgentCodex, Key: path, DisplayPath: path,
+		FingerprintKey: path,
+	}
+	provider := &incompleteContributorProvider{source: source}
+	provider.ProviderBase = parser.ProviderBase{
+		Def: parser.AgentDef{Type: parser.AgentCodex, FileBased: true},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			DiscoverSources: parser.CapabilitySupported,
+		}},
+	}
+	database := openTestDB(t)
+	missingPath := filepath.Join(t.TempDir(), "missing.jsonl")
+	require.NoError(t, database.UpsertSession(db.Session{
+		ID: "deferred", Project: "complete archive",
+		Machine: "local", Agent: string(parser.AgentCodex),
+		FilePath: &missingPath, MessageCount: 1,
+	}))
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentCodex: {root}},
+		Machine:   "local",
+		ProviderFactories: []parser.ProviderFactory{
+			incompleteContributorFactory{provider: provider},
+		},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentCodex: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+
+	stats := engine.ResyncAll(t.Context(), nil)
+
+	assert.True(t, stats.Aborted)
+	assert.Equal(t, 1, stats.Deferred)
+	assert.NoFileExists(t, database.Path()+resyncTempSuffix)
+	kept, err := database.GetSession(t.Context(), "deferred")
+	require.NoError(t, err)
+	require.NotNil(t, kept)
+	assert.Equal(t, "complete archive", kept.Project)
+}
+
 func TestResyncLocalCancellationPreventsContributors(t *testing.T) {
 	root := t.TempDir()
 	database, err := db.Open(filepath.Join(t.TempDir(), "archive.db"))
@@ -630,20 +830,17 @@ func TestResyncLocalCancellationPreventsContributors(t *testing.T) {
 	require.NoError(t, os.Remove(oldPath))
 
 	blocking := &blockingRebuildProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: parser.AgentCowork},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				DiscoverSources: parser.CapabilitySupported,
-			}},
-		},
-		started: make(chan struct{}),
-	}
-	later := &trackingRebuildProvider{ProviderBase: parser.ProviderBase{
 		Def: parser.AgentDef{Type: parser.AgentCowork},
 		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
 			DiscoverSources: parser.CapabilitySupported,
 		}},
-	}}
+		started: make(chan struct{}),
+	}
+	later := &trackingRebuildProvider{
+		Def: parser.AgentDef{Type: parser.AgentCowork},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			DiscoverSources: parser.CapabilitySupported,
+		}}}
 	engine := NewEngine(database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{parser.AgentCowork: {root}},
 		Machine:   "local",
@@ -783,13 +980,11 @@ func (f staticUsageRebuildFactory) NewProvider(parser.ProviderConfig) parser.Pro
 func newStaticUsageRebuildProvider(id, path string, input, output int) *staticUsageRebuildProvider {
 	started := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	return &staticUsageRebuildProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: parser.AgentCowork, FileBased: true},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				DiscoverSources:      parser.CapabilitySupported,
-				CompositeFingerprint: parser.CapabilitySupported,
-			}},
-		},
+		Def: parser.AgentDef{Type: parser.AgentCowork, FileBased: true},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			DiscoverSources:      parser.CapabilitySupported,
+			CompositeFingerprint: parser.CapabilitySupported,
+		}},
 		source: parser.SourceRef{
 			Provider: parser.AgentCowork, Key: path, DisplayPath: path, FingerprintKey: path,
 		},
@@ -918,13 +1113,12 @@ func TestResyncContributorParserFailuresAbortAndCleanTempDB(t *testing.T) {
 		AddClaudeUser("2026-01-01T00:00:00Z", "archive before parser failures").String()), 0o644))
 	require.Equal(t, 1, engine.SyncAll(context.Background(), nil).Synced)
 	require.NoError(t, os.Remove(oldPath))
-	provider := &malformedRebuildProvider{ProviderBase: parser.ProviderBase{
+	provider := &malformedRebuildProvider{
 		Def: parser.AgentDef{Type: parser.AgentCowork, FileBased: true},
 		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
 			DiscoverSources:      parser.CapabilitySupported,
 			CompositeFingerprint: parser.CapabilitySupported,
-		}},
-	}}
+		}}}
 
 	stats, err := engine.ResyncAllWithOptions(context.Background(), nil, RebuildOptions{
 		Contributors: []RebuildContributor{{
@@ -1063,4 +1257,90 @@ func TestResyncPreInstallSwapFailureDoesNotReportDiscardedTombstones(
 	stale, err := database.GetSession(context.Background(), staleID)
 	require.NoError(t, err)
 	assert.NotNil(t, stale, "the original archive keeps the stale fork active")
+}
+
+func countArchiveUsageIndexes(t *testing.T, path string) int {
+	t.Helper()
+	conn, err := sql.Open("sqlite3", path)
+	require.NoError(t, err, "open %s for usage index count", path)
+	defer conn.Close()
+	var count int
+	require.NoError(t, conn.QueryRow(
+		`SELECT count(*) FROM sqlite_master
+		 WHERE type = 'index' AND name IN (
+			'idx_messages_usage_timestamp',
+			'idx_messages_usage_session_covering',
+			'idx_messages_activity_timestamp'
+		 )`,
+	).Scan(&count), "count usage indexes in %s", path)
+	return count
+}
+
+func TestResyncDropsAndRebuildsUsageIndexes(t *testing.T) {
+	root := t.TempDir()
+	database, err := db.Open(filepath.Join(t.TempDir(), "archive.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+	path := filepath.Join(root, "proj", "session.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(testjsonl.NewSessionBuilder().
+		AddClaudeUser("2026-01-01T00:00:00Z", "usage index resync").String()), 0o644))
+
+	rebuildCalls := 0
+	duringRebuild := -1
+	stats, err := engine.resyncAllWithOptionsAndOperations(
+		context.Background(), nil, RebuildOptions{}, rebuildOperations{
+			rebuildUsageIndexes: func(newDB *db.DB) error {
+				rebuildCalls++
+				duringRebuild = countArchiveUsageIndexes(t, newDB.Path())
+				return newDB.RebuildUsageMessageIndexes()
+			},
+		},
+	)
+	require.NoError(t, err)
+	require.False(t, stats.Aborted, "resync aborted: %+v", stats)
+	assert.Equal(t, 1, rebuildCalls, "usage indexes rebuilt once")
+	assert.Equal(t, 0, duringRebuild,
+		"usage indexes must stay dropped during the bulk load")
+	assert.Equal(t, 3, countArchiveUsageIndexes(t, database.Path()),
+		"swapped archive must carry rebuilt usage indexes")
+}
+
+func TestResyncUsageIndexRebuildFailureAbortsSwap(t *testing.T) {
+	root := t.TempDir()
+	database, err := db.Open(filepath.Join(t.TempDir(), "archive.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+	oldPath := filepath.Join(root, "old", "old.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(oldPath), 0o755))
+	require.NoError(t, os.WriteFile(oldPath, []byte(testjsonl.NewSessionBuilder().
+		AddClaudeUser("2026-01-01T00:00:00Z", "archive survives usage failure").String()), 0o644))
+	require.Equal(t, 1, engine.SyncAll(context.Background(), nil).Synced)
+
+	sentinel := errors.New("usage index sentinel")
+	stats, err := engine.resyncAllWithOptionsAndOperations(
+		context.Background(), nil, RebuildOptions{}, rebuildOperations{
+			rebuildUsageIndexes: func(*db.DB) error { return sentinel },
+		},
+	)
+	require.ErrorIs(t, err, sentinel)
+	assert.True(t, stats.Aborted)
+	page, listErr := database.ListSessions(context.Background(), db.SessionFilter{})
+	require.NoError(t, listErr)
+	require.Len(t, page.Sessions, 1, "original archive must stay intact")
+	assert.Equal(t, 3, countArchiveUsageIndexes(t, database.Path()),
+		"original archive must keep its usage indexes")
+	assert.NoFileExists(t, database.Path()+resyncTempSuffix)
+	assert.NoFileExists(t, database.Path()+resyncTempSuffix+"-wal")
+	assert.NoFileExists(t, database.Path()+resyncTempSuffix+"-shm")
 }

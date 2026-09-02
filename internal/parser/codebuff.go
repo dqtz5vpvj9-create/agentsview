@@ -10,7 +10,7 @@ package parser
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -856,7 +856,7 @@ func parseCodebuffAIMessage(
 			}
 			inputParts["status"] = status
 
-			inputJSON, _ := json.Marshal(inputParts)
+			inputJSON, _ := json.Marshal(inputParts, json.Deterministic(true))
 
 			tc := ParsedToolCall{
 				ToolUseID: agentID,

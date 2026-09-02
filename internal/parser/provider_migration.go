@@ -25,6 +25,7 @@ var providerMigrationModes = map[AgentType]ProviderMigrationMode{
 	AgentGeminiApps:     ProviderMigrationImportOnly,
 	AgentOpenHands:      ProviderMigrationProviderAuthoritative,
 	AgentCursor:         ProviderMigrationProviderAuthoritative,
+	AgentCursorIDE:      ProviderMigrationProviderAuthoritative,
 	AgentMiMoCode:       ProviderMigrationProviderAuthoritative,
 	AgentOpenCode:       ProviderMigrationProviderAuthoritative,
 	AgentKilo:           ProviderMigrationProviderAuthoritative,
@@ -167,6 +168,15 @@ func validateProviderMigrationMode(
 						def.Type,
 					)
 				}
+			}
+		}
+		if caps.S3Discovery == CapabilitySupported {
+			provider := factory.NewProvider(ProviderConfig{})
+			if _, ok := provider.(S3Provider); !ok {
+				return fmt.Errorf(
+					"%s: S3 discovery capability requires S3Provider",
+					def.Type,
+				)
 			}
 		}
 	case ProviderMigrationImportOnly:

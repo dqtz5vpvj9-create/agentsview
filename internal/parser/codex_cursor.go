@@ -5,6 +5,7 @@ import (
 	"container/list"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json/jsontext"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -361,10 +362,14 @@ func (s *codexCursorState) observeTaskEvent(eventType string) {
 	}
 }
 
-// observeTokenUsage records the exact streaming token payload compactly and
-// reports whether it repeats the most recently observed payload.
+// observeTokenUsage records the streaming token payload compactly and reports
+// whether it repeats the most recently observed payload.
 func (s *codexCursorState) observeTokenUsage(raw string) bool {
-	digest := sha256.Sum256([]byte(raw))
+	canonical := jsontext.Value(raw).Clone()
+	if err := canonical.Canonicalize(jsontext.CanonicalizeRawInts(false)); err != nil {
+		return false
+	}
+	digest := sha256.Sum256(canonical)
 	duplicate := s.lastTokenUsageSeen && digest == s.lastTokenUsageDigest
 	s.lastTokenUsageDigest = digest
 	s.lastTokenUsageSeen = true

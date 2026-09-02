@@ -3,7 +3,8 @@ package parser
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -687,7 +688,7 @@ func applyPiebaldTokenUsage(msg *ParsedMessage, mr piebaldMessageRow) {
 		"cache_read_input_tokens":     cacheReadTokens,
 		"cache_creation_input_tokens": cacheWriteTokens,
 	}
-	j, err := json.Marshal(normalized)
+	j, err := json.Marshal(normalized, json.Deterministic(true))
 	if err != nil {
 		return
 	}
@@ -709,7 +710,7 @@ func parsePiebaldTimestamp(raw string) time.Time {
 
 func normalizeJSON(raw string) string {
 	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" || json.Valid([]byte(trimmed)) {
+	if trimmed == "" || jsontext.Value([]byte(trimmed)).IsValid() {
 		return trimmed
 	}
 	quoted, _ := json.Marshal(trimmed)
