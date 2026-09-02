@@ -66,7 +66,10 @@ func TestUsageCacheBackfillNewestFirstAndResumesInstalledCoverage(t *testing.T) 
 	assert.Empty(t, extracted, "installed versions are coverage truth on restart")
 }
 
-func TestUsageCacheBackfillRecapturesChangedSource(t *testing.T) {
+// The pass no longer recaptures when a source moves under it: it installs the
+// facts its read snapshot saw, and the next request refills the session that
+// changed. The observable outcome, an exact answer afterwards, is unchanged.
+func TestUsageCacheBackfillPicksUpSourceChangedDuringPass(t *testing.T) {
 	database := testDB(t)
 	started := "2026-08-10T08:00:00Z"
 	insertSession(t, database, "moving-backfill", "project", func(session *Session) {

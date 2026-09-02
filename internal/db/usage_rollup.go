@@ -6,10 +6,10 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +21,11 @@ import (
 )
 
 const usageRollupCursorSessionID = "\x00cursor"
+
+// usageRollupMaxBuildAttempts bounds the reclassification retry an install
+// transaction can request when a concurrent fill changes dedup membership.
+// Each attempt reads freshly committed facts, so it makes real progress.
+const usageRollupMaxBuildAttempts = 8
 
 type usageTimezoneIdentity struct {
 	Key, Name, IntervalFingerprint string
@@ -199,8 +204,10 @@ type usageRollupObserver struct {
 	beforeEnsure func()
 }
 
+// usageRollupCoordinator aggregates committed per-session facts out of the
+// usage cache. It deliberately holds no archive handle: the archive is read
+// only when a session's facts are filled.
 type usageRollupCoordinator struct {
-	archive  *DB
 	cache    *usageCache
 	ctx      context.Context
 	mu       sync.Mutex
@@ -209,10 +216,10 @@ type usageRollupCoordinator struct {
 }
 
 func newUsageRollupCoordinator(
-	ctx context.Context, archive *DB, cache *usageCache,
+	ctx context.Context, cache *usageCache,
 ) *usageRollupCoordinator {
 	return &usageRollupCoordinator{
-		archive: archive, cache: cache, ctx: ctx,
+		cache: cache, ctx: ctx,
 		calls: make(map[string]*usageRollupCall),
 	}
 }
@@ -261,6 +268,10 @@ func (c *usageRollupCoordinator) Ensure(
 	}
 }
 
+// ensureNow aggregates committed per-session facts out of the usage cache. It
+// never reads the archive, so an append landing mid-build cannot invalidate
+// it: that session's own notification fill installs new facts, which makes its
+// rollup install stale and rebuilds it on a later aggregation.
 func (c *usageRollupCoordinator) ensureNow(
 	ctx context.Context, snapshot usageQuerySnapshot,
 	fills map[string]usageFillResult, resolver *export.PricingResolver,
@@ -272,13 +283,45 @@ func (c *usageRollupCoordinator) ensureNow(
 		return nil, usageRollupMetrics{}, err
 	}
 	defer conn.Close()
+	var metrics usageRollupMetrics
+	// A concurrent fill can add a sibling to a dedup identity this build
+	// finalized, which the install transaction rejects. Reclassify against
+	// the newly committed facts instead of failing the caller.
+	for attempt := 1; ; attempt++ {
+		installs, done, attemptMetrics, attemptErr := c.ensureAttempt(
+			ctx, conn, identity, snapshot, fills, resolver, pricingHash)
+		metrics.DailyRows += attemptMetrics.DailyRows
+		metrics.ExceptionRows += attemptMetrics.ExceptionRows
+		metrics.ExceptionGroups += attemptMetrics.ExceptionGroups
+		metrics.BuildDuration += attemptMetrics.BuildDuration
+		metrics.InstallDuration += attemptMetrics.InstallDuration
+		if attemptErr != nil {
+			return nil, metrics, attemptErr
+		}
+		if done {
+			return installs, metrics, nil
+		}
+		if attempt >= usageRollupMaxBuildAttempts {
+			return nil, metrics, fmt.Errorf(
+				"usage rollup build kept losing dedup classification races")
+		}
+	}
+}
+
+// ensureAttempt performs one read-build-install cycle. It reports done when
+// every in-scope install matches the facts and metadata it must reflect.
+func (c *usageRollupCoordinator) ensureAttempt(
+	ctx context.Context, conn *sql.Conn, identity usageTimezoneIdentity,
+	snapshot usageQuerySnapshot, fills map[string]usageFillResult,
+	resolver *export.PricingResolver, pricingHash string,
+) (map[string]usageRollupInstall, bool, usageRollupMetrics, error) {
 	installs, stale, err := readUsageRollupInstalls(
 		ctx, conn, identity, snapshot, fills, pricingHash)
 	if err != nil || len(stale) == 0 {
 		cursorCurrent := installs[usageRollupCursorSessionID].FactRevision >=
 			snapshot.CursorHighWater
 		if err != nil || cursorCurrent {
-			return installs, usageRollupMetrics{}, err
+			return installs, err == nil, usageRollupMetrics{}, err
 		}
 	}
 	staleSessions := make(map[string]usageQuerySession, len(stale))
@@ -290,31 +333,35 @@ func (c *usageRollupCoordinator) ensureNow(
 		}
 	}
 	for _, version := range snapshot.Versions {
-		if stale[version.SessionID] {
-			staleVersions[version.SessionID] = version
-			staleFills[version.SessionID] = fills[version.SessionID]
+		if !stale[version.SessionID] {
+			continue
 		}
+		fill := fills[version.SessionID]
+		// Record the source version the cached facts came from, not the
+		// one the caller's archive snapshot observed.
+		staleVersions[version.SessionID] = fill.source
+		staleFills[version.SessionID] = fill
 	}
 	started := time.Now()
 	facts, err := loadUsageRollupFacts(ctx, conn, staleSessions)
 	if err != nil {
-		return nil, usageRollupMetrics{}, err
+		return nil, false, usageRollupMetrics{}, err
 	}
 	cross, err := loadUsageRollupCrossIdentities(ctx, conn)
 	if err != nil {
-		return nil, usageRollupMetrics{}, err
+		return nil, false, usageRollupMetrics{}, err
 	}
 	builds, err := buildUsageRollupSessions(
 		facts, staleSessions, staleVersions, staleFills, snapshot.location,
 		resolver, pricingHash, cross)
 	if err != nil {
-		return nil, usageRollupMetrics{}, err
+		return nil, false, usageRollupMetrics{}, err
 	}
 	if installs[usageRollupCursorSessionID].FactRevision < snapshot.CursorHighWater {
 		cursorBuild, cursorErr := loadCursorUsageRollupBuild(
 			ctx, conn, snapshot.CursorHighWater, snapshot.location, pricingHash)
 		if cursorErr != nil {
-			return nil, usageRollupMetrics{}, cursorErr
+			return nil, false, usageRollupMetrics{}, cursorErr
 		}
 		builds = append(builds, cursorBuild)
 	}
@@ -328,27 +375,29 @@ func (c *usageRollupCoordinator) ensureNow(
 		}
 		metrics.ExceptionGroups += int64(len(groups))
 	}
-	if err := c.recheck(ctx, staleVersions, staleSessions); err != nil {
-		return nil, metrics, err
-	}
 	installStarted := time.Now()
-	if err := installUsageRollupBuilds(
-		ctx, conn, identity, snapshot.location, builds, cross); err != nil {
-		return nil, metrics, err
-	}
+	err = installUsageRollupBuilds(
+		ctx, conn, identity, snapshot.location, builds, cross)
 	metrics.InstallDuration = time.Since(installStarted)
+	if err != nil {
+		if errors.Is(err, errUsageCacheSourceChanged) {
+			return nil, false, metrics, nil
+		}
+		return nil, false, metrics, err
+	}
 	installs, stale, err = readUsageRollupInstalls(
 		ctx, conn, identity, snapshot, fills, pricingHash)
 	if err != nil {
-		return nil, metrics, err
+		return nil, false, metrics, err
 	}
-	if len(stale) != 0 {
-		return nil, metrics, fmt.Errorf("usage rollup install did not verify")
+	if len(stale) != 0 ||
+		installs[usageRollupCursorSessionID].FactRevision < snapshot.CursorHighWater {
+		// Another builder installed a different generation of one of these
+		// sessions while this one was building. Its facts are committed, so
+		// the next attempt sees them.
+		return nil, false, metrics, nil
 	}
-	if installs[usageRollupCursorSessionID].FactRevision < snapshot.CursorHighWater {
-		return nil, metrics, fmt.Errorf("Cursor usage rollup install did not verify")
-	}
-	return installs, metrics, nil
+	return installs, true, metrics, nil
 }
 
 func readUsageRollupInstalls(
@@ -393,6 +442,9 @@ func readUsageRollupInstalls(
 	for _, session := range snapshot.Sessions {
 		sessions[session.ID] = session
 	}
+	// Staleness is decided entirely against the usage cache: an install is
+	// stale when the per-session facts it was built from are no longer the
+	// facts the cache holds. The archive is not consulted here.
 	stale := make(map[string]bool)
 	for _, version := range snapshot.Versions {
 		fill := fills[version.SessionID]
@@ -402,74 +454,13 @@ func readUsageRollupInstalls(
 			continue
 		}
 		if !ok || item.FactRevision != fill.InstallRevision ||
-			!sources[version.SessionID].Equal(version) ||
+			!sources[version.SessionID].Equal(fill.source) ||
 			baked[version.SessionID] != [2]string{session.Agent, session.StartedAt} ||
 			pricing[version.SessionID] != pricingHash {
 			stale[version.SessionID] = true
 		}
 	}
 	return installs, stale, nil
-}
-
-func (c *usageRollupCoordinator) recheck(
-	ctx context.Context, versions map[string]usageSourceVersion,
-	sessions map[string]usageQuerySession,
-) error {
-	observed := make([]usageSourceVersion, 0, len(versions))
-	for _, version := range versions {
-		observed = append(observed, version)
-	}
-	slices.SortFunc(observed, func(a, b usageSourceVersion) int {
-		return compareStrings(a.SessionID, b.SessionID)
-	})
-	current, err := c.cache.fill.recheckSourceVersions(ctx, observed)
-	if err != nil {
-		return err
-	}
-	for _, version := range observed {
-		if value, ok := current[version.SessionID]; !ok || !value.Equal(version) {
-			return fmt.Errorf("%w during rollup build", errUsageCacheSourceChanged)
-		}
-	}
-	metadata, err := c.currentMetadata(ctx, observed)
-	if err != nil {
-		return err
-	}
-	for id, session := range sessions {
-		if metadata[id] != [2]string{session.Agent, session.StartedAt} {
-			return fmt.Errorf("%w during rollup metadata check", errUsageCacheSourceChanged)
-		}
-	}
-	return nil
-}
-
-func (c *usageRollupCoordinator) currentMetadata(
-	ctx context.Context, versions []usageSourceVersion,
-) (map[string][2]string, error) {
-	ids := make([]string, 0, len(versions))
-	for _, version := range versions {
-		ids = append(ids, version.SessionID)
-	}
-	result := make(map[string][2]string, len(ids))
-	err := queryChunked(ids, func(chunk []string) error {
-		placeholders, args := inPlaceholders(chunk)
-		rows, err := c.archive.getReader().QueryContext(ctx, `SELECT id, agent,
-			COALESCE(started_at, '') FROM sessions
-			WHERE deleted_at IS NULL AND id IN `+placeholders, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var id, agent, startedAt string
-			if err := rows.Scan(&id, &agent, &startedAt); err != nil {
-				return err
-			}
-			result[id] = [2]string{agent, startedAt}
-		}
-		return rows.Err()
-	})
-	return result, err
 }
 
 func installUsageRollupBuilds(
@@ -683,8 +674,14 @@ func usageRollupCallKey(
 		sessions[session.ID] = session
 	}
 	for _, version := range snapshot.Versions {
-		writeUsageHashString(digest, usageFillCallKey(version))
-		writeUsageHashInt64(digest, fills[version.SessionID].InstallRevision)
+		fill := fills[version.SessionID]
+		// Key on the source the cached facts came from so two requests
+		// whose archive snapshots differ still share one build when the
+		// facts they aggregate are identical.
+		writeUsageHashString(digest, version.SessionID)
+		writeUsageHashString(digest, usageFillCallKey(fill.source))
+		writeUsageHashInt64(digest, fill.InstallRevision)
+		writeUsageHashBool(digest, fill.Deleted)
 		session := sessions[version.SessionID]
 		writeUsageHashString(digest, session.Agent)
 		writeUsageHashString(digest, session.StartedAt)

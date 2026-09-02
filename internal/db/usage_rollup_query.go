@@ -159,7 +159,12 @@ func verifyUsageRollupInstall(
 		}
 		return err
 	}
-	if revision != required.InstallRevision || pricingHash != required.PricingHash {
+	// A rebuild between the build and this read raises the install revision
+	// and leaves a newer, internally consistent set of rows for the same
+	// session. That is never older than the caller's archive snapshot, so
+	// read it rather than failing the request. Rollup installs already mix
+	// per-session generations across requests, so this adds no new mixing.
+	if revision < required.InstallRevision || pricingHash != required.PricingHash {
 		return fmt.Errorf("%w: usage rollup session %s changed before read",
 			errUsageCacheSourceChanged, sessionID)
 	}
