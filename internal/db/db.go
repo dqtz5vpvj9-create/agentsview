@@ -649,6 +649,7 @@ type DB struct {
 	// only then, so CLI resyncs never trigger an unrequested archive scan.
 	usageBackfillEnabled bool
 	mu                   sync.Mutex // serializes writes
+	compactMu            sync.Mutex // serializes staged archive compactions
 	connMu               sync.RWMutex
 	retired              []*sql.DB // old pools kept open for in-flight reads
 	// undrainedPools holds closed pools whose connections had not drained
@@ -777,11 +778,15 @@ func (w *writerHandle) current() (*sql.DB, error) {
 	if w.owner.readOnly {
 		return nil, ErrReadOnly
 	}
+	// The barrier check must also cover a non-nil pool: staged compaction
+	// reopens the pools on the installed-but-uncommitted archive with the
+	// barrier still up, and a write landing there would be lost by a
+	// rollback. Raw writer paths that do not take db.mu rely on this gate.
+	if w.owner.writerClosed.Load() {
+		return nil, ErrWriterClosed
+	}
 	db := w.owner.writer.Load()
 	if db == nil {
-		if w.owner.writerClosed.Load() {
-			return nil, ErrWriterClosed
-		}
 		return nil, ErrReadOnly
 	}
 	return db, nil
@@ -4580,11 +4585,16 @@ func (db *DB) CloseConnections() error {
 	}
 	db.StopUsageCacheBackfill()
 	db.stopWALCheckpointLoop()
-	// db.mu stays held through the drain: a concurrent Reopen or
-	// ReopenWriter would open fresh handles on the same path, letting this
-	// method return "drained" while new handles still block the rename.
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	return db.closeConnectionsLocked()
+}
+
+// closeConnectionsLocked closes both connection pools without acquiring
+// db.mu. The caller must hold db.mu for the whole close-and-drain interval.
+// Keeping that lock held is important for staged database replacement: no
+// writer can reopen a fresh pool between the close and the file swap.
+func (db *DB) closeConnectionsLocked() error {
 	db.connMu.Lock()
 
 	// Close the writer last: SQLite checkpoints and removes the WAL when
@@ -4732,22 +4742,21 @@ func (db *DB) Reopen() error {
 	if err := db.usageCache.RetireExcept(databaseID); err != nil {
 		return fmt.Errorf("retiring old usage cache generation: %w", err)
 	}
-	// Restart backfill only when this process explicitly enabled it
-	// (daemon lifecycle). A CLI resync reopening the archive must not
-	// kick off a full background scan of the replacement.
-	db.usageBackfillMu.Lock()
-	enabled := db.usageBackfillEnabled
-	db.usageBackfillMu.Unlock()
-	if !enabled {
-		return nil
-	}
-	return db.StartUsageCacheBackfill(context.Background())
+	return db.restartUsageCacheBackfillIfEnabled()
 }
 
 // reopenLocked performs the reopen while db.mu is already
 // held. New connections are opened before closing old ones
 // so the struct never points at closed handles on failure.
 func (db *DB) reopenLocked() error {
+	return db.reopenLockedWithBarrier(false)
+}
+
+// reopenLockedWithBarrier reopens both pools and leaves writerClosed in the
+// requested state. Staged compaction reopens the installed archive with the
+// barrier kept up so no write can land before the replacement commits; every
+// other caller clears the barrier.
+func (db *DB) reopenLockedWithBarrier(keepWriterBarrier bool) error {
 	writer, err := sql.Open(
 		"sqlite3", makeDSN(db.path, false),
 	)
@@ -4774,9 +4783,10 @@ func (db *DB) reopenLocked() error {
 	oldWriter := db.writer.Swap(writer)
 	oldReader := db.reader.Swap(reader)
 	// Reopen fully restores the writer pool, so clear any writer-closed barrier
-	// a prior CloseWriter set. Without this a resync swap that ran behind the
-	// worker write barrier would reopen the pool yet keep rejecting writes.
-	db.writerClosed.Store(false)
+	// a prior CloseWriter set unless the caller keeps it. Without the clear a
+	// resync swap that ran behind the worker write barrier would reopen the
+	// pool yet keep rejecting writes.
+	db.writerClosed.Store(keepWriterBarrier)
 
 	// Retire the just-swapped pools. Concurrent readers that
 	// loaded the old pointer before the swap may still have

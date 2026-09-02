@@ -52,7 +52,7 @@ type VersionInfo struct {
 // Bump it when a client-visible contract cannot be decoded safely by an older
 // CLI or daemon.
 const (
-	APIVersion = 7
+	APIVersion = 8
 	// ScopedWatchPushAPIVersion is the first daemon API that accepts bounded
 	// watcher batches and their authoritative recovery scope on push requests.
 	ScopedWatchPushAPIVersion = 7
@@ -172,6 +172,10 @@ type Server struct {
 	// localResyncRunner, when set, backs the foreground full-resync HTTP handler
 	// with the worker-backed build-and-swap instead of an in-process resync.
 	localResyncRunner LocalResyncRunner
+
+	// localCompactRunner, when set, backs archive compaction with the daemon's
+	// maintenance barrier instead of allowing a CLI to bypass the writer.
+	localCompactRunner LocalCompactRunner
 
 	artifactExchangeRunner ArtifactExchangeRunner
 	rawSyncDeviceAuth      RawSyncDeviceAuth
@@ -550,6 +554,18 @@ type LocalResyncRunner func(
 // (the default) keeps the in-process SyncThenRun resync path.
 func WithLocalResyncRunner(r LocalResyncRunner) Option {
 	return func(s *Server) { s.localResyncRunner = r }
+}
+
+// LocalCompactRunner runs staged maintenance against the local SQLite archive.
+// The daemon injects this runner so the command shares the archive-wide
+// maintenance barrier with sync and resync.
+type LocalCompactRunner func(
+	ctx context.Context, options db.CompactOptions,
+) (db.CompactResult, error)
+
+// WithLocalCompactRunner injects the daemon-managed compact runner.
+func WithLocalCompactRunner(r LocalCompactRunner) Option {
+	return func(s *Server) { s.localCompactRunner = r }
 }
 
 func (s *Server) humaConfig() huma.Config {

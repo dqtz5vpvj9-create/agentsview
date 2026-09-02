@@ -404,6 +404,67 @@ reclaimed. Use `--dry-run` first to verify the filter matches what you expect.
 
 ______________________________________________________________________
 
+### `agentsview db compact`
+
+Rebuild the local SQLite archive into a staged, verified database and reclaim
+free pages. The command also truncates the WAL. It does not compress or
+deduplicate live tool-result payloads, so it does not change future growth from
+those payloads.
+
+```bash
+agentsview db compact [flags]
+```
+
+| Flag           | Default | Description                                      |
+| -------------- | ------- | ------------------------------------------------ |
+| `--staging-dir` |         | Filesystem location for the staged database     |
+| `--dry-run`     | `false` | Report the estimate without changing the archive |
+| `--keep-backup` | `false` | Keep the original database backup                |
+| `--yes`         | `false` | Skip the confirmation prompt                     |
+| `--format`      | `human` | Use `json` for machine-readable output           |
+
+JSON mode writes only the final result to stdout and requires `--yes`; prompts
+and human progress messages are written to stderr. When a writable daemon owns
+the archive, `--staging-dir` is not accepted because the daemon chooses its
+own staging location and the compact endpoint is restricted to localhost. The
+command probes for an existing daemon and never starts one: maintenance must
+not trigger a daemon's startup sync. When no daemon owns the archive, the
+command takes the direct write lock and compacts in process.
+
+On a shared filesystem, peak additional space includes the original backup,
+the compacted candidate, a second candidate copy beside the live database, and
+a safety margin. With separate filesystems, staging needs the backup plus one
+candidate and the database filesystem needs the installation copy. The live
+source remains present until the final rename and is never credited as free
+space. For a large archive, use a separate volume with enough capacity:
+
+```bash
+agentsview db compact --dry-run
+agentsview db compact \
+  --staging-dir /mnt/cache/data-cache/agentsview-compact \
+  --keep-backup --yes
+```
+
+When a writable daemon is running, the command sends the request to that
+daemon. Direct file access is refused while another daemon owns the archive.
+Reads continue during the staged build, while writes are refused with a
+retryable archive-maintenance error until the verified replacement is
+committed; connections pause only for the final swap. Compactions are
+serialized per archive: a compaction requested while a sync, resync, or
+another compaction is running fails immediately with a conflict instead of
+queueing.
+
+If a compaction is interrupted or fails partway, the archive stays safe: a
+recovery manifest (`compact-recovery.json` beside the database) records the
+operation, and the next writable start finishes or rolls back the replacement
+before the archive opens. Until then the daemon may keep refusing writes and
+the error names the manifest; restarting the daemon resolves it. Once a
+compaction has committed, recovery only cleans up leftover staging files and
+never replaces the archive, so sessions ingested after a compaction are never
+at risk. Do not delete the manifest or the database files by hand.
+
+______________________________________________________________________
+
 ### `agentsview version`
 
 Print the version, git commit, and build date. Use `--json` for a stable,

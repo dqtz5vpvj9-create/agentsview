@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
 	"go.kenn.io/agentsview/internal/db"
+	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
 func (s *Server) registerDataRoutes() {
@@ -15,6 +17,7 @@ func (s *Server) registerDataRoutes() {
 	s.get(group, "/project-reclassification/candidates",
 		"List archive-wide reclassification candidates",
 		s.humaDataCandidates)
+	s.postLong(group, "/compact", "Compact local archive", s.humaDataCompact)
 }
 
 type dataProjectRulesInput struct {
@@ -33,6 +36,17 @@ type dataCandidatesInput struct {
 
 type dataCandidatesResponse struct {
 	Candidates []db.WorktreeReclassificationCandidate `json:"candidates"`
+}
+
+type dataCompactInput struct {
+	Body dataCompactRequest
+}
+
+type dataCompactRequest struct {
+	// The daemon chooses its own staging directory. Accepting a client path
+	// here would let any authenticated remote caller make the daemon copy a
+	// complete archive and backup into an arbitrary filesystem location.
+	KeepBackup *bool `json:"keep_backup,omitempty" doc:"Keep the original archive backup"`
 }
 
 func (s *Server) humaDataProjects(
@@ -106,4 +120,54 @@ func (s *Server) humaDataCandidates(
 	return &jsonOutput[dataCandidatesResponse]{
 		Body: dataCandidatesResponse{Candidates: candidates},
 	}, nil
+}
+
+func (s *Server) humaDataCompact(
+	ctx context.Context, in *dataCompactInput,
+) (*jsonOutput[db.CompactResult], error) {
+	if !isLocalhostContext(ctx) {
+		return nil, apiError(
+			http.StatusForbidden,
+			"archive compaction is only permitted from localhost",
+		)
+	}
+	local, ok := s.db.(*db.DB)
+	if !ok {
+		return nil, apiError(http.StatusNotImplemented, "not available in remote mode")
+	}
+	options := db.CompactOptions{}
+	if in != nil {
+		if in.Body.KeepBackup != nil {
+			options.KeepBackup = *in.Body.KeepBackup
+		}
+	}
+	var (
+		result db.CompactResult
+		err    error
+	)
+	if s.localCompactRunner != nil {
+		result, err = s.localCompactRunner(ctx, options)
+	} else {
+		err = s.serializeArchiveWrite(func() error {
+			result, err = local.Compact(ctx, options)
+			return err
+		})
+	}
+	if errors.Is(err, syncpkg.ErrSyncInProgress) ||
+		errors.Is(err, db.ErrCompactInProgress) {
+		return nil, apiError(
+			http.StatusConflict,
+			"another archive maintenance operation is already running",
+		)
+	}
+	if handled := handleHumaContextError(err); handled != nil {
+		return nil, handled
+	}
+	if handled := handleHumaReadOnly(err); handled != nil {
+		return nil, handled
+	}
+	if err != nil {
+		return nil, internalError("compact local archive error", err)
+	}
+	return &jsonOutput[db.CompactResult]{Body: result}, nil
 }

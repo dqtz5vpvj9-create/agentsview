@@ -78,3 +78,25 @@ On a read-only server (`pg serve` or `duckdb serve`) the inventory, the
 candidate evidence, and the Rules table remain fully readable, but the editor
 and rule mutations are replaced by a notice: classification rules are managed
 from the writable archive that ingests the machine's sessions.
+
+## Storage maintenance
+
+The local archive has three separate maintenance paths:
+
+- `agentsview db compact` reclaims SQLite free pages and truncates the WAL. It
+  preserves all live rows and has no effect on future tool-result growth.
+- `result_content_blocked_categories` followed by `agentsview sync --full`
+  applies the current result filtering to source-backed sessions that can be
+  reparsed. Orphaned and trashed sessions whose source files are gone cannot
+  be filtered this way.
+- Transparent compression or deduplication of live tool-result payloads is a
+  separate storage-format change and is not part of `db compact`.
+
+Compaction and full resync share the archive maintenance barrier, and the daemon
+enforces it: a compaction requested while a sync, resync, or another compaction
+is running fails immediately with a conflict rather than queueing. The compact
+command reports the database, WAL, SHM, freelist, staging requirement, and final
+reclaimed bytes separately; its result must not be combined with savings from
+filtering or a future compression implementation. See
+[`agentsview db compact`](/docs/commands/#agentsview-db-compact) for the staging
+space model and interrupted-compaction recovery.

@@ -106,6 +106,20 @@ func (db *DB) WaitUsageCacheBackfill(ctx context.Context) error {
 	return err
 }
 
+// restartUsageCacheBackfillIfEnabled resumes the background coverage pass
+// after maintenance stopped it, but only when this process explicitly enabled
+// it (daemon lifecycle). A CLI resync or compaction reopening the archive
+// must not kick off a full background scan on its own.
+func (db *DB) restartUsageCacheBackfillIfEnabled() error {
+	db.usageBackfillMu.Lock()
+	enabled := db.usageBackfillEnabled
+	db.usageBackfillMu.Unlock()
+	if !enabled {
+		return nil
+	}
+	return db.StartUsageCacheBackfill(context.Background())
+}
+
 // StopUsageCacheBackfill cancels and joins the active pass before cache handles
 // are closed.
 func (db *DB) StopUsageCacheBackfill() {

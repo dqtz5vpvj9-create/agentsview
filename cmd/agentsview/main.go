@@ -503,6 +503,11 @@ func runServe(cfg config.Config, opts serveOptions) {
 			newForegroundResyncRunner(ctx, cfg, engine, database),
 		))
 	}
+	if engine != nil {
+		srvOpts = append(srvOpts, server.WithLocalCompactRunner(
+			newForegroundCompactRunner(engine, database),
+		))
+	}
 	srvOpts = append(srvOpts, server.WithArtifactExchangeRunner(
 		newDaemonArtifactExchangeRunner(cfg, database, engine, emitter),
 	))
@@ -1037,6 +1042,24 @@ func newForegroundResyncRunner(
 	}
 }
 
+// newForegroundCompactRunner keeps archive compaction behind the same
+// non-blocking maintenance barrier as user-triggered sync and resync.
+func newForegroundCompactRunner(
+	engine *sync.Engine, database *db.DB,
+) server.LocalCompactRunner {
+	return func(
+		ctx context.Context, options db.CompactOptions,
+	) (db.CompactResult, error) {
+		var result db.CompactResult
+		err := engine.TryRunExclusive(func() error {
+			var err error
+			result, err = database.Compact(ctx, options)
+			return err
+		})
+		return result, err
+	}
+}
+
 // syncAllReleasingStartupMaintenance runs an incremental pass and, mirroring
 // SyncThenRun, releases startup maintenance when the pass was not cancelled.
 // SyncAll records startup reconciliation on its own but never releases the
@@ -1365,6 +1388,16 @@ func openWriteDB(
 	lock, err := acquireWriteOwnerLock(ctx, writeLockDataDir(cfg))
 	if err != nil {
 		return nil, nil, err
+	}
+	// Settle any interrupted staged compaction before the archive is probed.
+	// Only the canonical archive under the write lock runs this: derived
+	// databases (resync temps, isolated imports) must not interpret the
+	// archive's recovery manifest.
+	if err := db.RecoverCompactManifest(cfg.DBPath); err != nil {
+		_ = lock.Close()
+		return nil, nil, fmt.Errorf(
+			"recovering interrupted archive compaction: %w", err,
+		)
 	}
 	database, err := openDB(cfg)
 	if err != nil {
