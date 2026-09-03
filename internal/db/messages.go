@@ -2489,33 +2489,29 @@ func (db *DB) SetToolCallSubagentSession(
 	return nil
 }
 
-// soleToolResultEventTx returns a one-element slice when the call
-// identified by (session, owning message ordinal, call index) has exactly
-// one stored result event, and nil for every other count, which never
-// dedups. The key is the same triple attachToolResultEvents and
-// ToolCallResultContentSQL use, so every site agrees on which event a
-// summary is compared against. MIN over the single row is its content.
-func soleToolResultEventTx(
+// toolCallHasResultEventsTx reports whether the call identified by
+// (session, owning message ordinal, call index) has any stored result
+// events. The key is the same triple attachToolResultEvents uses. A call
+// with events derives its summary from them on read, so the link path must
+// not write one.
+func toolCallHasResultEventsTx(
 	tx *sql.Tx, sessionID string, messageOrdinal, callIndex int,
-) ([]ToolResultEvent, error) {
-	var count int
-	var content sql.NullString
+) (bool, error) {
+	var has bool
 	if err := tx.QueryRow(
-		`SELECT COUNT(*), MIN(content) FROM tool_result_events
-		 WHERE session_id = ?
-		   AND tool_call_message_ordinal = ?
-		   AND call_index = ?`,
+		`SELECT EXISTS(
+		   SELECT 1 FROM tool_result_events
+		   WHERE session_id = ?
+		     AND tool_call_message_ordinal = ?
+		     AND call_index = ?)`,
 		sessionID, messageOrdinal, callIndex,
-	).Scan(&count, &content); err != nil {
-		return nil, fmt.Errorf(
-			"counting tool result events for %s/%d/%d: %w",
+	).Scan(&has); err != nil {
+		return false, fmt.Errorf(
+			"checking tool result events for %s/%d/%d: %w",
 			sessionID, messageOrdinal, callIndex, err,
 		)
 	}
-	if count != 1 {
-		return nil, nil
-	}
-	return []ToolResultEvent{{Content: content.String}}, nil
+	return has, nil
 }
 
 func applyToolCallSubagentLinkTx(
@@ -2569,15 +2565,18 @@ func applyToolCallSubagentLinkTx(
 		resultContent = ""
 	} else {
 		// A linked result carries no events of its own, but the call it
-		// targets may already have one stored. Re-storing a summary the
-		// event repeats would undo the dedup on every incremental pass.
-		sole, err := soleToolResultEventTx(
+		// targets may already have some stored. A call with events derives
+		// its summary on read, so writing one here would re-inflate the
+		// column on every incremental pass.
+		has, err := toolCallHasResultEventsTx(
 			tx, sessionID, messageOrdinal, callIndex,
 		)
 		if err != nil {
 			return false, err
 		}
-		resultContent = DedupToolCallResultSummary(resultContent, sole)
+		if has {
+			resultContent = ""
+		}
 	}
 	if currentSubagent == storedSubagent &&
 		currentResultContentLen == link.ResultContentLen &&

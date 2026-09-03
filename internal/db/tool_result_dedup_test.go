@@ -9,9 +9,9 @@ import (
 )
 
 // TestToolCallResultSummaryStorage pins both halves of the tool-result
-// dedup: what the archive stores for a call, and what a loaded call looks
-// like to every consumer. The loaded ResultContent must match what the
-// column held back when the summary was written twice.
+// rule: the column is written only for a call with no result events, and a
+// loaded call with events shows the summary derived from them. The loaded
+// ResultContent must match what the parser produced at sync time.
 func TestToolCallResultSummaryStorage(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -41,7 +41,7 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
 			wantLoaded:    "total 4\ndrwxr-xr-x",
 		},
 		{
-			name: "multi event summary is stored",
+			name: "multi event summary is derived, not stored",
 			call: ToolCall{
 				ToolName:            "Task",
 				Category:            "Task",
@@ -69,12 +69,12 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
 					},
 				},
 			},
-			wantStored:    "agent-1:\nfirst\n\nagent-2:\nsecond",
+			wantStored:    "",
 			wantStoredLen: len("agent-1:\nfirst\n\nagent-2:\nsecond"),
 			wantLoaded:    "agent-1:\nfirst\n\nagent-2:\nsecond",
 		},
 		{
-			name: "single event summary that differs is stored",
+			name: "stale summary over a single event is replaced on read",
 			call: ToolCall{
 				ToolName:            "Task",
 				Category:            "Task",
@@ -90,9 +90,22 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
 					ContentLength: len("only"),
 				}},
 			},
-			wantStored:    "agent-1:\nonly",
+			wantStored:    "",
 			wantStoredLen: len("agent-1:\nonly"),
-			wantLoaded:    "agent-1:\nonly",
+			wantLoaded:    "only",
+		},
+		{
+			name: "call without events keeps its summary in the column",
+			call: ToolCall{
+				ToolName:            "Bash",
+				Category:            "Bash",
+				ToolUseID:           "call_plain",
+				ResultContent:       "paired result",
+				ResultContentLength: len("paired result"),
+			},
+			wantStored:    "paired result",
+			wantStoredLen: len("paired result"),
+			wantLoaded:    "paired result",
 		},
 		{
 			name: "blocked category keeps its blanked shape",
@@ -219,16 +232,12 @@ func TestRestoreToolCallResultContent(t *testing.T) {
 		want string
 	}{
 		{
-			name: "stored summary wins",
-			call: ToolCall{
-				ResultContent:       "summary",
-				ResultContentLength: 7,
-				ResultEvents:        []ToolResultEvent{{Content: "event"}},
-			},
+			name: "no events keeps the stored summary",
+			call: ToolCall{ResultContent: "summary", ResultContentLength: 7},
 			want: "summary",
 		},
 		{
-			name: "single event refills a cleared summary",
+			name: "single event derives its content",
 			call: ToolCall{
 				ResultContentLength: 5,
 				ResultEvents:        []ToolResultEvent{{Content: "event"}},
@@ -236,26 +245,32 @@ func TestRestoreToolCallResultContent(t *testing.T) {
 			want: "event",
 		},
 		{
-			name: "zero length is a genuinely empty summary",
+			name: "events replace a stored summary",
+			call: ToolCall{
+				ResultContent:       "stale",
+				ResultContentLength: 5,
+				ResultEvents:        []ToolResultEvent{{Content: "event"}},
+			},
+			want: "event",
+		},
+		{
+			name: "whitespace-only event derives empty",
 			call: ToolCall{
 				ResultEvents: []ToolResultEvent{{Content: "  "}},
 			},
 			want: "",
 		},
 		{
-			name: "multiple events never refill",
+			name: "multiple agents are rendered in first-seen order",
 			call: ToolCall{
 				ResultContentLength: 5,
 				ResultEvents: []ToolResultEvent{
-					{Content: "a"}, {Content: "b"},
+					{AgentID: "b", Content: "one"},
+					{AgentID: "a", Content: "two"},
+					{AgentID: "b", Content: "three"},
 				},
 			},
-			want: "",
-		},
-		{
-			name: "no events never refill",
-			call: ToolCall{ResultContentLength: 5},
-			want: "",
+			want: "b:\nthree\n\na:\ntwo",
 		},
 	}
 	for _, tt := range tests {
@@ -268,9 +283,8 @@ func TestRestoreToolCallResultContent(t *testing.T) {
 }
 
 // TestSubagentLinkKeepsDedupedSummary pins the incremental link path: a
-// linked result that repeats the call's single stored event must not
-// re-inflate result_content, while a summary the event does not carry is
-// stored as before.
+// linked result for a call that already has a stored event must never
+// re-inflate result_content, and the loaded call still shows the summary.
 func TestSubagentLinkKeepsDedupedSummary(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "s-link", "proj")
@@ -344,7 +358,7 @@ func TestSubagentLinkKeepsDedupedSummary(t *testing.T) {
 
 	link("agent finished with a longer final report")
 	content, length = stored()
-	assert.Equal(t, "agent finished with a longer final report", content,
-		"a summary the event does not carry is stored")
+	assert.Empty(t, content,
+		"a call with events never stores a summary, whatever the link says")
 	assert.Equal(t, len("agent finished with a longer final report"), length)
 }

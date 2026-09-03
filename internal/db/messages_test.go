@@ -676,6 +676,9 @@ func TestWriteSessionBatchReplaceMessagesOnlyBumpsChangedTranscript(t *testing.T
 	require.NotNil(t, recalculated.TranscriptRevision)
 	assert.Equal(t, "7", *recalculated.TranscriptRevision)
 
+	// A call with events derives its summary from them, so the visible
+	// change is the event content; the summary follows it.
+	write.Messages[0].ToolCalls[0].ResultEvents[0].Content = "changed result"
 	write.Messages[0].ToolCalls[0].ResultContent = "changed result"
 	_, err = d.WriteSessionBatch([]SessionBatchWrite{write})
 	require.NoError(t, err)
