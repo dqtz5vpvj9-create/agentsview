@@ -1,0 +1,25 @@
+name: Export in-session find source
+
+on:
+  push:
+    branches:
+      - automation/source-export
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: feat/in-session-find
+          fetch-depth: 0
+      - name: Package exact feature source
+        run: tar --exclude=.git -czf /tmp/agentsview-feature-source.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentsview-feature-source
+          path: /tmp/agentsview-feature-source.tar.gz
+          retention-days: 1
