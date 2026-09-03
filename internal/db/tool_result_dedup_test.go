@@ -369,13 +369,19 @@ func TestOmittedResultContentLengthRoundTrips(t *testing.T) {
 			}},
 		}
 	}
-	loaded := func(t *testing.T, d *DB, sessionID string) ToolCall {
+	// loaded reads the single call back and requires exactly wantEvents
+	// result events, so the event-length check below can never pass by
+	// looping over nothing.
+	loaded := func(
+		t *testing.T, d *DB, sessionID string, wantEvents int,
+	) ToolCall {
 		t.Helper()
 		msgs, err := d.GetMessages(context.Background(), sessionID, 0, 10, true)
 		require.NoError(t, err)
 		require.Len(t, msgs, 1)
 		require.Len(t, msgs[0].ToolCalls, 1)
 		tc := msgs[0].ToolCalls[0]
+		require.Len(t, tc.ResultEvents, wantEvents)
 		for _, ev := range tc.ResultEvents {
 			assert.Equal(t, len(ev.Content), ev.ContentLength,
 				"event length is inferred when omitted")
@@ -391,7 +397,7 @@ func TestOmittedResultContentLengthRoundTrips(t *testing.T) {
 			Content: "running", HasToolUse: true,
 			ToolCalls: []ToolCall{call("call_nolen")},
 		}}))
-		got := loaded(t, d, "s-nolen")
+		got := loaded(t, d, "s-nolen", 1)
 		assert.Equal(t, summary, got.ResultContent)
 		assert.Equal(t, len(summary), got.ResultContentLength)
 	})
@@ -412,7 +418,7 @@ func TestOmittedResultContentLengthRoundTrips(t *testing.T) {
 			ReplaceMessages: true,
 		}})
 		require.NoError(t, err)
-		got := loaded(t, d, "s-batch-nolen")
+		got := loaded(t, d, "s-batch-nolen", 1)
 		assert.Equal(t, summary, got.ResultContent)
 		assert.Equal(t, len(summary), got.ResultContentLength)
 	})
@@ -428,7 +434,7 @@ func TestOmittedResultContentLengthRoundTrips(t *testing.T) {
 			Content: "running", HasToolUse: true,
 			ToolCalls: []ToolCall{wrong},
 		}}))
-		got := loaded(t, d, "s-wrong")
+		got := loaded(t, d, "s-wrong", 1)
 		assert.Equal(t, summary, got.ResultContent)
 		assert.Equal(t, len(summary), got.ResultContentLength)
 	})
@@ -444,7 +450,7 @@ func TestOmittedResultContentLengthRoundTrips(t *testing.T) {
 				ResultContentLength: 4096,
 			}},
 		}}))
-		got := loaded(t, d, "s-withheld")
+		got := loaded(t, d, "s-withheld", 0)
 		assert.Empty(t, got.ResultContent)
 		assert.Equal(t, 4096, got.ResultContentLength)
 	})
@@ -469,7 +475,7 @@ func TestOmittedResultContentLengthRoundTrips(t *testing.T) {
 					HasResult:         true,
 				}},
 			}))
-		got := loaded(t, d, "s-link-nolen")
+		got := loaded(t, d, "s-link-nolen", 0)
 		assert.Equal(t, summary, got.ResultContent)
 		assert.Equal(t, len(summary), got.ResultContentLength)
 	})
