@@ -348,3 +348,92 @@ func TestSubagentLinkKeepsDedupedSummary(t *testing.T) {
 		"a summary the event does not carry is stored")
 	assert.Equal(t, len("agent finished with a longer final report"), length)
 }
+
+// TestOmittedResultContentLengthRoundTrips pins the public write API: a
+// caller that supplies a summary and its single event but leaves the
+// length at zero must still read the summary back. The length is what
+// tells the loader to refill a summary the dedup dropped, so the write
+// path infers it from the summary.
+func TestOmittedResultContentLengthRoundTrips(t *testing.T) {
+	const summary = "output without a declared length"
+	call := func(id string) ToolCall {
+		return ToolCall{
+			ToolName:      "Bash",
+			Category:      "Bash",
+			ToolUseID:     id,
+			ResultContent: summary,
+			ResultEvents: []ToolResultEvent{{
+				Source:  "function_call_output",
+				Status:  "completed",
+				Content: summary,
+			}},
+		}
+	}
+	loaded := func(t *testing.T, d *DB, sessionID string) ToolCall {
+		t.Helper()
+		msgs, err := d.GetMessages(context.Background(), sessionID, 0, 10, true)
+		require.NoError(t, err)
+		require.Len(t, msgs, 1)
+		require.Len(t, msgs[0].ToolCalls, 1)
+		return msgs[0].ToolCalls[0]
+	}
+
+	t.Run("InsertMessages", func(t *testing.T) {
+		d := testDB(t)
+		insertSession(t, d, "s-nolen", "proj")
+		require.NoError(t, d.InsertMessages([]Message{{
+			SessionID: "s-nolen", Ordinal: 0, Role: "assistant",
+			Content: "running", HasToolUse: true,
+			ToolCalls: []ToolCall{call("call_nolen")},
+		}}))
+		got := loaded(t, d, "s-nolen")
+		assert.Equal(t, summary, got.ResultContent)
+		assert.Equal(t, len(summary), got.ResultContentLength)
+	})
+
+	t.Run("WriteSessionBatch", func(t *testing.T) {
+		d := testDB(t)
+		_, err := d.WriteSessionBatch([]SessionBatchWrite{{
+			Session: Session{
+				ID: "s-batch-nolen", Project: "proj",
+				Machine: defaultMachine, Agent: defaultAgent,
+				MessageCount: 1,
+			},
+			Messages: []Message{{
+				SessionID: "s-batch-nolen", Ordinal: 0, Role: "assistant",
+				Content: "running", HasToolUse: true,
+				ToolCalls: []ToolCall{call("call_batch_nolen")},
+			}},
+			ReplaceMessages: true,
+		}})
+		require.NoError(t, err)
+		got := loaded(t, d, "s-batch-nolen")
+		assert.Equal(t, summary, got.ResultContent)
+		assert.Equal(t, len(summary), got.ResultContentLength)
+	})
+
+	t.Run("WriteSessionIncremental link", func(t *testing.T) {
+		d := testDB(t)
+		insertSession(t, d, "s-link-nolen", "proj")
+		require.NoError(t, d.InsertMessages([]Message{{
+			SessionID: "s-link-nolen", Ordinal: 0, Role: "assistant",
+			Content: "spawning", HasToolUse: true,
+			ToolCalls: []ToolCall{{
+				ToolName: "Agent", Category: "Task", ToolUseID: "call_link_nolen",
+			}},
+		}}))
+		require.NoError(t, d.WriteSessionIncremental("s-link-nolen", nil,
+			IncrementalSessionUpdate{
+				MsgCount: 1, NextOrdinal: 1,
+				SubagentLinks: []ToolCallSubagentLink{{
+					ToolUseID:         "call_link_nolen",
+					SubagentSessionID: "agent-child",
+					ResultContent:     summary,
+					HasResult:         true,
+				}},
+			}))
+		got := loaded(t, d, "s-link-nolen")
+		assert.Equal(t, summary, got.ResultContent)
+		assert.Equal(t, len(summary), got.ResultContentLength)
+	})
+}

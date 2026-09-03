@@ -2565,6 +2565,9 @@ func applyToolCallSubagentLinkTx(
 		return err == nil, err
 	}
 	resultContent := link.ResultContent
+	resultContentLen := inferResultContentLength(
+		resultContent, link.ResultContentLen,
+	)
 	if blockedResultCategories[category] {
 		resultContent = ""
 	} else {
@@ -2580,7 +2583,7 @@ func applyToolCallSubagentLinkTx(
 		resultContent = DedupToolCallResultSummary(resultContent, sole)
 	}
 	if currentSubagent == storedSubagent &&
-		currentResultContentLen == link.ResultContentLen &&
+		currentResultContentLen == resultContentLen &&
 		currentResultContent == resultContent {
 		return false, nil
 	}
@@ -2589,7 +2592,7 @@ func applyToolCallSubagentLinkTx(
 		 SET subagent_session_id = ?, result_content_length = ?,
 		     result_content = ?
 		 WHERE session_id = ? AND tool_use_id = ?`,
-		nilIfEmpty(currentSubagent), link.ResultContentLen, resultContent,
+		nilIfEmpty(currentSubagent), resultContentLen, resultContent,
 		sessionID, link.ToolUseID,
 	)
 	return err == nil, err
@@ -2765,14 +2768,16 @@ func resolveToolCalls(
 	for i, m := range msgs {
 		for callIdx, tc := range m.ToolCalls {
 			calls = append(calls, ToolCall{
-				MessageID:           ids[i],
-				SessionID:           m.SessionID,
-				ToolName:            tc.ToolName,
-				Category:            tc.Category,
-				ToolUseID:           tc.ToolUseID,
-				InputJSON:           tc.InputJSON,
-				SkillName:           tc.SkillName,
-				ResultContentLength: tc.ResultContentLength,
+				MessageID: ids[i],
+				SessionID: m.SessionID,
+				ToolName:  tc.ToolName,
+				Category:  tc.Category,
+				ToolUseID: tc.ToolUseID,
+				InputJSON: tc.InputJSON,
+				SkillName: tc.SkillName,
+				ResultContentLength: inferResultContentLength(
+					tc.ResultContent, tc.ResultContentLength,
+				),
 				ResultContent: DedupToolCallResultSummary(
 					tc.ResultContent, tc.ResultEvents,
 				),
@@ -2783,6 +2788,19 @@ func resolveToolCalls(
 		}
 	}
 	return calls
+}
+
+// inferResultContentLength fills in the summary length a caller left at
+// zero. The length is what tells the loaders to refill a summary the dedup
+// dropped, so a caller that supplies a summary without its length would
+// otherwise get an empty summary back. Every in-tree writer already passes
+// the summary's byte length, so this only changes what direct API callers
+// see.
+func inferResultContentLength(summary string, length int) int {
+	if length == 0 && summary != "" {
+		return len(summary)
+	}
+	return length
 }
 
 type toolResultEventRow struct {
