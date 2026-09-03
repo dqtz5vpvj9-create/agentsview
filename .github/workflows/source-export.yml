@@ -1,0 +1,22 @@
+name: Source export
+
+on:
+  push:
+    branches:
+      - automation/source-export
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package source tree
+        run: tar --exclude=.git -czf /tmp/agentsview-source.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentsview-source
+          path: /tmp/agentsview-source.tar.gz
+          retention-days: 1
