@@ -40,6 +40,7 @@
   "header_transcript_blocks_thinking": "Thinking blocks",
   "header_transcript_blocks_tool": "Tool calls",
   "header_transcript_blocks_code": "Code blocks",
+  "header_transcript_blocks_system": "System boundaries",
   "header_actions_follow_latest": "Follow latest messages",
   "header_actions_toggle_sort": "Toggle sort order (o)",
   "header_actions_cycle_layout": "Cycle layout: {layout} (l)",

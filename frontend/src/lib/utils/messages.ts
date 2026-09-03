@@ -29,6 +29,22 @@ const VISIBLE_SYSTEM_SUBTYPES = new Set([
 ]);
 
 /**
+ * Reports whether the transcript renders this message as a system boundary
+ * card instead of ordinary message content. The Claude parser keeps these
+ * rows on role "user" so analytics do not count them as assistant replies,
+ * so the role alone cannot tell them apart.
+ */
+export function isSystemBoundaryMessage(
+  m: Message,
+): m is Message & { source_subtype: string } {
+  if (m.is_compact_boundary) return false;
+  if (!m.is_system) return false;
+  return (
+    !!m.source_subtype && m.source_subtype !== "compact_boundary"
+  );
+}
+
+/**
  * Returns true if the message is system-injected and should be
  * hidden from the UI. Checks the backend is_system flag first,
  * then falls back to prefix detection for parsers that don't set it.

@@ -40,6 +40,7 @@
   "header_transcript_blocks_thinking": "思考ブロック",
   "header_transcript_blocks_tool": "ツール呼び出し",
   "header_transcript_blocks_code": "コードブロック",
+  "header_transcript_blocks_system": "システム境界",
   "header_actions_follow_latest": "最新のメッセージをフォローする",
   "header_actions_toggle_sort": "並べ替え順序を切り換える (o)",
   "header_actions_cycle_layout": "サイクルレイアウト: {layout} (l)",

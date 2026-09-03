@@ -22,7 +22,10 @@
   import {
     hasVisibleSegments,
   } from "../../utils/content-parser.js";
-  import { isSystemMessage } from "../../utils/messages.js";
+  import {
+    isSystemBoundaryMessage,
+    isSystemMessage,
+  } from "../../utils/messages.js";
   import { resolveMessageLayout } from "../../utils/message-layout.js";
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
   import { sessionActivity } from "../../stores/sessionActivity.svelte.js";
@@ -889,7 +892,7 @@
               />
             {:else if item.message.is_compact_boundary}
               <CompactBoundaryDivider message={item.message} />
-            {:else if item.message.is_system && item.message.source_subtype && item.message.source_subtype !== 'compact_boundary'}
+            {:else if isSystemBoundaryMessage(item.message)}
               <SystemBoundaryCard
                 subtype={item.message.source_subtype}
                 content={item.message.content}

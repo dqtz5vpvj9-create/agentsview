@@ -38,7 +38,8 @@ export type BlockType =
   | "assistant"
   | "thinking"
   | "tool"
-  | "code";
+  | "code"
+  | "system";
 
 export const ALL_BLOCK_TYPES: BlockType[] = [
   "user",
@@ -46,6 +47,7 @@ export const ALL_BLOCK_TYPES: BlockType[] = [
   "thinking",
   "tool",
   "code",
+  "system",
 ];
 
 const BLOCK_FILTER_KEY = "agentsview-block-filters";
@@ -56,23 +58,71 @@ const VITALS_CALLS_EXPANDED_KEY =
 const SIGNAL_PANEL_KEY = "agentsview-signal-panel";
 const FOLLOW_LATEST_KEY = "agentsview-follow-latest";
 
-function readBlockFilters(): Set<BlockType> {
+// The block types the original stored payload could name. That payload listed
+// the visible types, so any type added later is missing from every stored
+// payload and must not be read back as one the reader chose to hide. The
+// current payload lists hidden types instead, which keeps a future block type
+// visible by default without another migration.
+const LEGACY_VISIBLE_BLOCK_TYPES: BlockType[] = [
+  "user",
+  "assistant",
+  "thinking",
+  "tool",
+  "code",
+];
+
+/**
+ * Resolves the visible block types from a stored filter payload. Exported so
+ * the stored-format migration can be exercised with literal payloads.
+ */
+export function parseBlockFilters(raw: string | null): Set<BlockType> {
+  const hidden = parseHiddenBlocks(raw);
+  return new Set(ALL_BLOCK_TYPES.filter((type) => !hidden.has(type)));
+}
+
+/** Serializes the visible block types for storage. */
+export function serializeBlockFilters(
+  visible: Set<BlockType>,
+): string {
+  return JSON.stringify({
+    hidden: ALL_BLOCK_TYPES.filter((type) => !visible.has(type)),
+  });
+}
+
+function parseHiddenBlocks(raw: string | null): Set<BlockType> {
+  if (!raw) return new Set();
   try {
-    const raw = localStorage?.getItem(BLOCK_FILTER_KEY);
-    if (raw) {
-      const arr = JSON.parse(raw);
-      if (Array.isArray(arr)) {
-        return new Set(
-          arr.filter((t: string) =>
-            ALL_BLOCK_TYPES.includes(t as BlockType),
-          ) as BlockType[],
-        );
-      }
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return new Set(
+        LEGACY_VISIBLE_BLOCK_TYPES.filter(
+          (type) => !parsed.includes(type),
+        ),
+      );
+    }
+    if (parsed && Array.isArray(parsed.hidden)) {
+      return new Set(knownBlockTypes(parsed.hidden));
     }
   } catch {
     // ignore
   }
-  return new Set(ALL_BLOCK_TYPES);
+  return new Set();
+}
+
+function knownBlockTypes(values: unknown[]): BlockType[] {
+  return values.filter((value): value is BlockType =>
+    ALL_BLOCK_TYPES.includes(value as BlockType),
+  );
+}
+
+function readBlockFilters(): Set<BlockType> {
+  try {
+    return parseBlockFilters(
+      localStorage?.getItem(BLOCK_FILTER_KEY) ?? null,
+    );
+  } catch {
+    return new Set(ALL_BLOCK_TYPES);
+  }
 }
 
 const LAYOUT_KEY = "agentsview-message-layout";
@@ -528,7 +578,7 @@ class UIStore {
     try {
       localStorage?.setItem(
         BLOCK_FILTER_KEY,
-        JSON.stringify([...this.visibleBlocks]),
+        serializeBlockFilters(this.visibleBlocks),
       );
     } catch {
       // ignore

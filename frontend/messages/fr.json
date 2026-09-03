@@ -40,6 +40,7 @@
   "header_transcript_blocks_thinking": "Blocs de réflexion",
   "header_transcript_blocks_tool": "Appels d'outil",
   "header_transcript_blocks_code": "Blocs de code",
+  "header_transcript_blocks_system": "Limites système",
   "header_actions_follow_latest": "Suivre les derniers messages",
   "header_actions_toggle_sort": "Inverser l'ordre de tri (o)",
   "header_actions_cycle_layout": "Changer de disposition : {layout} (l)",

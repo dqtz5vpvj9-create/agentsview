@@ -321,6 +321,32 @@ describe("MessageList follow cancellation", () => {
     expect(readProgress.get("s1")?.token).toBe("current");
   });
 
+  it("hides system boundary cards when the system block is filtered out", async () => {
+    messages.messages = [
+      {
+        ...makeMessage(0),
+        role: "user",
+        content:
+          "<task-notification>\n<status>completed</status>\n</task-notification>",
+        is_system: true,
+        source_subtype: "task_notification",
+      },
+    ];
+    messages.messageCount = 1;
+    setVirtualRows(1);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    expect(
+      document.querySelector(".system-boundary"),
+    ).not.toBeNull();
+
+    ui.setBlockVisible("system", false);
+    await tick();
+
+    expect(document.querySelector(".system-boundary")).toBeNull();
+  });
+
   it("acknowledges traversal when a block filter hides the raw boundary", async () => {
     messages.messages = [
       { ...makeMessage(0), role: "assistant" },

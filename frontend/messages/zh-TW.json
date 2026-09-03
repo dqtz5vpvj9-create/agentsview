@@ -40,6 +40,7 @@
   "header_transcript_blocks_thinking": "思考區塊",
   "header_transcript_blocks_tool": "工具使用",
   "header_transcript_blocks_code": "程式碼區塊",
+  "header_transcript_blocks_system": "系統邊界",
   "header_actions_follow_latest": "跟隨最新訊息",
   "header_actions_toggle_sort": "切換排序 (o)",
   "header_actions_cycle_layout": "切換佈局：{layout} (l)",

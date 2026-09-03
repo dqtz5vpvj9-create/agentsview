@@ -690,7 +690,7 @@ so matches can be highlighted.
 ### Block-Type Filtering
 
 Click the filter icon in the message viewer header to open a dropdown that
-toggles visibility of five content categories:
+toggles visibility of six content categories:
 
 | Category  | What It Controls          |
 | --------- | ------------------------- |
@@ -699,6 +699,12 @@ toggles visibility of five content categories:
 | Thinking  | Thinking/reasoning blocks |
 | Tool      | Tool call blocks          |
 | Code      | Code blocks               |
+| System    | System boundary cards     |
+
+System boundary cards are the compact rows that mark a session continuation or
+resume, an interrupted request, a task notification, or stop hook feedback.
+Hiding the category removes all of them; the rest of the transcript is
+unaffected.
 
 All categories are visible by default. When any are hidden, a badge on the
 filter button shows the count of hidden types. Click **Show all** to restore

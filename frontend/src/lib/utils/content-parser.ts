@@ -1,5 +1,6 @@
 import type { Message, ToolCall } from "../api/types.js";
 import { LRUCache } from "./cache.js";
+import { isSystemBoundaryMessage } from "./messages.js";
 
 export type SegmentType = "text" | "thinking" | "tool" | "code" | "skill";
 
@@ -578,9 +579,20 @@ export function enrichSegments(
 export function hasVisibleSegments(
   msg: Message,
   isVisible: (
-    type: "user" | "assistant" | "thinking" | "tool" | "code",
+    type:
+      | "user"
+      | "assistant"
+      | "thinking"
+      | "tool"
+      | "code"
+      | "system",
   ) => boolean,
 ): boolean {
+  // A boundary card shows a label and a one-line preview, never the parsed
+  // segments of its body, so its own block type owns its visibility. Parsing
+  // the body here would let an unrelated toggle hide the card, and would tie
+  // every boundary card to the "user" role it carries for analytics.
+  if (isSystemBoundaryMessage(msg)) return isVisible("system");
   const role: "user" | "assistant" =
     msg.role === "user" ? "user" : "assistant";
   const segs = enrichSegments(

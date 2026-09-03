@@ -40,6 +40,7 @@
   "header_transcript_blocks_thinking": "思考块",
   "header_transcript_blocks_tool": "工具调用",
   "header_transcript_blocks_code": "代码块",
+  "header_transcript_blocks_system": "系统边界",
   "header_actions_follow_latest": "跟随最新消息",
   "header_actions_toggle_sort": "切换排序 (o)",
   "header_actions_cycle_layout": "切换布局：{layout} (l)",

@@ -40,6 +40,7 @@
   "header_transcript_blocks_thinking": "사고 블록",
   "header_transcript_blocks_tool": "도구 호출",
   "header_transcript_blocks_code": "코드 블록",
+  "header_transcript_blocks_system": "시스템 경계",
   "header_actions_follow_latest": "최신 메시지 따라가기",
   "header_actions_toggle_sort": "정렬 순서 전환 (o)",
   "header_actions_cycle_layout": "레이아웃 전환: {layout} (l)",

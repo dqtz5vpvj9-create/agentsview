@@ -1020,8 +1020,69 @@ describe("hasVisibleSegments", () => {
   }
 
   const allBlocksVisible = visibilityFrom(
-    new Set(["user", "assistant", "thinking", "tool", "code"]),
+    new Set([
+      "user",
+      "assistant",
+      "thinking",
+      "tool",
+      "code",
+      "system",
+    ]),
   );
+
+  it("boundary card answers to the system filter, not its user role", () => {
+    const m = makeMsg({
+      role: "user",
+      content:
+        "<task-notification>\n<status>completed</status>\n</task-notification>",
+      is_system: true,
+      source_subtype: "task_notification",
+    });
+    const noSystem = visibilityFrom(
+      new Set(["user", "assistant", "thinking", "tool", "code"]),
+    );
+    const noUser = visibilityFrom(
+      new Set(["assistant", "thinking", "tool", "code", "system"]),
+    );
+
+    expect(hasVisibleSegments(m, noSystem)).toBe(false);
+    expect(hasVisibleSegments(m, noUser)).toBe(true);
+  });
+
+  it("boundary card ignores the filters its body would parse into", () => {
+    const body = "```sh\nexit 2\n```";
+    const noCode = visibilityFrom(
+      new Set(["user", "assistant", "thinking", "tool", "system"]),
+    );
+    // Control: the same body outside a boundary card is code-only, so the
+    // code filter does hide it. The card itself renders a label and a
+    // one-line preview, so that filter must not reach it.
+    const plain = makeMsg({ role: "user", content: body });
+    const card = makeMsg({
+      role: "user",
+      content: body,
+      is_system: true,
+      source_subtype: "stop_hook",
+    });
+
+    expect(hasVisibleSegments(plain, noCode)).toBe(false);
+    expect(hasVisibleSegments(card, noCode)).toBe(true);
+  });
+
+  it("compact boundary is not governed by the system filter", () => {
+    const m = makeMsg({
+      role: "user",
+      content: "Session summary",
+      is_system: true,
+      is_compact_boundary: true,
+      source_subtype: "compact_boundary",
+    });
+    const noSystem = visibilityFrom(
+      new Set(["user", "assistant", "thinking", "tool", "code"]),
+    );
+
+    expect(hasVisibleSegments(m, noSystem)).toBe(true);
+  });
 
   it("tool-only message hidden when tool filter is off", () => {
     const m = makeMsg({

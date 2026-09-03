@@ -12,7 +12,13 @@ import {
   SIDEBAR_WIDTH_MIN,
   SIDEBAR_WIDTH_STORAGE_MAX,
 } from "../components/layout/sidebar-width.js";
-import { ui } from "./ui.svelte.js";
+import {
+  ALL_BLOCK_TYPES,
+  parseBlockFilters,
+  serializeBlockFilters,
+  ui,
+  type BlockType,
+} from "./ui.svelte.js";
 
 describe("UIStore", () => {
   beforeEach(() => {
@@ -776,6 +782,59 @@ describe("UIStore", () => {
       expect(ui.isBlockVisible("thinking")).toBe(true);
       expect(ui.isBlockVisible("code")).toBe(true);
       expect(ui.isBlockVisible("assistant")).toBe(true);
+      expect(ui.isBlockVisible("system")).toBe(true);
+    });
+
+    it("keeps system boundaries visible for a payload stored before that block existed", () => {
+      // Written by a build whose vocabulary ended at "code", with the code
+      // block hidden. "system" is missing because it did not exist yet, not
+      // because the reader turned it off.
+      const legacy = JSON.stringify([
+        "user",
+        "assistant",
+        "thinking",
+        "tool",
+      ]);
+
+      const visible = parseBlockFilters(legacy);
+
+      expect(visible.has("code")).toBe(false);
+      expect(visible.has("system")).toBe(true);
+    });
+
+    it("keeps a hidden system boundary hidden across a reload", () => {
+      const visible = parseBlockFilters(
+        JSON.stringify({ hidden: ["system"] }),
+      );
+
+      expect(visible.has("system")).toBe(false);
+      expect(visible.has("user")).toBe(true);
+    });
+
+    it("restores the same hidden set it stored", () => {
+      const chosen = new Set<BlockType>(ALL_BLOCK_TYPES);
+      chosen.delete("system");
+      chosen.delete("tool");
+
+      const restored = parseBlockFilters(
+        serializeBlockFilters(chosen),
+      );
+
+      expect([...restored].sort()).toEqual([
+        "assistant",
+        "code",
+        "thinking",
+        "user",
+      ]);
+    });
+
+    it("shows every block when the stored payload is missing or unreadable", () => {
+      expect(parseBlockFilters(null).size).toBe(
+        ALL_BLOCK_TYPES.length,
+      );
+      expect(parseBlockFilters("{not json").size).toBe(
+        ALL_BLOCK_TYPES.length,
+      );
     });
 
     it("should toggle a block type off and on", () => {
