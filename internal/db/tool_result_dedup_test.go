@@ -375,7 +375,12 @@ func TestOmittedResultContentLengthRoundTrips(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, msgs, 1)
 		require.Len(t, msgs[0].ToolCalls, 1)
-		return msgs[0].ToolCalls[0]
+		tc := msgs[0].ToolCalls[0]
+		for _, ev := range tc.ResultEvents {
+			assert.Equal(t, len(ev.Content), ev.ContentLength,
+				"event length is inferred when omitted")
+		}
+		return tc
 	}
 
 	t.Run("InsertMessages", func(t *testing.T) {
