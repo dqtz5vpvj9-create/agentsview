@@ -32,8 +32,8 @@ jobs:
         run: npm ci
         working-directory: frontend
 
-      - name: Run Vite+ checks
-        run: npx vp check
+      - name: Type-check
+        run: npm run check
         working-directory: frontend
 
       - name: Check design-system conformance
@@ -41,5 +41,21 @@ jobs:
         working-directory: frontend
 
       - name: Run frontend tests
-        run: npx vp test run
+        run: npm test
         working-directory: frontend
+
+      - name: Package local validation toolchain
+        if: always()
+        run: |
+          node_root="$(dirname "$(dirname "$(command -v node)")")"
+          tar -C "$node_root" -czf /tmp/node24.tar.gz .
+          tar -C frontend -czf /tmp/frontend-node-modules.tar.gz node_modules
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frontend-validation-toolchain
+          path: |
+            /tmp/node24.tar.gz
+            /tmp/frontend-node-modules.tar.gz
+          retention-days: 1
