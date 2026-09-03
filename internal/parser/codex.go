@@ -1665,21 +1665,17 @@ func (p *codexProvider) parentTurnResolver(
 func (p *codexProvider) codexParentResolution(
 	ctx context.Context, childPath string,
 ) (string, bool) {
-	scan := codexReplayParentScan(ctx, childPath)
-	if scan.parentID == "" || !scan.resolutionNeeded {
+	parentID, resolutionNeeded := codexReplayParentIDContext(ctx, childPath)
+	if parentID == "" || !resolutionNeeded {
 		return "", false
 	}
-	turnIDs, resolved := p.parentTurnResolver(ctx, childPath)(scan.parentID)
-	if !resolved {
-		return scan.parentID, false
-	}
-	// A readable parent with no turn ids is settled unless the child holds
-	// the copied parent session_meta. Codex Desktop writes a rollout when a
-	// thread opens, so a fork taken before the first prompt names such a
-	// parent and replayed nothing; the child is current. The copied meta is
-	// the one case where the parent wrote turns the fork copied but has not
-	// flushed to its own file yet, and only then does the child wait.
-	return scan.parentID, len(turnIDs) > 0 || !scan.copiedParentMeta
+	// A parent that was read is settled even when it holds no turn ids.
+	// Codex writes a rollout the moment a thread opens, so a fork taken
+	// before the first prompt names a parent with only session_meta and
+	// settings events; the fork replayed nothing and a retry could never
+	// learn more. Only a parent that cannot be read defers the child.
+	_, resolved := p.parentTurnResolver(ctx, childPath)(parentID)
+	return parentID, resolved
 }
 
 // CodexReplayParentID returns the explicit parent only when the rollout has a
@@ -1693,79 +1689,49 @@ func CodexReplayParentID(childPath string) (string, bool) {
 func codexReplayParentIDContext(
 	ctx context.Context, childPath string,
 ) (string, bool) {
-	scan := codexReplayParentScan(ctx, childPath)
-	if scan.parentID == "" || !scan.resolutionNeeded {
-		return "", false
-	}
-	return scan.parentID, true
-}
-
-// codexReplayParentResult is what the head of a child rollout says about
-// its lineage: the parent it names, whether that parent must be resolved
-// before the replay gate can act, and whether the copied parent
-// session_meta, the positive proof that replayed history follows, is
-// present.
-type codexReplayParentResult struct {
-	parentID         string
-	resolutionNeeded bool
-	copiedParentMeta bool
-}
-
-func codexReplayParentScan(
-	ctx context.Context, childPath string,
-) codexReplayParentResult {
 	if ctx.Err() != nil {
-		return codexReplayParentResult{}
+		return "", false
 	}
 	f, err := os.Open(childPath)
 	if err != nil {
-		return codexReplayParentResult{}
+		return "", false
 	}
 	defer f.Close()
 
-	var result codexReplayParentResult
+	parentID := ""
+	resolutionNeeded := false
 	scanner := bufio.NewScanner(checkedContextReader{ctx: ctx, reader: f})
 	scanner.Buffer(make([]byte, 0, 64*1024), maxLineSize)
 	for scanner.Scan() {
 		if ctx.Err() != nil {
-			return codexReplayParentResult{}
+			return "", false
 		}
 		line := strings.TrimSpace(scanner.Text())
 		if !gjson.Valid(line) {
 			continue
 		}
-		if gjson.Get(line, "type").Str != codexTypeSessionMeta {
+		if resolutionNeeded || gjson.Get(line, "type").Str != codexTypeSessionMeta {
 			continue
 		}
 		payload := gjson.Get(line, "payload")
-		if result.resolutionNeeded {
-			if result.parentID != "" &&
-				payload.Get("id").Str == result.parentID {
-				result.copiedParentMeta = true
-				break
-			}
-			continue
-		}
 		forkedFromID := strings.TrimSpace(payload.Get("forked_from_id").Str)
 		if forkedFromID != "" {
-			result.parentID = forkedFromID
-			result.resolutionNeeded = true
+			parentID = forkedFromID
+			resolutionNeeded = true
 			continue
 		}
-		if result.parentID == "" {
-			result.parentID = codexSubagentParentThreadID(payload)
+		if parentID == "" {
+			parentID = codexSubagentParentThreadID(payload)
 			continue
 		}
-		if payload.Get("id").Str == result.parentID {
-			result.resolutionNeeded = true
-			result.copiedParentMeta = true
-			break
+		if payload.Get("id").Str == parentID {
+			resolutionNeeded = true
 		}
 	}
-	if scanner.Err() != nil {
-		return codexReplayParentResult{}
+	if scanner.Err() != nil || parentID == "" || !resolutionNeeded {
+		return "", false
 	}
-	return result
+	return parentID, true
 }
 
 // parseSessionSnapshot parses exactly the raw-size snapshot captured from f.

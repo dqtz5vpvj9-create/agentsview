@@ -127,79 +127,13 @@ func TestCodexProviderUnresolvedParentNeedsRetry(t *testing.T) {
 	assert.Equal(t, "child answer", result.Result.Messages[1].Content)
 }
 
-func TestCodexProviderReadableParentWithoutTurnsRetriesUntilParentAdvances(
-	t *testing.T,
-) {
-	root := t.TempDir()
-	const childID = "22222222-2222-4222-8222-222222222223"
-	const parentID = "11111111-1111-4111-8111-111111111112"
-	const parentTurnID = "parent-turn-later"
-	const childTurnID = "child-turn"
-
-	parentPath := writeCodexProviderSessionContent(t, root, parentID,
-		testjsonl.JoinJSONL(testjsonl.CodexSessionMetaJSON(
-			parentID, "/workspace/project", "codex_cli_rs", tsEarly,
-		)),
-	)
-	childContent := testjsonl.JoinJSONL(
-		testjsonl.CodexForkedSessionMetaJSON(
-			childID, parentID, "/workspace/project", "codex_cli_rs", tsEarly,
-		),
-		testjsonl.CodexSessionMetaJSON(
-			parentID, "/workspace/project", "codex_cli_rs", tsEarly,
-		),
-		testjsonl.CodexTurnContextWithIDJSON(
-			"gpt-5.4", parentTurnID, tsEarlyS1,
-		),
-		testjsonl.CodexMsgJSON("user", "replayed task", tsEarlyS1),
-		testjsonl.CodexMsgJSON("assistant", "replayed answer", "2024-01-01T10:00:02Z"),
-		testjsonl.CodexTurnContextWithIDJSON(
-			"gpt-5.4", childTurnID, "2024-01-01T10:00:03Z",
-		),
-		testjsonl.CodexMsgJSON("user", "child task", "2024-01-01T10:00:03Z"),
-		testjsonl.CodexMsgJSON("assistant", "child answer", tsEarlyS5),
-	)
-	writeCodexProviderSessionContent(t, root, childID, childContent)
-
-	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
-	require.True(t, ok)
-	source := requireCodexProviderSource(t, provider, childID)
-
-	first, err := provider.Parse(t.Context(), ParseRequest{Source: source})
-	require.NoError(t, err)
-	require.Len(t, first.Results, 1)
-	require.Equal(t, DataVersionNeedsRetry, first.Results[0].DataVersion,
-		"a readable parent with no turn IDs is still unresolved")
-	require.Contains(t, first.Results[0].RetryReason, "parent turns")
-	require.Len(t, first.Results[0].Result.Messages, 4,
-		"unresolved parsing fails open until the parent becomes usable")
-
-	f, err := os.OpenFile(parentPath, os.O_APPEND|os.O_WRONLY, 0o644)
-	require.NoError(t, err)
-	_, err = f.WriteString(testjsonl.JoinJSONL(
-		testjsonl.CodexTurnContextWithIDJSON(
-			"gpt-5.4", parentTurnID, tsEarlyS1,
-		),
-	))
-	require.NoError(t, err)
-	require.NoError(t, f.Close())
-
-	second, err := provider.Parse(t.Context(), ParseRequest{Source: source})
-	require.NoError(t, err)
-	require.Len(t, second.Results, 1)
-	require.Equal(t, DataVersionCurrent, second.Results[0].DataVersion)
-	require.Empty(t, second.Results[0].RetryReason)
-	require.Len(t, second.Results[0].Result.Messages, 2)
-	require.Equal(t, "child task", second.Results[0].Result.Messages[0].Content)
-	require.Equal(t, "child answer", second.Results[0].Result.Messages[1].Content)
-}
-
 func TestCodexProviderTurnlessParentResolvesWithoutRetry(t *testing.T) {
 	// Codex Desktop writes a rollout when a thread opens; forking before the
 	// first prompt produces a parent holding only session_meta and settings
 	// events. Such a parent is present and fully readable, so the fork must
 	// parse as current instead of being marked for a retry that can never
-	// succeed and blocking every later reconciliation page behind it.
+	// succeed. Whether the child carries a copied parent session_meta is
+	// not a signal: real forks replay parent history with and without it.
 	root := t.TempDir()
 	const childID = "22222222-2222-4222-8222-222222222222"
 	const parentID = "11111111-1111-4111-8111-111111111111"
