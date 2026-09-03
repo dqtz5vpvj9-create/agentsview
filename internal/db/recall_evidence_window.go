@@ -264,9 +264,8 @@ func buildRecallEvidenceWindow(
 		       COALESCE(tc.input_json, ''),
 		       COALESCE(tc.skill_name, ''),
 		       COALESCE(tc.result_content_length, 0),
-		       COALESCE(tc.result_content, ''),
-		       COALESCE(tc.subagent_session_id, ''),
-		       COALESCE(tc.call_index, 0)
+		       `+ToolCallResultContentSQL("tc", "m.ordinal")+`,
+		       COALESCE(tc.subagent_session_id, '')
 		FROM tool_calls tc
 		JOIN messages m ON m.id = tc.message_id
 		WHERE m.session_id = ?
@@ -285,12 +284,8 @@ func buildRecallEvidenceWindow(
 		)
 	}
 	allowedToolUseIDs := make(map[string]struct{})
-	// Calls that have result events derive their summary from them on
-	// read. Remember where each call landed so one events query over the
-	// window can fill those summaries after the scan.
-	placed := make(map[[2]int]struct{ messageIndex, toolCallIndex int })
 	for toolRows.Next() {
-		var ordinal, callIndex int
+		var ordinal int
 		var toolCall RecallEvidenceWindowToolCall
 		if err := toolRows.Scan(
 			&ordinal,
@@ -302,7 +297,6 @@ func buildRecallEvidenceWindow(
 			&toolCall.ResultContentLength,
 			&toolCall.ResultContent,
 			&toolCall.SubagentSessionID,
-			&callIndex,
 		); err != nil {
 			toolRows.Close()
 			return RecallEvidenceWindow{}, fmt.Errorf(
@@ -322,12 +316,6 @@ func buildRecallEvidenceWindow(
 			window.Messages[messageIndex].ToolCalls,
 			toolCall,
 		)
-		placed[[2]int{ordinal, callIndex}] = struct {
-			messageIndex, toolCallIndex int
-		}{
-			messageIndex:  messageIndex,
-			toolCallIndex: len(window.Messages[messageIndex].ToolCalls) - 1,
-		}
 		if toolCall.ToolUseID != "" {
 			allowedToolUseIDs[toolCall.ToolUseID] = struct{}{}
 		}
@@ -343,12 +331,6 @@ func buildRecallEvidenceWindow(
 			"reading recall evidence tool calls: %w",
 			err,
 		)
-	}
-	if err := deriveRecallEvidenceResultContent(
-		ctx, queryer, window.Messages, placed, sessionID,
-		messageStartOrdinal, messageEndOrdinal,
-	); err != nil {
-		return RecallEvidenceWindow{}, err
 	}
 	window.AllowedToolUseIDs = make(
 		[]string,
@@ -908,65 +890,6 @@ func reconcileAllRecallEvidenceTx(
 		); err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-// deriveRecallEvidenceResultContent fills ResultContent for every tool call
-// in the window that has stored result events, using the same summary the
-// loaders derive. One query covers the whole ordinal range.
-func deriveRecallEvidenceResultContent(
-	ctx context.Context,
-	queryer recallEvidenceQueryer,
-	messages []RecallEvidenceWindowMessage,
-	placed map[[2]int]struct{ messageIndex, toolCallIndex int },
-	sessionID string,
-	messageStartOrdinal, messageEndOrdinal int,
-) error {
-	if len(placed) == 0 {
-		return nil
-	}
-	rows, err := queryer.QueryContext(ctx, `
-		SELECT tool_call_message_ordinal, call_index,
-		       COALESCE(agent_id, ''), content
-		FROM tool_result_events
-		WHERE session_id = ?
-		  AND tool_call_message_ordinal BETWEEN ? AND ?
-		ORDER BY tool_call_message_ordinal, call_index, event_index`,
-		sessionID, messageStartOrdinal, messageEndOrdinal,
-	)
-	if err != nil {
-		return fmt.Errorf(
-			"querying recall evidence tool result events: %w", err,
-		)
-	}
-	defer rows.Close()
-	events := make(map[[2]int][]ToolResultEvent)
-	for rows.Next() {
-		var ordinal, callIndex int
-		var ev ToolResultEvent
-		if err := rows.Scan(
-			&ordinal, &callIndex, &ev.AgentID, &ev.Content,
-		); err != nil {
-			return fmt.Errorf(
-				"scanning recall evidence tool result event: %w", err,
-			)
-		}
-		key := [2]int{ordinal, callIndex}
-		events[key] = append(events[key], ev)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf(
-			"reading recall evidence tool result events: %w", err,
-		)
-	}
-	for key, evs := range events {
-		at, ok := placed[key]
-		if !ok {
-			continue
-		}
-		messages[at.messageIndex].ToolCalls[at.toolCallIndex].ResultContent =
-			SummarizeToolResultEvents(evs)
 	}
 	return nil
 }

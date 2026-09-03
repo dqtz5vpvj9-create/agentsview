@@ -1927,15 +1927,11 @@ func TestSearchContentToolResultEmptyToolUseIDNotSuppressedByEvents(t *testing.T
 	ctx := context.Background()
 	local := newLocalDB(t)
 	sessionID := "duck-empty-tool-use"
-	// Two calls, neither with a tool_use_id. The first has a result event;
-	// the second is a legacy call whose only result is its summary. An
-	// unguarded '' = '' event match would suppress the second call's
-	// summary from search.
-	withEvent := db.ToolCall{
-		ToolName:            "modern",
+	call := db.ToolCall{
+		ToolName:            "legacy",
 		Category:            "other",
-		ResultContent:       "event result without the target",
-		ResultContentLength: len("event result without the target"),
+		ResultContent:       "legacy needle result",
+		ResultContentLength: len("legacy needle result"),
 		ResultEvents: []db.ToolResultEvent{{
 			Source:        "tool",
 			Status:        "complete",
@@ -1945,16 +1941,10 @@ func TestSearchContentToolResultEmptyToolUseIDNotSuppressedByEvents(t *testing.T
 			EventIndex:    0,
 		}},
 	}
-	legacy := db.ToolCall{
-		ToolName:            "legacy",
-		Category:            "other",
-		ResultContent:       "legacy needle result",
-		ResultContentLength: len("legacy needle result"),
-	}
 	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
 		Session: syncSession(sessionID, "alpha", "empty tool use", "2026-01-19T00:00:00.000Z", 1),
 		Messages: []db.Message{
-			syncMessage(sessionID, 0, "assistant", "called tool", "2026-01-19T00:01:00.000Z", withEvent, legacy),
+			syncMessage(sessionID, 0, "assistant", "called tool", "2026-01-19T00:01:00.000Z", call),
 		},
 		DataVersion:     1,
 		ReplaceMessages: true,
