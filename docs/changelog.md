@@ -7,19 +7,11 @@ description: Release history for AgentsView
 
 **Improvements**
 
-- Shrink large archives by storing each tool result once. Most tool calls
-  have a single result event, and the archive used to keep that text twice:
-  once as the event and once as the call's summary. The summary is no longer
-  written when it repeats the event, which removed about 40% of a multi
-  gigabyte `sessions.db` and made dashboard queries that scan tool calls
-  several times faster. The first start after upgrading runs a full resync to
-  drop the duplicates, and a PostgreSQL mirror re-pushes every session once
-  because the stored tool-call rows changed.
-- Anyone reading `sessions.db`, a PostgreSQL mirror, or raw artifact JSON
-  directly should note that `tool_calls.result_content` is now empty for those
-  calls while `result_content_length` still holds the summary size. The text
-  lives in the call's single `tool_result_events` row. The API, exports, MCP,
-  and search continue to return the result as before.
+- Shrink large archives by storing each **tool result** once instead of also
+  copying it into the call summary. Direct readers of
+  `tool_calls.result_content` now find that text in `tool_result_events`.
+  Existing archives resync on the next start, and a PostgreSQL mirror
+  re-pushes every session once.
 
 ---
 
