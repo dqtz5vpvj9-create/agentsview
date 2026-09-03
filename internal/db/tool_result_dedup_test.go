@@ -349,11 +349,11 @@ func TestSubagentLinkKeepsDedupedSummary(t *testing.T) {
 	assert.Equal(t, len("agent finished with a longer final report"), length)
 }
 
-// TestOmittedResultContentLengthRoundTrips pins the public write API: a
-// caller that supplies a summary and its single event but leaves the
-// length at zero must still read the summary back. The length is what
-// tells the loader to refill a summary the dedup dropped, so the write
-// path infers it from the summary.
+// TestOmittedResultContentLengthRoundTrips pins the public write API: the
+// stored length of a non-empty summary or event is always the text's
+// length, whatever the caller supplied, and a supplied length survives
+// only for withheld text. The length is what tells the loader to refill a
+// summary the dedup dropped, so a caller cannot break the round trip.
 func TestOmittedResultContentLengthRoundTrips(t *testing.T) {
 	const summary = "output without a declared length"
 	call := func(id string) ToolCall {
@@ -415,6 +415,38 @@ func TestOmittedResultContentLengthRoundTrips(t *testing.T) {
 		got := loaded(t, d, "s-batch-nolen")
 		assert.Equal(t, summary, got.ResultContent)
 		assert.Equal(t, len(summary), got.ResultContentLength)
+	})
+
+	t.Run("wrong length is corrected", func(t *testing.T) {
+		d := testDB(t)
+		insertSession(t, d, "s-wrong", "proj")
+		wrong := call("call_wrong")
+		wrong.ResultContentLength = len(summary) - 1
+		wrong.ResultEvents[0].ContentLength = len(summary) + 7
+		require.NoError(t, d.InsertMessages([]Message{{
+			SessionID: "s-wrong", Ordinal: 0, Role: "assistant",
+			Content: "running", HasToolUse: true,
+			ToolCalls: []ToolCall{wrong},
+		}}))
+		got := loaded(t, d, "s-wrong")
+		assert.Equal(t, summary, got.ResultContent)
+		assert.Equal(t, len(summary), got.ResultContentLength)
+	})
+
+	t.Run("withheld text keeps the supplied length", func(t *testing.T) {
+		d := testDB(t)
+		insertSession(t, d, "s-withheld", "proj")
+		require.NoError(t, d.InsertMessages([]Message{{
+			SessionID: "s-withheld", Ordinal: 0, Role: "assistant",
+			Content: "running", HasToolUse: true,
+			ToolCalls: []ToolCall{{
+				ToolName: "Read", Category: "Read", ToolUseID: "call_withheld",
+				ResultContentLength: 4096,
+			}},
+		}}))
+		got := loaded(t, d, "s-withheld")
+		assert.Empty(t, got.ResultContent)
+		assert.Equal(t, 4096, got.ResultContentLength)
 	})
 
 	t.Run("WriteSessionIncremental link", func(t *testing.T) {

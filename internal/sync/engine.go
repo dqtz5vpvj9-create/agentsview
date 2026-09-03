@@ -20076,9 +20076,15 @@ func pairToolResultsContext(
 				return err
 			}
 			if tc, ok := idx[tr.ToolUseID]; ok {
+				// A withheld result keeps the parser's size; a stored one
+				// is measured, matching the archive's write rule so change
+				// detection never sees a parser-side rounding difference.
 				tc.ResultContentLength = tr.ContentLength
 				if !blocked[tc.Category] {
 					tc.ResultContent = parser.DecodeContent(tr.ContentRaw)
+					tc.ResultContentLength = db.ResolveResultContentLength(
+						tc.ResultContent, tr.ContentLength,
+					)
 				}
 			}
 		}

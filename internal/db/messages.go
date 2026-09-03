@@ -2565,7 +2565,7 @@ func applyToolCallSubagentLinkTx(
 		return err == nil, err
 	}
 	resultContent := link.ResultContent
-	resultContentLen := inferResultContentLength(
+	resultContentLen := ResolveResultContentLength(
 		resultContent, link.ResultContentLen,
 	)
 	if blockedResultCategories[category] {
@@ -2775,7 +2775,7 @@ func resolveToolCalls(
 				ToolUseID: tc.ToolUseID,
 				InputJSON: tc.InputJSON,
 				SkillName: tc.SkillName,
-				ResultContentLength: inferResultContentLength(
+				ResultContentLength: ResolveResultContentLength(
 					tc.ResultContent, tc.ResultContentLength,
 				),
 				ResultContent: DedupToolCallResultSummary(
@@ -2790,17 +2790,18 @@ func resolveToolCalls(
 	return calls
 }
 
-// inferResultContentLength fills in the summary length a caller left at
-// zero. The length is what tells the loaders to refill a summary the dedup
-// dropped, so a caller that supplies a summary without its length would
-// otherwise get an empty summary back. Every in-tree writer already passes
-// the summary's byte length, so this only changes what direct API callers
-// see.
-func inferResultContentLength(summary string, length int) int {
-	if length == 0 && summary != "" {
-		return len(summary)
+// ResolveResultContentLength returns the length to store for a tool-result
+// summary. Non-empty text is measured; a supplied length is kept only when
+// the text is empty, which is the withheld (blocked category) and deduped
+// (single event holds the text) cases where the length records how large
+// the summary was. The same rule applies to result events. It holds by
+// construction at every write path, so a caller can neither omit the length
+// nor store one that disagrees with the text.
+func ResolveResultContentLength(text string, supplied int) int {
+	if text != "" {
+		return len(text)
 	}
-	return length
+	return supplied
 }
 
 type toolResultEventRow struct {
@@ -2816,9 +2817,9 @@ func resolveToolResultEvents(msgs []Message) []toolResultEventRow {
 		for callIndex, tc := range m.ToolCalls {
 			for eventIndex, ev := range tc.ResultEvents {
 				ev.EventIndex = eventIndex
-				if ev.ContentLength == 0 {
-					ev.ContentLength = len(ev.Content)
-				}
+				ev.ContentLength = ResolveResultContentLength(
+					ev.Content, ev.ContentLength,
+				)
 				if ev.ToolUseID == "" {
 					ev.ToolUseID = tc.ToolUseID
 				}
