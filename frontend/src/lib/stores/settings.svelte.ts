@@ -3,6 +3,7 @@ import {
   SettingsService,
   type SettingsResponse,
   type SettingsUpdateRequest,
+  type SessionProviderResponse,
   type TerminalResponse,
 } from "../api/generated/index";
 import {
@@ -28,9 +29,7 @@ interface AppSettings extends Omit<
   chart_palette: ChartPalette;
 }
 
-export interface SessionProvider {
-  id: string;
-  display_name: string;
+export interface SessionProvider extends Omit<SessionProviderResponse, "dirs"> {
   dirs: string[];
 }
 

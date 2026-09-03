@@ -53,12 +53,15 @@ function toolMsg(
   });
 }
 
-function ordinalsOf(messages: Message[], agent?: string) {
+function ordinalsOf(
+  messages: Message[],
+  keepAnswerBeforeTrailingTools = false,
+) {
   const items = buildDisplayItems(messages);
   return filterDisplayItemsByTranscriptMode(
     items,
     "focused",
-    { agent },
+    { keepAnswerBeforeTrailingTools },
   ).flatMap((item) => item.ordinals);
 }
 
@@ -97,7 +100,7 @@ describe("filterDisplayItemsByTranscriptMode", () => {
     ).toEqual([0, 3]);
   });
 
-  it("keeps that answer for Codex, which keeps working after it answers", () => {
+  it("keeps an answer when the provider supports post-answer tool work", () => {
     expect(
       ordinalsOf(
         [
@@ -106,30 +109,16 @@ describe("filterDisplayItemsByTranscriptMode", () => {
           toolMsg(2),
           userMsg(3),
         ],
-        "codex",
+        true,
       ),
     ).toEqual([0, 1, 3]);
   });
 
-  it("keeps that answer for TraeX, which shares the Codex transcript shape", () => {
-    expect(
-      ordinalsOf(
-        [
-          userMsg(0),
-          assistantMsg(1, "answer"),
-          toolMsg(2),
-          userMsg(3),
-        ],
-        "traex",
-      ),
-    ).toEqual([0, 1, 3]);
-  });
-
-  it("still shows nothing for a Codex turn that never produced text", () => {
+  it("still shows nothing when post-answer tool work produced no text", () => {
     expect(
       ordinalsOf(
         [userMsg(0), toolMsg(1), userMsg(2)],
-        "codex",
+        true,
       ),
     ).toEqual([0, 2]);
   });

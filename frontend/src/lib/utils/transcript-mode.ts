@@ -4,44 +4,25 @@ import type {
 } from "./display-items.js";
 import type { Message } from "../api/types.js";
 
-/**
- * Agents whose transcripts keep working after they answer. Codex and its fork
- * TraeX report a result mid-turn and then continue calling tools, and the next
- * user prompt often lands while that work is still running. For them trailing
- * tool calls say nothing about whether the preceding text was the turn's
- * answer, so the suppression below would hide real answers -- measured at 17%
- * of Codex turns against 0.2% of Claude turns on the same archive.
- */
-const AGENTS_THAT_WORK_PAST_THE_ANSWER = new Set(["codex", "traex"]);
-
-export function keepsAnswerAfterTrailingToolWork(
-  agent: string | undefined,
-): boolean {
-  return (
-    agent !== undefined &&
-    AGENTS_THAT_WORK_PAST_THE_ANSWER.has(agent)
-  );
-}
-
 export function filterDisplayItemsByTranscriptMode(
   items: DisplayItem[],
   mode: "normal" | "focused",
   options?: {
     isMessageVisible?: (message: Message) => boolean;
-    agent?: string;
+    keepAnswerBeforeTrailingTools?: boolean;
   },
 ): DisplayItem[] {
   if (mode === "normal") return items;
 
-  const keepAnswerAfterToolWork =
-    keepsAnswerAfterTrailingToolWork(options?.agent);
+  const keepAnswerBeforeTrailingTools =
+    options?.keepAnswerBeforeTrailingTools === true;
   const filtered: DisplayItem[] = [];
   let pendingAssistant: MessageItem | null = null;
   let toolAfterPendingAssistant = false;
 
   for (const item of items) {
     if (item.kind === "tool-group") {
-      if (pendingAssistant && !keepAnswerAfterToolWork) {
+      if (pendingAssistant && !keepAnswerBeforeTrailingTools) {
         toolAfterPendingAssistant = true;
       }
       continue;

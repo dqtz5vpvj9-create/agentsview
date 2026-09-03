@@ -6,4 +6,5 @@ export type SessionProviderResponse = {
   dirs: Array<string> | null;
   display_name: string;
   id: string;
+  post_answer_tool_work?: boolean;
 };

@@ -6,6 +6,7 @@
   import { messages } from "../../stores/messages.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
+  import { settings } from "../../stores/settings.svelte.js";
   import { readProgress } from "../../stores/read-progress.svelte.js";
   import { MessageSquareIcon } from "../../icons.js";
   import { createVirtualizer } from "../../virtual/createVirtualizer.svelte.js";
@@ -81,11 +82,17 @@
       return normalDisplayItemsAsc;
     }
 
+    const provider = settings.sessionProviders.find(
+      (candidate) => candidate.id === sessions.activeSession?.agent,
+    );
+    const keepAnswerBeforeTrailingTools =
+      provider?.post_answer_tool_work === true;
+
     if (!ui.hasBlockFilters) {
       return filterDisplayItemsByTranscriptMode(
         baseDisplayItemsAsc,
         "focused",
-        { agent: sessions.activeSession?.agent },
+        { keepAnswerBeforeTrailingTools },
       );
     }
 
@@ -93,7 +100,7 @@
       filteredDisplayItemsAsc,
       "focused",
       {
-        agent: sessions.activeSession?.agent,
+        keepAnswerBeforeTrailingTools,
         isMessageVisible: (message) =>
           hasVisibleSegments(message, (type) =>
             ui.isBlockVisible(type),
