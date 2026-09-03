@@ -139,6 +139,22 @@ must compare the same fields so incremental and resync paths agree. A no-op
 message replacement preserves existing secret findings; changed transcript
 content clears them for a fresh scan.
 
+### Tool result summaries
+
+`tool_calls.result_content` is a display summary derived from the call's
+`tool_result_events` rows at sync time. When a call has exactly one event and
+the summary equals that event's content, the summary is not stored: the column
+is empty while `result_content_length` still records the summary's size. That
+pair, an empty column with a non-zero length, tells a reader to take the text
+from the single event. Multi-event summaries, single-event summaries that
+differ from their event, calls with no events, and blocked categories store
+exactly what the parser produced. Load tool calls through the message loaders,
+which refill the summary once events are attached; a query that selects the
+column directly must apply the same fallback, and PostgreSQL and DuckDB apply
+the same write rule so their tool-call fingerprints match SQLite. Anyone
+reading the archive or a mirror by hand sees the empty column and must join
+the events table to recover the text.
+
 ## DuckDB Mirror
 
 - Treat DuckDB as a disposable read mirror of SQLite, never as a system of
