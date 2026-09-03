@@ -785,23 +785,6 @@ describe("UIStore", () => {
       expect(ui.isBlockVisible("system")).toBe(true);
     });
 
-    it("keeps system boundaries visible for a payload stored before that block existed", () => {
-      // Written by a build whose vocabulary ended at "code", with the code
-      // block hidden. "system" is missing because it did not exist yet, not
-      // because the reader turned it off.
-      const legacy = JSON.stringify([
-        "user",
-        "assistant",
-        "thinking",
-        "tool",
-      ]);
-
-      const visible = parseBlockFilters(legacy);
-
-      expect(visible.has("code")).toBe(false);
-      expect(visible.has("system")).toBe(true);
-    });
-
     it("keeps a hidden system boundary hidden across a reload", () => {
       const visible = parseBlockFilters(
         JSON.stringify({ hidden: ["system"] }),

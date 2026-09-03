@@ -58,23 +58,7 @@ const VITALS_CALLS_EXPANDED_KEY =
 const SIGNAL_PANEL_KEY = "agentsview-signal-panel";
 const FOLLOW_LATEST_KEY = "agentsview-follow-latest";
 
-// The block types the original stored payload could name. That payload listed
-// the visible types, so any type added later is missing from every stored
-// payload and must not be read back as one the reader chose to hide. The
-// current payload lists hidden types instead, which keeps a future block type
-// visible by default without another migration.
-const LEGACY_VISIBLE_BLOCK_TYPES: BlockType[] = [
-  "user",
-  "assistant",
-  "thinking",
-  "tool",
-  "code",
-];
-
-/**
- * Resolves the visible block types from a stored filter payload. Exported so
- * the stored-format migration can be exercised with literal payloads.
- */
+/** Resolves the visible block types from a stored filter payload. */
 export function parseBlockFilters(raw: string | null): Set<BlockType> {
   const hidden = parseHiddenBlocks(raw);
   return new Set(ALL_BLOCK_TYPES.filter((type) => !hidden.has(type)));
@@ -93,13 +77,6 @@ function parseHiddenBlocks(raw: string | null): Set<BlockType> {
   if (!raw) return new Set();
   try {
     const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) {
-      return new Set(
-        LEGACY_VISIBLE_BLOCK_TYPES.filter(
-          (type) => !parsed.includes(type),
-        ),
-      );
-    }
     if (parsed && Array.isArray(parsed.hidden)) {
       return new Set(knownBlockTypes(parsed.hidden));
     }
