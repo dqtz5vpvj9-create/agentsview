@@ -266,3 +266,85 @@ func TestRestoreToolCallResultContent(t *testing.T) {
 		})
 	}
 }
+
+// TestSubagentLinkKeepsDedupedSummary pins the incremental link path: a
+// linked result that repeats the call's single stored event must not
+// re-inflate result_content, while a summary the event does not carry is
+// stored as before.
+func TestSubagentLinkKeepsDedupedSummary(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s-link", "proj")
+	require.NoError(t, d.InsertMessages([]Message{{
+		SessionID:  "s-link",
+		Ordinal:    0,
+		Role:       "assistant",
+		Content:    "spawning an agent",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID:           "s-link",
+			ToolName:            "Agent",
+			Category:            "Task",
+			ToolUseID:           "call_link",
+			ResultContent:       "agent finished",
+			ResultContentLength: len("agent finished"),
+			// The event carries no ToolUseID of its own; the insert path
+			// copies the call's id onto it, so the link path could find it
+			// either way. The test pins the stored shape, not the key.
+			ResultEvents: []ToolResultEvent{{
+				Source:        "subagent_notification",
+				Status:        "completed",
+				Content:       "agent finished",
+				ContentLength: len("agent finished"),
+			}},
+		}},
+	}}))
+
+	stored := func() (string, int) {
+		var content string
+		var length int
+		require.NoError(t, d.Reader().QueryRow(`
+			SELECT COALESCE(result_content, ''),
+			       COALESCE(result_content_length, 0)
+			FROM tool_calls WHERE session_id = ? AND tool_use_id = ?`,
+			"s-link", "call_link",
+		).Scan(&content, &length))
+		return content, length
+	}
+
+	content, length := stored()
+	require.Empty(t, content, "insert must dedup the single-event summary")
+	require.Equal(t, len("agent finished"), length)
+
+	link := func(result string) {
+		require.NoError(t, d.WriteSessionIncremental("s-link", nil,
+			IncrementalSessionUpdate{
+				MsgCount:    1,
+				NextOrdinal: 1,
+				SubagentLinks: []ToolCallSubagentLink{{
+					ToolUseID:         "call_link",
+					SubagentSessionID: "agent-child",
+					ResultContent:     result,
+					ResultContentLen:  len(result),
+					HasResult:         true,
+				}},
+			}))
+	}
+
+	link("agent finished")
+	content, length = stored()
+	assert.Empty(t, content, "link repeating the event must stay deduped")
+	assert.Equal(t, len("agent finished"), length)
+
+	msgs, err := d.GetMessages(context.Background(), "s-link", 0, 10, true)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.Len(t, msgs[0].ToolCalls, 1)
+	assert.Equal(t, "agent finished", msgs[0].ToolCalls[0].ResultContent)
+	assert.Equal(t, "agent-child", msgs[0].ToolCalls[0].SubagentSessionID)
+
+	link("agent finished with a longer final report")
+	content, length = stored()
+	assert.Equal(t, "agent finished with a longer final report", content,
+		"a summary the event does not carry is stored")
+	assert.Equal(t, len("agent finished with a longer final report"), length)
+}

@@ -2489,37 +2489,27 @@ func (db *DB) SetToolCallSubagentSession(
 	return nil
 }
 
-// soleToolResultEventContentByIDTx is the tool_use_id-keyed twin of
-// soleToolResultEventContentTx, for the subagent-link path that knows the
-// call only by its tool_use_id.
-func soleToolResultEventContentByIDTx(
-	tx *sql.Tx, sessionID, toolUseID string,
-) ([]ToolResultEvent, error) {
-	if toolUseID == "" {
-		return nil, nil
-	}
-	return soleToolResultEventTx(
-		tx, sessionID+"/"+toolUseID,
-		"session_id = ? AND tool_use_id = ?",
-		sessionID, toolUseID,
-	)
-}
-
-// soleToolResultEventTx returns a one-element slice when the matched rows
-// are exactly one event, and nil for every other count, which never dedups.
-// MIN over that single row is just its content.
+// soleToolResultEventTx returns a one-element slice when the call
+// identified by (session, owning message ordinal, call index) has exactly
+// one stored result event, and nil for every other count, which never
+// dedups. The key is the same triple attachToolResultEvents and
+// ToolCallResultContentSQL use, so every site agrees on which event a
+// summary is compared against. MIN over the single row is its content.
 func soleToolResultEventTx(
-	tx *sql.Tx, label, where string, args ...any,
+	tx *sql.Tx, sessionID string, messageOrdinal, callIndex int,
 ) ([]ToolResultEvent, error) {
 	var count int
 	var content sql.NullString
 	if err := tx.QueryRow(
 		`SELECT COUNT(*), MIN(content) FROM tool_result_events
-		 WHERE `+where,
-		args...,
+		 WHERE session_id = ?
+		   AND tool_call_message_ordinal = ?
+		   AND call_index = ?`,
+		sessionID, messageOrdinal, callIndex,
 	).Scan(&count, &content); err != nil {
 		return nil, fmt.Errorf(
-			"counting tool result events for %s: %w", label, err,
+			"counting tool result events for %s/%d/%d: %w",
+			sessionID, messageOrdinal, callIndex, err,
 		)
 	}
 	if count != 1 {
@@ -2533,17 +2523,21 @@ func applyToolCallSubagentLinkTx(
 	blockedResultCategories map[string]bool,
 ) (bool, error) {
 	var toolName, category, currentSubagent, currentResultContent string
-	var currentResultContentLen int
+	var currentResultContentLen, messageOrdinal, callIndex int
 	if err := tx.QueryRow(
-		`SELECT tool_name, category, COALESCE(subagent_session_id, ''),
-		        COALESCE(result_content_length, 0),
-		        COALESCE(result_content, '')
-		 FROM tool_calls
-		 WHERE session_id = ? AND tool_use_id = ?`,
+		`SELECT tc.tool_name, tc.category,
+		        COALESCE(tc.subagent_session_id, ''),
+		        COALESCE(tc.result_content_length, 0),
+		        COALESCE(tc.result_content, ''),
+		        m.ordinal, COALESCE(tc.call_index, 0)
+		 FROM tool_calls tc
+		 JOIN messages m ON m.id = tc.message_id
+		 WHERE tc.session_id = ? AND tc.tool_use_id = ?`,
 		sessionID, link.ToolUseID,
 	).Scan(
 		&toolName, &category, &currentSubagent,
 		&currentResultContentLen, &currentResultContent,
+		&messageOrdinal, &callIndex,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
@@ -2577,8 +2571,8 @@ func applyToolCallSubagentLinkTx(
 		// A linked result carries no events of its own, but the call it
 		// targets may already have one stored. Re-storing a summary the
 		// event repeats would undo the dedup on every incremental pass.
-		sole, err := soleToolResultEventContentByIDTx(
-			tx, sessionID, link.ToolUseID,
+		sole, err := soleToolResultEventTx(
+			tx, sessionID, messageOrdinal, callIndex,
 		)
 		if err != nil {
 			return false, err
