@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { EmptyState } from "@kenn-io/kit-ui";
+  import { Button, EmptyState } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
   import { TrashIcon } from "../../icons.js";
   import { onDestroy, onMount } from "svelte";
@@ -17,7 +17,20 @@
   let trashedSessions: Session[] = $state([]);
   let loading = $state(true);
   let emptying = $state(false);
+  let loadError: { detail: string | null } | null = $state(null);
+  let emptyError: { detail: string | null } | null = $state(null);
+  let pending = $state(new Map<string, "restore" | "delete">());
+  let rowErrors = $state(new Map<string, string | null>());
   const trashRead = new LatestRead();
+
+  function errorDetail(error: unknown): string | null {
+    return error instanceof Error ? error.message : null;
+  }
+
+  function cancelTrashRead() {
+    trashRead.cancel();
+    loading = false;
+  }
 
   interface TrashResponse {
     sessions: Session[];
@@ -28,6 +41,8 @@
   });
 
   async function loadTrash() {
+    if (emptying || pending.size > 0) return;
+    loadError = null;
     const signal = trashRead.begin();
     loading = true;
     try {
@@ -38,51 +53,74 @@
       ) as unknown as TrashResponse;
       if (!trashRead.isCurrent(signal)) return;
       trashedSessions = res.sessions ?? [];
+      emptyError = null;
     } catch (e) {
       if (isAbortError(e) || !trashRead.isCurrent(signal)) return;
-      // Silently ignore — page will show empty state.
+      loadError = { detail: errorDetail(e) };
     } finally {
       if (trashRead.finish(signal)) loading = false;
     }
   }
 
-  onDestroy(() => trashRead.cancel());
+  onDestroy(cancelTrashRead);
 
-  async function restoreSession(id: string) {
+  async function changeSession(id: string, action: "restore" | "delete") {
+    if (emptying || pending.has(id) || !trashedSessions.some((s) => s.id === id)) return;
+    // A read begun before this action must not resurrect the removed row.
+    cancelTrashRead();
+    pending = new Map(pending).set(id, action);
+    const nextErrors = new Map(rowErrors);
+    nextErrors.delete(id);
+    rowErrors = nextErrors;
     try {
       configureGeneratedClient();
-      await SessionsService.postApiV1SessionsIdRestore({ id });
-      trashedSessions = trashedSessions.filter((s) => s.id !== id);
-      sessions.clearRecentlyDeleted(id);
-      sessions.invalidateFilterCaches();
-      sessions.load();
-    } catch {
-      // silently fail
+      if (action === "restore") {
+        await SessionsService.postApiV1SessionsIdRestore({ id });
+      } else {
+        await SessionsService.deleteApiV1SessionsIdPermanent({ id });
+      }
+    } catch (error) {
+      rowErrors = new Map(rowErrors).set(id, errorDetail(error));
+      return;
+    } finally {
+      const nextPending = new Map(pending);
+      nextPending.delete(id);
+      pending = nextPending;
     }
+    trashedSessions = trashedSessions.filter((s) => s.id !== id);
+    if (trashedSessions.length === 0) {
+      loadError = null;
+      emptyError = null;
+    }
+    sessions.clearRecentlyDeleted(id);
+    sessions.invalidateFilterCaches();
+    // Refreshing the sidebar is separate from the already successful action.
+    if (action === "restore") void sessions.load();
+  }
+
+  async function restoreSession(id: string) {
+    await changeSession(id, "restore");
   }
 
   async function permanentDelete(id: string) {
-    try {
-      configureGeneratedClient();
-      await SessionsService.deleteApiV1SessionsIdPermanent({ id });
-      trashedSessions = trashedSessions.filter((s) => s.id !== id);
-      sessions.clearRecentlyDeleted(id);
-      sessions.invalidateFilterCaches();
-    } catch {
-      // silently fail
-    }
+    await changeSession(id, "delete");
   }
 
   async function emptyAll() {
+    if (emptying || pending.size > 0 || trashedSessions.length === 0) return;
+    cancelTrashRead();
+    emptyError = null;
     emptying = true;
     try {
       configureGeneratedClient();
       await SessionsService.deleteApiV1Trash();
       trashedSessions = [];
+      rowErrors = new Map();
+      loadError = null;
       sessions.clearRecentlyDeleted();
       sessions.invalidateFilterCaches();
-    } catch {
-      // Silently ignore — button resets to allow retry.
+    } catch (error) {
+      emptyError = { detail: errorDetail(error) };
     } finally {
       emptying = false;
     }
@@ -95,14 +133,37 @@
 </script>
 
 <div class="trash-page">
+  {#if loadError}
+    <div class="trash-error load-error" role="alert">
+      <strong>{m.subagent_inline_failed_to_load()}</strong>
+      {#if loadError.detail}<span>{loadError.detail}</span>{/if}
+      <Button
+        size="sm"
+        surface="soft"
+        label={m.shared_retry()}
+        disabled={emptying || pending.size > 0}
+        onclick={loadTrash}
+      />
+    </div>
+  {/if}
+  {#if emptyError}
+    <div class="trash-error empty-error" role="alert">
+      <strong>{m.insights_page_error()}</strong>
+      <span>{m.trash_empty_trash()}</span>
+      {#if emptyError.detail}<span>{emptyError.detail}</span>{/if}
+    </div>
+  {/if}
   {#if loading}
-    <div class="loading-state">{m.trash_loading()}</div>
-  {:else if trashedSessions.length === 0}
-    <EmptyState title={m.trash_empty()} description={m.trash_empty_desc()}>
-      {#snippet icon()}
-        <TrashIcon size="40" strokeWidth="1.6" aria-hidden="true" />
-      {/snippet}
-    </EmptyState>
+    <div class="loading-state" class:refreshing={trashedSessions.length > 0} role="status">{m.trash_loading()}</div>
+  {/if}
+  {#if trashedSessions.length === 0}
+    {#if !loading && !loadError}
+      <EmptyState title={m.trash_empty()} description={m.trash_empty_desc()}>
+        {#snippet icon()}
+          <TrashIcon size="40" strokeWidth="1.6" aria-hidden="true" />
+        {/snippet}
+      </EmptyState>
+    {/if}
   {:else}
     <div class="trash-header">
       <TrashIcon size="18" strokeWidth="2" class="trash-icon" aria-hidden="true" />
@@ -111,7 +172,7 @@
       <button
         class="empty-all-btn"
         onclick={emptyAll}
-        disabled={emptying}
+        disabled={emptying || pending.size > 0}
       >
         {emptying ? m.trash_emptying() : m.trash_empty_trash()}
       </button>
@@ -119,7 +180,7 @@
 
     <div class="trash-list">
       {#each trashedSessions as session (session.id)}
-        <div class="trash-card">
+        <div class="trash-card" aria-busy={emptying || pending.has(session.id)}>
           <div class="trash-card-info">
             <div class="trash-card-name">{displayName(session)}</div>
             <div class="trash-card-meta">
@@ -135,10 +196,14 @@
             </div>
           </div>
           <div class="trash-card-actions">
+            {#if pending.has(session.id)}
+              <span class="row-progress" role="status">{m.subagent_inline_loading()}</span>
+            {/if}
             <button
               class="restore-btn"
               onclick={() => restoreSession(session.id)}
               title={m.trash_restore_session()}
+              disabled={emptying || pending.has(session.id)}
             >
               {m.trash_restore()}
             </button>
@@ -146,10 +211,17 @@
               class="perm-delete-btn"
               onclick={() => permanentDelete(session.id)}
               title={m.trash_permanently_delete()}
+              disabled={emptying || pending.has(session.id)}
             >
               {m.trash_delete_forever()}
             </button>
           </div>
+          {#if rowErrors.has(session.id)}
+            <div class="row-error" role="alert">
+              <strong>{m.insights_page_error()}</strong>
+              {#if rowErrors.get(session.id)}<span>{rowErrors.get(session.id)}</span>{/if}
+            </div>
+          {/if}
         </div>
       {/each}
     </div>
@@ -214,6 +286,42 @@
     font-size: 13px;
   }
 
+  .loading-state.refreshing {
+    padding: 8px 0;
+  }
+
+  .trash-error,
+  .row-error {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+  }
+
+  .trash-error {
+    padding: 12px;
+    margin-bottom: 16px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+  }
+
+  .row-error {
+    flex-basis: 100%;
+  }
+
+  .row-progress {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .trash-page button:disabled {
+    opacity: 0.55;
+    cursor: progress;
+  }
+
   .trash-list {
     display: flex;
     flex-direction: column;
@@ -222,6 +330,7 @@
 
   .trash-card {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     background: var(--bg-surface);
     border: 1px solid var(--border-muted);
@@ -236,7 +345,7 @@
   }
 
   .trash-card-info {
-    flex: 1;
+    flex: 1 1 240px;
     min-width: 0;
   }
 
@@ -252,6 +361,7 @@
 
   .trash-card-meta {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 8px;
     font-size: 10px;
@@ -282,6 +392,7 @@
 
   .trash-card-actions {
     display: flex;
+    align-items: center;
     gap: 6px;
     flex-shrink: 0;
   }
@@ -298,7 +409,7 @@
     transition: background 0.12s;
   }
 
-  .restore-btn:hover {
+  .restore-btn:hover:not(:disabled) {
     background: color-mix(in srgb, var(--accent-green) 8%, transparent);
   }
 
@@ -314,7 +425,7 @@
     transition: background 0.12s, color 0.12s;
   }
 
-  .perm-delete-btn:hover {
+  .perm-delete-btn:hover:not(:disabled) {
     background: color-mix(in srgb, var(--accent-red, #e55) 8%, transparent);
   }
 </style>
