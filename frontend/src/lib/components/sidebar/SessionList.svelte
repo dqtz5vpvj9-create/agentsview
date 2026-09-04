@@ -17,6 +17,7 @@
   import { TrashIcon, CheckIcon } from "../../icons.js";
   import { formatNumber } from "../../utils/format.js";
   import { agentColor } from "../../utils/agents.js";
+  import { getSidebarEmptyState } from "./sidebar-empty-state.js";
   import {
     type DisplayItem,
     type GroupMode,
@@ -128,6 +129,14 @@
     initialHydratedVersion === sessions.sidebarIndexVersion
       ? totalSize
       : paintedTotalSize,
+  );
+  let emptyState = $derived(
+    getSidebarEmptyState(
+      renderDisplayItems.length,
+      sessions.loading ||
+        initialHydratingVersion === sessions.sidebarIndexVersion,
+      sessions.hasActiveFilters || starred.filterOnly,
+    ),
   );
 
   let visibleItems = $derived.by(() => {
@@ -360,6 +369,11 @@
     }
   }
 
+  function clearEmptyFilters() {
+    starred.filterOnly = false;
+    sessions.clearSessionFilters();
+  }
+
   function handleScroll() {
     if (!containerRef) return;
     if (scrollRaf !== null) return;
@@ -571,120 +585,133 @@
   bind:this={containerRef}
   onscroll={handleScroll}
 >
-  <div
-    style="height: {renderTotalSize}px; width: 100%; position: relative;"
-  >
-    {#each visibleItems as item (item.id)}
-      <div
-        style="position: absolute; top: 0; left: 0; width: 100%; height: {item.height}px; transform: translateY({item.top}px);"
-      >
-        {#if item.type === "header"}
-          <button
-            class="group-header"
-            onclick={() => toggleGroup(item.label)}
-            title={groupToggleLabel(!collapsed.has(item.label), item.label)}
-            aria-label={groupToggleLabel(!collapsed.has(item.label), item.label)}
-          >
-            {#if collapsed.has(item.label)}
-              <ChevronRightIcon class="chevron" size="10" strokeWidth="2.5" aria-hidden="true" />
-            {:else}
-              <ChevronDownIcon class="chevron" size="10" strokeWidth="2.5" aria-hidden="true" />
-            {/if}
-            {#if groupMode === "agent"}
-              <span
-                class="group-dot"
-                style:background={agentColor(item.label)}
-              ></span>
-            {:else}
-              <FolderIcon class="project-icon" size="11" strokeWidth="1.8" aria-hidden="true" />
-            {/if}
-            <span class="group-name">{item.label}</span>
-            <span class="group-count">{item.count}</span>
-          </button>
-        {:else if item.type === "subagent-group" && item.group}
-          {@const subKey = `subagent:${item.group.key}`}
-          {@const subExpanded = expandedGroups.has(subKey)}
-          <button
-            class="sub-group-header"
-            style:padding-left="{8 + (item.depth ?? 1) * 16}px"
-            onclick={() => toggleChainExpand(subKey)}
-            title={groupToggleLabel(subExpanded, m.sidebar_subagents())}
-            aria-label={groupToggleLabel(subExpanded, m.sidebar_subagents())}
-          >
-            {#if subExpanded}
-              <ChevronDownIcon class="sub-group-arrow" size="10" strokeWidth="2.5" aria-hidden="true" />
-            {:else}
-              <ChevronRightIcon class="sub-group-arrow" size="10" strokeWidth="2.5" aria-hidden="true" />
-            {/if}
-            <UserRoundIcon class="sub-group-icon" size="10" strokeWidth="2" aria-hidden="true" />
-            <span class="sub-group-label">{m.sidebar_subagents()}</span>
-            <span class="sub-group-count">({item.count})</span>
-          </button>
-        {:else if item.type === "team-group" && item.group}
-          {@const teamKey = `team:${item.group.key}`}
-          {@const teamExpanded = expandedGroups.has(teamKey)}
-          <button
-            class="sub-group-header"
-            style:padding-left="{8 + (item.depth ?? 1) * 16}px"
-            onclick={() => toggleChainExpand(teamKey)}
-            title={groupToggleLabel(teamExpanded, m.sidebar_team())}
-            aria-label={groupToggleLabel(teamExpanded, m.sidebar_team())}
-          >
-            {#if teamExpanded}
-              <ChevronDownIcon class="sub-group-arrow" size="10" strokeWidth="2.5" aria-hidden="true" />
-            {:else}
-              <ChevronRightIcon class="sub-group-arrow" size="10" strokeWidth="2.5" aria-hidden="true" />
-            {/if}
-            <UsersRoundIcon class="sub-group-icon" size="12" strokeWidth="2" aria-hidden="true" />
-            <span class="sub-group-label">{m.sidebar_team()}</span>
-            <span class="sub-group-count">({item.count})</span>
-          </button>
-        {:else if item.isChild && item.session}
-          <SessionItem
-            session={item.session}
-            continuationCount={1}
-            hideAgent={groupMode === "agent"}
-            hideProject={groupMode === "project"}
-            compact
-            depth={item.depth ?? 1}
-            isLastChild={item.isLastChild ?? false}
-            selectMode={sessions.selectMode}
-            selected={sessions.selectedIds.has(item.session.id)}
-          />
-        {:else if item.group}
-          {@const primary = item.group.sessions.find(
-            (s) => s.id === item.group!.primarySessionId,
-          ) ?? item.group.sessions[0]}
-          {@const children = item.group.sessions.filter((s) => s.id !== item.group!.primarySessionId)}
-          {@const groupHasSubagents = children.some((s) => isSubagentDescendant(s, item.group!.sessions))}
-          {@const groupHasTeammates = children.some((s) => s.is_teammate ?? s.first_message?.includes("<teammate-message") ?? false)}
-          {#if primary}
+  {#if emptyState === "no-results"}
+    <div class="sidebar-empty" role="status">
+      <span>{m.command_palette_no_results()}</span>
+      <button type="button" onclick={clearEmptyFilters}>
+        {m.sidebar_filters_clear_filters()}
+      </button>
+    </div>
+  {:else if emptyState === "no-sessions"}
+    <div class="sidebar-empty" role="status">
+      <span>{m.shared_no_data()}</span>
+    </div>
+  {:else}
+    <div
+      style="height: {renderTotalSize}px; width: 100%; position: relative;"
+    >
+      {#each visibleItems as item (item.id)}
+        <div
+          style="position: absolute; top: 0; left: 0; width: 100%; height: {item.height}px; transform: translateY({item.top}px);"
+        >
+          {#if item.type === "header"}
+            <button
+              class="group-header"
+              onclick={() => toggleGroup(item.label)}
+              title={groupToggleLabel(!collapsed.has(item.label), item.label)}
+              aria-label={groupToggleLabel(!collapsed.has(item.label), item.label)}
+            >
+              {#if collapsed.has(item.label)}
+                <ChevronRightIcon class="chevron" size="10" strokeWidth="2.5" aria-hidden="true" />
+              {:else}
+                <ChevronDownIcon class="chevron" size="10" strokeWidth="2.5" aria-hidden="true" />
+              {/if}
+              {#if groupMode === "agent"}
+                <span
+                  class="group-dot"
+                  style:background={agentColor(item.label)}
+                ></span>
+              {:else}
+                <FolderIcon class="project-icon" size="11" strokeWidth="1.8" aria-hidden="true" />
+              {/if}
+              <span class="group-name">{item.label}</span>
+              <span class="group-count">{item.count}</span>
+            </button>
+          {:else if item.type === "subagent-group" && item.group}
+            {@const subKey = `subagent:${item.group.key}`}
+            {@const subExpanded = expandedGroups.has(subKey)}
+            <button
+              class="sub-group-header"
+              style:padding-left="{8 + (item.depth ?? 1) * 16}px"
+              onclick={() => toggleChainExpand(subKey)}
+              title={groupToggleLabel(subExpanded, m.sidebar_subagents())}
+              aria-label={groupToggleLabel(subExpanded, m.sidebar_subagents())}
+            >
+              {#if subExpanded}
+                <ChevronDownIcon class="sub-group-arrow" size="10" strokeWidth="2.5" aria-hidden="true" />
+              {:else}
+                <ChevronRightIcon class="sub-group-arrow" size="10" strokeWidth="2.5" aria-hidden="true" />
+              {/if}
+              <UserRoundIcon class="sub-group-icon" size="10" strokeWidth="2" aria-hidden="true" />
+              <span class="sub-group-label">{m.sidebar_subagents()}</span>
+              <span class="sub-group-count">({item.count})</span>
+            </button>
+          {:else if item.type === "team-group" && item.group}
+            {@const teamKey = `team:${item.group.key}`}
+            {@const teamExpanded = expandedGroups.has(teamKey)}
+            <button
+              class="sub-group-header"
+              style:padding-left="{8 + (item.depth ?? 1) * 16}px"
+              onclick={() => toggleChainExpand(teamKey)}
+              title={groupToggleLabel(teamExpanded, m.sidebar_team())}
+              aria-label={groupToggleLabel(teamExpanded, m.sidebar_team())}
+            >
+              {#if teamExpanded}
+                <ChevronDownIcon class="sub-group-arrow" size="10" strokeWidth="2.5" aria-hidden="true" />
+              {:else}
+                <ChevronRightIcon class="sub-group-arrow" size="10" strokeWidth="2.5" aria-hidden="true" />
+              {/if}
+              <UsersRoundIcon class="sub-group-icon" size="12" strokeWidth="2" aria-hidden="true" />
+              <span class="sub-group-label">{m.sidebar_team()}</span>
+              <span class="sub-group-count">({item.count})</span>
+            </button>
+          {:else if item.isChild && item.session}
             <SessionItem
-              session={primary}
-              continuationCount={item.group.sessions.length}
-              groupSessionIds={item.group.sessions.length > 1
-                ? item.group.sessions.map((s) => s.id)
-                : undefined}
-              groupSessions={item.group.sessions.length > 1
-                ? item.group.sessions
-                : undefined}
+              session={item.session}
+              continuationCount={1}
               hideAgent={groupMode === "agent"}
               hideProject={groupMode === "project"}
-              expanded={expandedGroups.has(item.group.key)}
-              onToggleExpand={item.group.sessions.length > 1
-                ? () => toggleChainExpand(item.group!.key)
-                : undefined}
-              depth={0}
-              hasSubagents={groupHasSubagents}
-              hasTeammates={groupHasTeammates}
+              compact
+              depth={item.depth ?? 1}
+              isLastChild={item.isLastChild ?? false}
               selectMode={sessions.selectMode}
-              selected={primary ? sessions.selectedIds.has(primary.id) : false}
+              selected={sessions.selectedIds.has(item.session.id)}
             />
+          {:else if item.group}
+            {@const primary = item.group.sessions.find(
+              (s) => s.id === item.group!.primarySessionId,
+            ) ?? item.group.sessions[0]}
+            {@const children = item.group.sessions.filter((s) => s.id !== item.group!.primarySessionId)}
+            {@const groupHasSubagents = children.some((s) => isSubagentDescendant(s, item.group!.sessions))}
+            {@const groupHasTeammates = children.some((s) => s.is_teammate ?? s.first_message?.includes("<teammate-message") ?? false)}
+            {#if primary}
+              <SessionItem
+                session={primary}
+                continuationCount={item.group.sessions.length}
+                groupSessionIds={item.group.sessions.length > 1
+                  ? item.group.sessions.map((s) => s.id)
+                  : undefined}
+                groupSessions={item.group.sessions.length > 1
+                  ? item.group.sessions
+                  : undefined}
+                hideAgent={groupMode === "agent"}
+                hideProject={groupMode === "project"}
+                expanded={expandedGroups.has(item.group.key)}
+                onToggleExpand={item.group.sessions.length > 1
+                  ? () => toggleChainExpand(item.group!.key)
+                  : undefined}
+                depth={0}
+                hasSubagents={groupHasSubagents}
+                hasTeammates={groupHasTeammates}
+                selectMode={sessions.selectMode}
+                selected={primary ? sessions.selectedIds.has(primary.id) : false}
+              />
+            {/if}
           {/if}
-        {/if}
-      </div>
-    {/each}
-  </div>
+        </div>
+      {/each}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -809,6 +836,34 @@
     flex: 1;
     overflow-y: auto;
     overflow-x: hidden;
+  }
+
+  .sidebar-empty {
+    min-height: 160px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 24px 16px;
+    color: var(--text-muted);
+    font-size: 11px;
+    text-align: center;
+  }
+
+  .sidebar-empty button {
+    padding: 4px 9px;
+    border: 1px solid var(--border-muted);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    background: var(--bg-surface);
+    cursor: pointer;
+  }
+
+  .sidebar-empty button:hover {
+    color: var(--text-primary);
+    border-color: var(--border-default);
+    background: var(--bg-surface-hover);
   }
 
   /* Group headers (agent and project) */
