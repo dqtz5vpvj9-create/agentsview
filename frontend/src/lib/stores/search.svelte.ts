@@ -160,6 +160,10 @@ export class SearchStore {
     if (project !== undefined) this.project = project;
 
     this.cancelInFlight();
+    // Invalidate the previous query before the debounce delay: Enter must not
+    // open an old hit while the input already shows the next query.
+    this.results = [];
+    this.error = null;
     if (!query.trim()) {
       this.debouncedSearch.cancel();
       this.results = [];
@@ -168,6 +172,7 @@ export class SearchStore {
       return;
     }
 
+    this.isSearching = true;
     this.debouncedSearch(query, this.project);
   }
 
@@ -228,6 +233,7 @@ export class SearchStore {
     const controller = new AbortController();
     const { signal } = controller;
     this.abortController = controller;
+    this.results = [];
     this.isSearching = true;
     this.error = null;
     const mode = this.mode;
