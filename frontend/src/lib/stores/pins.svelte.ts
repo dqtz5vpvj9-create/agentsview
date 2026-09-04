@@ -19,6 +19,7 @@ class PinsStore {
   /** All pins across all sessions (loaded for pinned tab). */
   pins: PinnedMessage[] = $state([]);
   loading: boolean = $state(false);
+  loadError: { detail: string | null } | null = $state(null);
 
   /** Message IDs that are pinned in the currently viewed session. */
   sessionPinIds: Set<number> = $state(new Set());
@@ -43,6 +44,7 @@ class PinsStore {
       this.pins = [];
     }
     this.loading = true;
+    this.loadError = null;
     const loadVer = ++this.#loadAllVersion;
     const signal = this.#allPinsRead.begin();
     const mutVer = this.#mutationVersion;
@@ -65,7 +67,7 @@ class PinsStore {
       }
     } catch (e) {
       if (isAbortError(e) || !this.#allPinsRead.isCurrent(signal)) return;
-      // Silently ignore — pins are non-critical.
+      this.loadError = { detail: e instanceof Error ? e.message : null };
     } finally {
       if (this.#allPinsRead.finish(signal)) {
         this.loading = false;
