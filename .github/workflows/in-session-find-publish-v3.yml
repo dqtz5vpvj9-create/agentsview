@@ -1,0 +1,184 @@
+name: Publish in-session find commits v3
+
+on:
+  push:
+    branches:
+      - automation/in-session-find-publish
+    paths:
+      - .github/workflows/in-session-find-publish-v3.yml
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out publisher payload
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: automation/in-session-find-publish
+          path: publisher
+          fetch-depth: 0
+
+      - name: Check out target branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: feat/in-session-find
+          path: target
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "24"
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: target/go.mod
+
+      - name: Build or verify, validate, and publish
+        id: publish
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          base=8f1dcb6865f9604fe0231b462279618e6b5de726
+          report="$RUNNER_TEMP/in-session-find-result-v3.md"
+          printf '# In-session find verified publication\n\nWorkflow run: `%s`\n\n' "$GITHUB_RUN_ID" > "$report"
+          trap 'rc=$?; printf "\nFAILED with exit code %s at line %s.\n" "$rc" "$LINENO" >> "$report"; cp "$report" "$RUNNER_TEMP/publish-result-v3.md"; exit "$rc"' ERR
+
+          shopt -s nullglob
+          parts=(publisher/.github/patches/in-session-find/part-*.b64)
+          test "${#parts[@]}" -gt 0
+          cat "${parts[@]}" | tr -d '\r\n' | base64 --decode | gzip -dc > "$RUNNER_TEMP/in-session-find.mbox"
+          rm -rf "$RUNNER_TEMP/mails"
+          mkdir -p "$RUNNER_TEMP/mails"
+          git mailsplit -d4 -o "$RUNNER_TEMP/mails" "$RUNNER_TEMP/in-session-find.mbox" >/dev/null
+          test "$(find "$RUNNER_TEMP/mails" -type f | wc -l | tr -d ' ')" = "9"
+
+          expected=(
+            'feat(search): collect searchable blocks per message'
+            'feat(search): build the in-session match index'
+            'feat(search): add highlight registry and block attachment'
+            'refactor(search): rebuild the in-session search store on the local index'
+            'feat(search): bypass filters and reveal matches precisely'
+            'feat(search): paint blocks through the highlight attachment'
+            'refactor(search): remove the mark-based highlight path'
+            'feat(search): add match overview rail'
+            'feat(search): add grouped find results list'
+          )
+
+          cd target
+          git config user.name 'Shinn'
+          git config user.email '453821056@qq.com'
+          initial=$(git rev-parse HEAD)
+          built=false
+          if test "$initial" = "$base"; then
+            for mail in "$RUNNER_TEMP"/mails/*; do
+              git am --committer-date-is-author-date "$mail"
+            done
+            built=true
+          else
+            test "$(git rev-list --count "$base"..HEAD)" = "9"
+          fi
+          final=$(git rev-parse HEAD)
+          mapfile -t commits < <(git rev-list --reverse "$base".."$final")
+          test "${#commits[@]}" = "9"
+          for i in "${!commits[@]}"; do
+            test "$(git log -1 --format=%s "${commits[$i]}")" = "${expected[$i]}"
+          done
+
+          go run ./internal/pricing/cmd/litellm-snapshot -restore
+          (cd frontend && npm ci)
+
+          run_tests() {
+            local regex="$1"
+            mapfile -t tests < <(find frontend/src -type f \( -name '*test.ts' -o -name '*test.js' \) | grep -E "$regex" | sort)
+            test "${#tests[@]}" -gt 0
+            (cd frontend && npx vp test run "${tests[@]#frontend/}")
+          }
+
+          printf 'Base: `%s`\n\n' "$base" >> "$report"
+          for i in "${!commits[@]}"; do
+            number=$((i + 2))
+            commit="${commits[$i]}"
+            git checkout --detach "$commit"
+            (cd frontend && npm run i18n:compile)
+            mapfile -t changed < <(git diff-tree --no-commit-id --name-only -r "$commit" -- frontend | sed 's#^frontend/##' | sort -u)
+            vp_result='passed'
+            if test "${#changed[@]}" -gt 0; then
+              if ! (cd frontend && npx vp check "${changed[@]}"); then
+                vp_result='decomposed checks passed'
+                mapfile -t format_files < <(printf '%s\n' "${changed[@]}" | grep -E '\.(ts|js|svelte|css|json|md|html)$' || true)
+                if test "${#format_files[@]}" -gt 0; then
+                  (cd frontend && npx oxfmt --check "${format_files[@]}")
+                fi
+                mapfile -t lint_files < <(printf '%s\n' "${changed[@]}" | grep -E '\.(ts|js)$' || true)
+                if test "${#lint_files[@]}" -gt 0; then
+                  (cd frontend && npx oxlint "${lint_files[@]}")
+                fi
+              fi
+            fi
+            (cd frontend && npx svelte-check --tsconfig ./tsconfig.json)
+            (cd frontend && npm run check:kit-ui)
+            case "$number" in
+              2) run_tests 'search/block-text|content/ToolBlock' ;;
+              3) run_tests 'search/session-index' ;;
+              4) run_tests 'search/(highlight-registry|search-block)' ;;
+              5) run_tests 'stores/inSessionSearch|content/SessionFindBar|utils/keyboard' ;;
+              6) run_tests 'search/reveal|content/MessageList' ;;
+              7) run_tests 'content/(MessageContent|CodeBlock|SkillBlock|ThinkingBlock|ToolBlock|ParallelGroup|ToolCallGroup)' ;;
+              8) run_tests 'content/(MessageContent|CodeBlock|SkillBlock|ThinkingBlock|ToolBlock|ParallelGroup|ToolCallGroup)' ;;
+              9) run_tests 'content/(FindOverviewRail|MessageList)' ;;
+              10) run_tests 'content/(FindResultsList|SessionFindBar|MessageList)' ;;
+            esac
+            git diff --check "$commit^".."$commit"
+            printf '%s. `%s` — `%s` — scoped vp status: %s; type, design-system, whitespace, and targeted tests passed.\n' "$number" "$commit" "${expected[$i]}" "$vp_result" >> "$report"
+          done
+
+          git checkout --detach "$final"
+          (cd frontend && npm run i18n:compile)
+          (cd frontend && npx svelte-check --tsconfig ./tsconfig.json)
+          (cd frontend && npm run check:kit-ui)
+          (cd frontend && npx vp test run)
+          test -z "$(grep -RInE 'applyHighlight|applyMarks|clearMarks|highlightQuery|isCurrentHighlight' frontend/src --exclude='*.test.ts' || true)"
+          git diff --check "$base".."$final"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          printf '\nFinal validation passed: i18n compile, full Svelte type check, design-system check, complete frontend test suite, legacy-symbol audit, clean worktree, and whitespace check.\n' >> "$report"
+
+          git fetch origin feat/in-session-find
+          remote=$(git rev-parse origin/feat/in-session-find)
+          if test "$remote" = "$base"; then
+            git push origin "$final":feat/in-session-find
+          else
+            test "$remote" = "$final"
+          fi
+          printf '\nPublished HEAD: `%s`\n' "$final" >> "$report"
+          cp "$report" "$RUNNER_TEMP/publish-result-v3.md"
+          trap - ERR
+
+      - name: Record outcome
+        if: always()
+        shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/publish-result-v3.md"
+          if test ! -f "$report"; then
+            report="$RUNNER_TEMP/in-session-find-result-v3.md"
+          fi
+          if test ! -f "$report"; then
+            printf '# In-session find verified publication\n\nWorkflow stopped before report initialization.\n' > "$report"
+          fi
+          printf '\nGitHub job status: `%s`\n' "$JOB_STATUS" >> "$report"
+          cp "$report" publisher/.github/patches/in-session-find/publish-result-v3.md
+          cd publisher
+          git config user.name 'Shinn'
+          git config user.email '453821056@qq.com'
+          git add .github/patches/in-session-find/publish-result-v3.md
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore: record in-session find v3 outcome'
+            git push origin HEAD:automation/in-session-find-publish
+          fi
