@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import { CopyButton, EmptyState, SearchInput } from "@kenn-io/kit-ui";
+  import { Button, CopyButton, EmptyState, SearchInput } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
   import {
     ExternalLinkIcon,
@@ -117,19 +117,38 @@
     />
   </div>
 
+  {#if pins.loadError}
+    <div class="pin-load-error" role="alert">
+      <strong>{m.subagent_inline_failed_to_load()}</strong>
+      {#if pins.loadError.detail}<span>{pins.loadError.detail}</span>{/if}
+      <Button
+        size="sm"
+        surface="soft"
+        label={m.shared_retry()}
+        onclick={() => pins.loadAll(sessions.filters.project || undefined)}
+      />
+    </div>
+  {/if}
+
   {#if pins.loading}
-    <div class="loading-state">{m.pinned_loading()}</div>
-  {:else if pins.pins.length === 0 && sessions.filters.project}
-    <EmptyState
-      title={m.pinned_none_for_project()}
-      description={m.pinned_none_for_project_hint()}
-    />
-  {:else if pins.pins.length === 0}
-    <EmptyState title={m.pinned_none()} description={m.pinned_none_hint()}>
-      {#snippet icon()}
-        <PinIcon size="40" strokeWidth="1.6" aria-hidden="true" />
-      {/snippet}
-    </EmptyState>
+    <div class="loading-state" class:refreshing={pins.pins.length > 0} role="status">{m.pinned_loading()}</div>
+  {/if}
+
+  {#if pins.pins.length === 0}
+    {#if !pins.loading && !pins.loadError}
+      {#if sessions.filters.project}
+        <EmptyState
+          title={m.pinned_none_for_project()}
+          description={m.pinned_none_for_project_hint()}
+        />
+      {:else}
+        <EmptyState title={m.pinned_none()} description={m.pinned_none_hint()}>
+          {#snippet icon()}
+            <PinIcon size="40" strokeWidth="1.6" aria-hidden="true" />
+          {/snippet}
+        </EmptyState>
+      {/if}
+    {/if}
   {:else if visiblePins.length === 0}
     <EmptyState title={m.command_palette_no_results()} />
   {:else}
@@ -249,6 +268,23 @@
     color: var(--text-muted);
     padding: 40px 0;
     font-size: 13px;
+  }
+
+  .loading-state.refreshing {
+    padding: 8px 0;
+  }
+
+  .pin-load-error {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    padding: 12px;
+    margin-bottom: 16px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
   }
 
   .pin-search {
