@@ -5,6 +5,7 @@
   import { ui } from "../../stores/ui.svelte.js";
   import { starred } from "../../stores/starred.svelte.js";
   import SessionItem from "./SessionItem.svelte";
+  import { GroupExpansionPreferences } from "./group-expansion.js";
   import SessionFilterControl from "../filters/SessionFilterControl.svelte";
   import SidebarToggleButton from "../layout/SidebarToggleButton.svelte";
   import {
@@ -22,8 +23,6 @@
     type GroupMode,
     ITEM_HEIGHT,
     OVERSCAN,
-    STORAGE_KEY_GROUP,
-    getInitialGroupMode,
     buildGroupSections,
     buildDisplayItems,
     computeTotalSize,
@@ -41,22 +40,16 @@
   let paintedDisplayItems: DisplayItem[] = $state([]);
   let paintedTotalSize = $state(0);
 
-  let groupMode: GroupMode = $state(getInitialGroupMode());
-  let manualExpanded: Set<string> = $state(new Set());
-  // Start all collapsed when grouping is first enabled.
-  let collapseAll = $state(getInitialGroupMode() !== "none");
+  const sidebarGroups = new GroupExpansionPreferences();
+  const initialGroupMode = sidebarGroups.mode();
+  let groupMode: GroupMode = $state(initialGroupMode);
+  let manualExpanded: Set<string> = $state(sidebarGroups.expanded(initialGroupMode));
   // Track which continuation chains are expanded.
   let expandedGroups: Set<string> = $state(new Set());
   let detachSidebar: (() => void) | null = null;
 
   onMount(() => {
     detachSidebar = sessions.attachSidebar();
-  });
-
-  $effect(() => {
-    if (typeof localStorage !== "undefined") {
-      localStorage.setItem(STORAGE_KEY_GROUP, groupMode);
-    }
   });
 
   let groups = $derived.by(() => {
@@ -96,9 +89,6 @@
   // render is already collapsed (no flicker).
   let collapsed = $derived.by(() => {
     if (groupMode === "none") return new Set<string>();
-    if (collapseAll) {
-      return new Set(groupSections.map((s) => s.label));
-    }
     // Invert: all labels minus the manually expanded ones.
     const all = new Set(groupSections.map((s) => s.label));
     for (const a of manualExpanded) all.delete(a);
@@ -145,8 +135,8 @@
 
   function setGroupMode(mode: GroupMode) {
     groupMode = mode;
-    collapseAll = mode !== "none";
-    manualExpanded = new Set();
+    sidebarGroups.setMode(mode);
+    manualExpanded = sidebarGroups.expanded(mode);
   }
 
   function toggleGroupByAgent() {
@@ -158,18 +148,11 @@
   }
 
   function toggleGroup(label: string) {
-    if (collapseAll) {
-      collapseAll = false;
-      manualExpanded = new Set([label]);
-    } else {
-      const next = new Set(manualExpanded);
-      if (next.has(label)) {
-        next.delete(label);
-      } else {
-        next.add(label);
-      }
-      manualExpanded = next;
-    }
+    const next = new Set(manualExpanded);
+    if (next.has(label)) next.delete(label);
+    else next.add(label);
+    manualExpanded = next;
+    sidebarGroups.save(groupMode, next);
   }
 
   function toggleChainExpand(groupKey: string) {
