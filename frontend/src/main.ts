@@ -5,6 +5,7 @@ import "@kenn-io/kit-ui/mermaid.css";
 import "./app.css";
 import { initI18n } from "./lib/i18n/index.js";
 import { installPerfFetchInstrumentation } from "./lib/stores/perf.svelte.js";
+import { installSessionRangeSelection } from "./lib/utils/session-range-selection.js";
 
 const target = document.getElementById("app");
 
@@ -13,6 +14,7 @@ if (!target) {
 }
 
 installPerfFetchInstrumentation();
+installSessionRangeSelection();
 initI18n();
 
 mount(App, { target });
