@@ -454,10 +454,7 @@ func TestUsageRollupSeededRandomParitySweep(t *testing.T) {
 	}
 }
 
-// A newer install of the same session is a valid answer, so the read accepts a
-// raised install revision instead of recapturing. Only a changed pricing hash,
-// which means the rows were priced differently, still forces a recapture.
-func TestUsageRollupQueryAcceptsNewerInstallRejectsRepricedOne(t *testing.T) {
+func TestUsageRollupQueryRejectsDifferentInstallOrPricing(t *testing.T) {
 	database := testDB(t)
 	seedUsageSnapshotSession(t, database, "session-a", "project-a",
 		"2026-08-10T09:00:00Z", 0, 10, "model-a")
@@ -477,7 +474,7 @@ func TestUsageRollupQueryAcceptsNewerInstallRejectsRepricedOne(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = cache.usageRollupQuery(t.Context(), snapshot, filter, installs, resolver)
-	assert.NoError(t, err)
+	assert.ErrorIs(t, err, errUsageCacheSourceChanged)
 	_, err = cache.db.Exec(`UPDATE usage_rollup_installs
 		SET install_revision = ? WHERE id = ?`,
 		required.InstallRevision-1, required.ID)

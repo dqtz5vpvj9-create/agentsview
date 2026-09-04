@@ -538,6 +538,80 @@ func TestUsageRollupOlderBuildCannotReplaceNewerFacts(t *testing.T) {
 	assert.Equal(t, int64(20), result.Groups[0].OutputTokens)
 }
 
+func TestUsageRollupOlderCursorBuildCannotReplaceNewerEvents(t *testing.T) {
+	database := testDB(t)
+	require.NoError(t, database.InsertCursorUsageEvents([]CursorUsageEvent{{
+		OccurredAt: "2026-08-10T09:00:00Z", Model: "cursor-model",
+		InputTokens: 1, DedupKey: "cursor-one",
+	}}))
+	filter := UsageFilter{Timezone: "UTC", SkipSessionCounts: true}
+	oldSnapshot, err := database.captureUsageQuery(
+		t.Context(), filter, usageQueryKindToken)
+	require.NoError(t, err)
+	cache, err := database.usageCache.Generation(t.Context(), oldSnapshot.DatabaseID)
+	require.NoError(t, err)
+	oldFills, err := cache.fill.Ensure(
+		t.Context(), nil, oldSnapshot.CursorHighWater)
+	require.NoError(t, err)
+	oldBuilt := make(chan struct{})
+	releaseOld := make(chan struct{})
+	var blocked atomic.Bool
+	cache.rollup.observer.beforeInstall = func(builds []usageRollupBuild) {
+		for _, build := range builds {
+			if build.SessionID != usageRollupCursorSessionID ||
+				build.FactRevision != oldSnapshot.CursorHighWater ||
+				!blocked.CompareAndSwap(false, true) {
+				continue
+			}
+			close(oldBuilt)
+			<-releaseOld
+		}
+	}
+	type cursorRollupOutcome struct {
+		installs map[string]usageRollupInstall
+		err      error
+	}
+	oldDone := make(chan cursorRollupOutcome, 1)
+	go func() {
+		installs, _, ensureErr := cache.rollup.Ensure(
+			t.Context(), oldSnapshot, oldFills,
+			export.NewPricingResolver(oldSnapshot.PricingRows))
+		oldDone <- cursorRollupOutcome{installs: installs, err: ensureErr}
+	}()
+	<-oldBuilt
+	require.NoError(t, database.InsertCursorUsageEvents([]CursorUsageEvent{{
+		OccurredAt: "2026-08-10T10:00:00Z", Model: "cursor-model",
+		InputTokens: 2, DedupKey: "cursor-two",
+	}}))
+	newSnapshot, err := database.captureUsageQuery(
+		t.Context(), filter, usageQueryKindToken)
+	require.NoError(t, err)
+	newFills, err := cache.fill.Ensure(
+		t.Context(), nil, newSnapshot.CursorHighWater)
+	require.NoError(t, err)
+	newInstalls, _, err := cache.rollup.Ensure(
+		t.Context(), newSnapshot, newFills,
+		export.NewPricingResolver(newSnapshot.PricingRows))
+	require.NoError(t, err)
+	close(releaseOld)
+	oldOutcome := <-oldDone
+	require.NoError(t, oldOutcome.err)
+	assert.Equal(t, newSnapshot.CursorHighWater,
+		oldOutcome.installs[usageRollupCursorSessionID].FactRevision)
+	assert.Equal(t, newInstalls[usageRollupCursorSessionID].InstallRevision,
+		oldOutcome.installs[usageRollupCursorSessionID].InstallRevision)
+
+	result, err := cache.usageRollupQuery(
+		t.Context(), newSnapshot, filter, newInstalls,
+		export.NewPricingResolver(newSnapshot.PricingRows))
+	require.NoError(t, err)
+	var inputTokens int64
+	for _, group := range result.Groups {
+		inputTokens += group.InputTokens
+	}
+	assert.Equal(t, int64(3), inputTokens)
+}
+
 func prepareUsageRollupTest(
 	t *testing.T, database *DB,
 ) (usageQuerySnapshot, map[string]usageFillResult, *usageCache) {

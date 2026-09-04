@@ -425,9 +425,8 @@ func readCurrentUsageFillResults(
 			&result.source.SyncMarker, &result.source.TranscriptRevision,
 			&result.source.UsageEventFingerprint, &result.InstallRevision)
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf(
-				"%w: usage facts disappeared during rollup build",
-				errUsageCacheSourceChanged)
+			results[version.SessionID] = usageFillResult{Deleted: true}
+			continue
 		}
 		if err != nil {
 			return nil, err
@@ -582,10 +581,19 @@ func installUsageRollupBuilds(
 	dates := make(map[string]bool)
 	for _, build := range builds {
 		var installID int64
-		err := conn.QueryRowContext(ctx, `SELECT id FROM usage_rollup_installs
-			WHERE timezone_id = ? AND session_id = ?`, timezoneID, build.SessionID).Scan(&installID)
+		var installedFactRevision int64
+		err := conn.QueryRowContext(ctx, `SELECT id, fact_install_revision
+			FROM usage_rollup_installs
+			WHERE timezone_id = ? AND session_id = ?`, timezoneID, build.SessionID).
+			Scan(&installID, &installedFactRevision)
 		if err != nil && err != sql.ErrNoRows {
 			return err
+		}
+		if err == nil && build.SessionID == usageRollupCursorSessionID &&
+			installedFactRevision > build.FactRevision {
+			return fmt.Errorf(
+				"%w: Cursor usage advanced during rollup build",
+				errUsageCacheSourceChanged)
 		}
 		if err == nil {
 			for _, table := range []string{
