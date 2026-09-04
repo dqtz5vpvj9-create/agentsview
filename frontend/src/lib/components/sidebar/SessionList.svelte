@@ -19,6 +19,10 @@
   import { agentColor } from "../../utils/agents.js";
   import { getSidebarEmptyState } from "./sidebar-empty-state.js";
   import {
+    readExpandedSidebarGroups,
+    writeExpandedSidebarGroups,
+  } from "./sidebar-group-memory.js";
+  import {
     type DisplayItem,
     type GroupMode,
     ITEM_HEIGHT,
@@ -33,6 +37,11 @@
     selectPrimaryId,
   } from "./session-list-utils.js";
 
+  function storedExpandedGroups(mode: GroupMode): Set<string> {
+    if (typeof localStorage === "undefined") return new Set();
+    return readExpandedSidebarGroups(mode, localStorage);
+  }
+
   let containerRef: HTMLDivElement | undefined = $state(undefined);
   let scrollTop = $state(0);
   let viewportHeight = $state(0);
@@ -42,10 +51,15 @@
   let paintedDisplayItems: DisplayItem[] = $state([]);
   let paintedTotalSize = $state(0);
 
-  let groupMode: GroupMode = $state(getInitialGroupMode());
-  let manualExpanded: Set<string> = $state(new Set());
-  // Start all collapsed when grouping is first enabled.
-  let collapseAll = $state(getInitialGroupMode() !== "none");
+  const initialGroupMode = getInitialGroupMode();
+  let groupMode: GroupMode = $state(initialGroupMode);
+  let manualExpanded: Set<string> = $state(
+    storedExpandedGroups(initialGroupMode),
+  );
+  // Start collapsed only when this grouping mode has no saved expansion.
+  let collapseAll = $state(
+    initialGroupMode !== "none" && manualExpanded.size === 0,
+  );
   // Track which continuation chains are expanded.
   let expandedGroups: Set<string> = $state(new Set());
   let detachSidebar: (() => void) | null = null;
@@ -58,6 +72,15 @@
     if (typeof localStorage !== "undefined") {
       localStorage.setItem(STORAGE_KEY_GROUP, groupMode);
     }
+  });
+
+  $effect(() => {
+    if (typeof localStorage === "undefined") return;
+    writeExpandedSidebarGroups(
+      groupMode,
+      collapseAll ? [] : manualExpanded,
+      localStorage,
+    );
   });
 
   let groups = $derived.by(() => {
@@ -154,8 +177,8 @@
 
   function setGroupMode(mode: GroupMode) {
     groupMode = mode;
-    collapseAll = mode !== "none";
-    manualExpanded = new Set();
+    manualExpanded = storedExpandedGroups(mode);
+    collapseAll = mode !== "none" && manualExpanded.size === 0;
   }
 
   function toggleGroupByAgent() {
