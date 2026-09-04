@@ -30,6 +30,11 @@ type usageFillResult struct {
 	source          usageSourceVersion
 }
 
+type usageFillInstallExpectation struct {
+	InstallRevision int64
+	Exists          bool
+}
+
 type usageFillCall struct {
 	done   chan struct{}
 	result usageFillResult
@@ -215,50 +220,90 @@ func (c *usageFillCoordinator) fillSessionsDetached(
 	if len(versions) == 0 {
 		return results, nil
 	}
-	if c.observer.beforeExtract != nil {
-		c.observer.beforeExtract(slices.Clone(versions))
-	}
-	// One archive read transaction yields both the facts and the source
-	// version they belong to, so the install never has to consult the
-	// archive again and a concurrent append cannot invalidate this fill.
-	spool, extracted, err := c.extractSessions(ctx, versions)
-	if err != nil {
-		return nil, err
-	}
-	if c.observer.afterExtract != nil {
-		c.observer.afterExtract(slices.Clone(versions))
-	}
-	stable := make([]usageSourceVersion, 0, len(versions))
-	var deleted []string
-	for _, requested := range versions {
-		if version, ok := extracted[requested.SessionID]; ok {
-			stable = append(stable, version)
-			continue
+	pending := slices.Clone(versions)
+	for sourceAttempt := 1; sourceAttempt <= usageFillMaxAttempts; sourceAttempt++ {
+		expected, err := c.captureFillInstallExpectations(pending)
+		if err != nil {
+			return nil, err
 		}
-		deleted = append(deleted, requested.SessionID)
-		results[requested.SessionID] = usageFillResult{Deleted: true}
+		if c.observer.beforeExtract != nil {
+			c.observer.beforeExtract(slices.Clone(pending))
+		}
+		// One archive read transaction yields both the facts and the source
+		// version they belong to, so the install never has to consult the
+		// archive again. The cache expectation prevents an older concurrent
+		// extraction from replacing facts installed after this attempt began.
+		spool, extracted, err := c.extractSessions(ctx, pending)
+		if err != nil {
+			return nil, err
+		}
+		if c.observer.afterExtract != nil {
+			c.observer.afterExtract(slices.Clone(pending))
+		}
+		stable := make([]usageSourceVersion, 0, len(pending))
+		var deleted []string
+		for _, requested := range pending {
+			if version, ok := extracted[requested.SessionID]; ok {
+				stable = append(stable, version)
+				continue
+			}
+			deleted = append(deleted, requested.SessionID)
+		}
+		if c.observer.beforeInstall != nil {
+			c.observer.beforeInstall(slices.Clone(stable))
+		}
+		var installed map[string]usageFillResult
+		var lost []string
+		for installAttempt := 1; installAttempt <= usageFillMaxAttempts; installAttempt++ {
+			installed, lost, err = c.installSpool(
+				ctx, spool, stable, deleted, expected)
+			if err == nil || !isUsageCacheBusy(err) {
+				break
+			}
+		}
+		closeErr := spool.Close()
+		if err != nil {
+			return nil, errors.Join(err, closeErr)
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		maps.Copy(results, installed)
+		if len(lost) == 0 {
+			return results, nil
+		}
+		lostSet := make(map[string]bool, len(lost))
+		for _, sessionID := range lost {
+			lostSet[sessionID] = true
+		}
+		next := make([]usageSourceVersion, 0, len(lost))
+		for _, version := range pending {
+			if lostSet[version.SessionID] {
+				next = append(next, version)
+			}
+		}
+		pending = next
 	}
-	if c.observer.beforeInstall != nil {
-		c.observer.beforeInstall(slices.Clone(stable))
-	}
-	// Cache-side lock contention is the only reason to try the install
-	// again; the facts themselves are already fixed by the read snapshot.
-	var installed map[string]usageFillResult
-	for attempt := 1; attempt <= usageFillMaxAttempts; attempt++ {
-		installed, err = c.installSpool(ctx, spool, stable, deleted)
-		if err == nil || !isUsageCacheBusy(err) {
-			break
+	return nil, fmt.Errorf(
+		"%w: usage cache facts kept changing during fill",
+		errUsageCacheSourceChanged)
+}
+
+func (c *usageFillCoordinator) captureFillInstallExpectations(
+	versions []usageSourceVersion,
+) (map[string]usageFillInstallExpectation, error) {
+	expected := make(map[string]usageFillInstallExpectation, len(versions))
+	for _, version := range versions {
+		cached, ok, err := c.cachedSession(version.SessionID)
+		if err != nil {
+			return nil, err
+		}
+		expected[version.SessionID] = usageFillInstallExpectation{
+			InstallRevision: cached.InstallRevision,
+			Exists:          ok,
 		}
 	}
-	closeErr := spool.Close()
-	if err != nil {
-		return nil, errors.Join(err, closeErr)
-	}
-	if closeErr != nil {
-		return nil, closeErr
-	}
-	maps.Copy(results, installed)
-	return results, nil
+	return expected, nil
 }
 
 // FillBackground performs cancellable, non-single-flight work for the daemon
@@ -686,11 +731,13 @@ const usageFillEventFactsSQL = `
 func (c *usageFillCoordinator) installSpool(
 	ctx context.Context, spool *usageFactSpool,
 	stable []usageSourceVersion, deleted []string,
-) (map[string]usageFillResult, error) {
+	expected map[string]usageFillInstallExpectation,
+) (map[string]usageFillResult, []string, error) {
 	installed := make(map[string]usageFillResult, len(stable))
 	if len(stable) == 0 && len(deleted) == 0 {
-		return installed, nil
+		return installed, nil, nil
 	}
+	var lost []string
 	// The loop body runs at least once so a batch that only removes deleted
 	// sessions still commits.
 	for start := 0; start == 0 || start < len(stable); start += usageFillInstallBatchSize {
@@ -700,40 +747,41 @@ func (c *usageFillCoordinator) installSpool(
 		if start > 0 {
 			batchDeleted = nil
 		}
-		batchInstalled, err := c.installSpoolBatch(
-			ctx, spool, stable[start:end], batchDeleted,
+		batchInstalled, batchLost, err := c.installSpoolBatch(
+			ctx, spool, stable[start:end], batchDeleted, expected,
 		)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		maps.Copy(installed, batchInstalled)
+		lost = append(lost, batchLost...)
 		if end < len(stable) {
 			c.maintainBetweenInstallBatches(ctx)
 		}
 	}
-	return installed, nil
+	return installed, lost, nil
 }
 
 func (c *usageFillCoordinator) installSpoolBatch(
 	ctx context.Context, spool *usageFactSpool, stable []usageSourceVersion,
-	deleted []string,
-) (map[string]usageFillResult, error) {
+	deleted []string, expected map[string]usageFillInstallExpectation,
+) (map[string]usageFillResult, []string, error) {
 	conn, err := c.cache.db.Conn(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer conn.Close()
 	if _, err := conn.ExecContext(ctx,
 		`ATTACH DATABASE ? AS usage_fill_spool`, spool.path,
 	); err != nil {
-		return nil, fmt.Errorf("attaching usage fact spool: %w", err)
+		return nil, nil, fmt.Errorf("attaching usage fact spool: %w", err)
 	}
 	defer func() {
 		_, _ = conn.ExecContext(context.Background(),
 			`DETACH DATABASE usage_fill_spool`)
 	}()
 	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
-		return nil, fmt.Errorf("locking usage cache for fill: %w", err)
+		return nil, nil, fmt.Errorf("locking usage cache for fill: %w", err)
 	}
 	committed := false
 	defer func() {
@@ -742,43 +790,87 @@ func (c *usageFillCoordinator) installSpoolBatch(
 		}
 	}()
 
-	results := make(map[string]usageFillResult, len(stable)+len(deleted))
+	eligibleStable := make([]usageSourceVersion, 0, len(stable))
+	eligibleDeleted := make([]string, 0, len(deleted))
+	var lost []string
+	for _, version := range stable {
+		matches, matchErr := fillInstallExpectationMatches(
+			ctx, conn, version.SessionID, expected[version.SessionID])
+		if matchErr != nil {
+			return nil, nil, matchErr
+		}
+		if matches {
+			eligibleStable = append(eligibleStable, version)
+		} else {
+			lost = append(lost, version.SessionID)
+		}
+	}
 	for _, sessionID := range deleted {
+		matches, matchErr := fillInstallExpectationMatches(
+			ctx, conn, sessionID, expected[sessionID])
+		if matchErr != nil {
+			return nil, nil, matchErr
+		}
+		if matches {
+			eligibleDeleted = append(eligibleDeleted, sessionID)
+		} else {
+			lost = append(lost, sessionID)
+		}
+	}
+	results := make(map[string]usageFillResult,
+		len(eligibleStable)+len(eligibleDeleted))
+	for _, sessionID := range eligibleDeleted {
 		results[sessionID] = usageFillResult{Deleted: true}
 	}
-	affected := append([]string(nil), deleted...)
-	for _, version := range stable {
+	affected := append([]string(nil), eligibleDeleted...)
+	for _, version := range eligibleStable {
 		affected = append(affected, version.SessionID)
 	}
 	oldIdentities, err := usageFactIdentitiesForSessions(ctx, conn, affected)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	for _, sessionID := range deleted {
+	for _, sessionID := range eligibleDeleted {
 		for _, query := range []string{
 			`DELETE FROM usage_rollup_installs WHERE session_id = ?`,
 			`DELETE FROM usage_cached_sessions WHERE session_id = ?`,
 		} {
 			if _, err := conn.ExecContext(ctx, query, sessionID); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 	}
-	stableResults, err := installSpoolSessions(ctx, conn, stable)
+	stableResults, err := installSpoolSessions(ctx, conn, eligibleStable)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	maps.Copy(results, stableResults)
 	if err := c.invalidateChangedIdentitySharers(
-		ctx, conn, oldIdentities, stable, affected,
+		ctx, conn, oldIdentities, eligibleStable, affected,
 	); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
-		return nil, fmt.Errorf("committing usage cache fill: %w", err)
+		return nil, nil, fmt.Errorf("committing usage cache fill: %w", err)
 	}
 	committed = true
-	return results, nil
+	return results, lost, nil
+}
+
+func fillInstallExpectationMatches(
+	ctx context.Context, conn *sql.Conn, sessionID string,
+	expected usageFillInstallExpectation,
+) (bool, error) {
+	var revision int64
+	err := conn.QueryRowContext(ctx, `SELECT install_revision
+		FROM usage_cached_sessions WHERE session_id = ?`, sessionID).Scan(&revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return !expected.Exists, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return expected.Exists && revision == expected.InstallRevision, nil
 }
 
 // invalidateChangedIdentitySharers compares the dedup identities a fill

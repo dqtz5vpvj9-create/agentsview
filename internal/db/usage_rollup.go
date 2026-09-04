@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"maps"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -201,7 +203,8 @@ type usageRollupCall struct {
 }
 
 type usageRollupObserver struct {
-	beforeEnsure func()
+	beforeEnsure  func()
+	beforeInstall func([]usageRollupBuild)
 }
 
 // usageRollupCoordinator aggregates committed per-session facts out of the
@@ -284,12 +287,14 @@ func (c *usageRollupCoordinator) ensureNow(
 	}
 	defer conn.Close()
 	var metrics usageRollupMetrics
-	// A concurrent fill can add a sibling to a dedup identity this build
-	// finalized, which the install transaction rejects. Reclassify against
-	// the newly committed facts instead of failing the caller.
+	currentFills := maps.Clone(fills)
+	// A concurrent fill can replace a session's facts or add a sibling to a
+	// dedup identity this build finalized. The install transaction rejects
+	// both races. Refresh committed facts before the next attempt instead of
+	// failing the caller.
 	for attempt := 1; ; attempt++ {
 		installs, done, attemptMetrics, attemptErr := c.ensureAttempt(
-			ctx, conn, identity, snapshot, fills, resolver, pricingHash)
+			ctx, conn, identity, snapshot, currentFills, resolver, pricingHash)
 		metrics.DailyRows += attemptMetrics.DailyRows
 		metrics.ExceptionRows += attemptMetrics.ExceptionRows
 		metrics.ExceptionGroups += attemptMetrics.ExceptionGroups
@@ -300,6 +305,11 @@ func (c *usageRollupCoordinator) ensureNow(
 		}
 		if done {
 			return installs, metrics, nil
+		}
+		currentFills, err = readCurrentUsageFillResults(
+			ctx, conn, snapshot.Versions)
+		if err != nil {
+			return nil, metrics, err
 		}
 		if attempt >= usageRollupMaxBuildAttempts {
 			return nil, metrics, fmt.Errorf(
@@ -376,6 +386,9 @@ func (c *usageRollupCoordinator) ensureAttempt(
 		metrics.ExceptionGroups += int64(len(groups))
 	}
 	installStarted := time.Now()
+	if c.observer.beforeInstall != nil {
+		c.observer.beforeInstall(slices.Clone(builds))
+	}
 	err = installUsageRollupBuilds(
 		ctx, conn, identity, snapshot.location, builds, cross)
 	metrics.InstallDuration = time.Since(installStarted)
@@ -398,6 +411,31 @@ func (c *usageRollupCoordinator) ensureAttempt(
 		return nil, false, metrics, nil
 	}
 	return installs, true, metrics, nil
+}
+
+func readCurrentUsageFillResults(
+	ctx context.Context, conn *sql.Conn, versions []usageSourceVersion,
+) (map[string]usageFillResult, error) {
+	results := make(map[string]usageFillResult, len(versions))
+	for _, version := range versions {
+		var result usageFillResult
+		err := conn.QueryRowContext(ctx, `SELECT source_sync_marker,
+			source_transcript_rev, usage_event_fingerprint, install_revision
+			FROM usage_cached_sessions WHERE session_id = ?`, version.SessionID).Scan(
+			&result.source.SyncMarker, &result.source.TranscriptRevision,
+			&result.source.UsageEventFingerprint, &result.InstallRevision)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf(
+				"%w: usage facts disappeared during rollup build",
+				errUsageCacheSourceChanged)
+		}
+		if err != nil {
+			return nil, err
+		}
+		result.source.SessionID = version.SessionID
+		results[version.SessionID] = result
+	}
+	return results, nil
 }
 
 func readUsageRollupInstalls(
@@ -494,6 +532,28 @@ func installUsageRollupBuilds(
 		return fmt.Errorf(
 			"%w: dedup identities gained members during rollup build",
 			errUsageCacheSourceChanged)
+	}
+	for _, build := range builds {
+		if build.SessionID == usageRollupCursorSessionID {
+			continue
+		}
+		var current usageFillResult
+		err := conn.QueryRowContext(ctx, `SELECT source_sync_marker,
+			source_transcript_rev, usage_event_fingerprint, install_revision
+			FROM usage_cached_sessions WHERE session_id = ?`, build.SessionID).Scan(
+			&current.source.SyncMarker, &current.source.TranscriptRevision,
+			&current.source.UsageEventFingerprint, &current.InstallRevision)
+		current.source.SessionID = build.SessionID
+		if errors.Is(err, sql.ErrNoRows) || err == nil &&
+			(current.InstallRevision != build.FactRevision ||
+				!current.source.Equal(build.Source)) {
+			return fmt.Errorf(
+				"%w: usage facts changed during rollup build",
+				errUsageCacheSourceChanged)
+		}
+		if err != nil {
+			return err
+		}
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := conn.ExecContext(ctx, `INSERT INTO usage_rollup_timezones(

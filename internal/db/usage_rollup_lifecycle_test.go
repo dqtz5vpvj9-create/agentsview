@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -475,6 +476,66 @@ func TestUsageRollupConnectedSnapshotChangeRebuildsOnlyChangedSession(t *testing
 	assert.Equal(t, 2, daily.Totals.InputTokens)
 	assert.Equal(t, 30, daily.Totals.OutputTokens,
 		"the changed sibling must immediately replace the snapshot winner")
+}
+
+func TestUsageRollupOlderBuildCannotReplaceNewerFacts(t *testing.T) {
+	database := testDB(t)
+	seedUsageSnapshotSession(t, database, "rollup-race", "project-a",
+		"2026-08-10T09:00:00Z", 0, 10, "model-a")
+	oldSnapshot, oldFills, cache := prepareUsageRollupTest(t, database)
+	oldRevision := oldFills["rollup-race"].InstallRevision
+	oldBuilt := make(chan struct{})
+	releaseOld := make(chan struct{})
+	var blocked atomic.Bool
+	cache.rollup.observer.beforeInstall = func(builds []usageRollupBuild) {
+		if len(builds) != 1 || builds[0].FactRevision != oldRevision ||
+			!blocked.CompareAndSwap(false, true) {
+			return
+		}
+		close(oldBuilt)
+		<-releaseOld
+	}
+	type rollupOutcome struct {
+		installs map[string]usageRollupInstall
+		err      error
+	}
+	oldDone := make(chan rollupOutcome, 1)
+	go func() {
+		installs, _, ensureErr := cache.rollup.Ensure(
+			t.Context(), oldSnapshot, oldFills,
+			export.NewPricingResolver(oldSnapshot.PricingRows))
+		oldDone <- rollupOutcome{installs: installs, err: ensureErr}
+	}()
+	<-oldBuilt
+	tx, err := database.getWriter().BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	_, err = tx.Exec(`UPDATE messages SET token_usage = '{"output_tokens":20}'
+		WHERE session_id = 'rollup-race'`)
+	require.NoError(t, err)
+	_, err = tx.Exec(`UPDATE sessions SET transcript_revision = 'newer'
+		WHERE id = 'rollup-race'`)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+	newSnapshot, newFills, _ := prepareUsageRollupTest(t, database)
+	newInstalls, _, err := cache.rollup.Ensure(
+		t.Context(), newSnapshot, newFills,
+		export.NewPricingResolver(newSnapshot.PricingRows))
+	require.NoError(t, err)
+	close(releaseOld)
+	oldOutcome := <-oldDone
+	require.NoError(t, oldOutcome.err)
+	assert.Equal(t, newInstalls["rollup-race"].InstallRevision,
+		oldOutcome.installs["rollup-race"].InstallRevision)
+
+	filter := UsageFilter{
+		From: "2026-08-10", To: "2026-08-10", Timezone: "UTC",
+	}
+	result, err := cache.usageRollupQuery(
+		t.Context(), newSnapshot, filter, oldOutcome.installs,
+		export.NewPricingResolver(newSnapshot.PricingRows))
+	require.NoError(t, err)
+	require.Len(t, result.Groups, 1)
+	assert.Equal(t, int64(20), result.Groups[0].OutputTokens)
 }
 
 func prepareUsageRollupTest(

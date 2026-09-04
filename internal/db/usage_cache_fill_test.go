@@ -221,6 +221,76 @@ func TestUsageFillCoordinatorDoesNotJoinOlderSourceVersion(t *testing.T) {
 	require.NoError(t, <-oldDone)
 }
 
+func TestUsageFillOlderExtractionCannotReplaceNewerCachedFacts(t *testing.T) {
+	database := usageCandidateFixture(t)
+	snapshot, err := database.captureUsageQuery(
+		t.Context(), UsageFilter{}, usageQueryKindToken)
+	require.NoError(t, err)
+	cache, err := database.usageCache.Generation(t.Context(), snapshot.DatabaseID)
+	require.NoError(t, err)
+	var oldVersion usageSourceVersion
+	for _, version := range snapshot.Versions {
+		if version.SessionID == "inside-message" {
+			oldVersion = version
+			break
+		}
+	}
+	require.Equal(t, "inside-message", oldVersion.SessionID)
+	oldExtracted := make(chan struct{})
+	releaseOld := make(chan struct{})
+	var oldExtractions atomic.Int32
+	cache.fill.observer.afterExtract = func(versions []usageSourceVersion) {
+		if versions[0].TranscriptRevision != oldVersion.TranscriptRevision {
+			return
+		}
+		if oldExtractions.Add(1) == 1 {
+			close(oldExtracted)
+			<-releaseOld
+		}
+	}
+	type fillOutcome struct {
+		results map[string]usageFillResult
+		err     error
+	}
+	oldDone := make(chan fillOutcome, 1)
+	go func() {
+		results, fillErr := cache.fill.Ensure(
+			t.Context(), []usageSourceVersion{oldVersion}, 0)
+		oldDone <- fillOutcome{results: results, err: fillErr}
+	}()
+	<-oldExtracted
+	tx, err := database.getWriter().BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	_, err = tx.Exec(`UPDATE messages SET token_usage = '{"input_tokens":9}'
+		WHERE session_id = ?`, oldVersion.SessionID)
+	require.NoError(t, err)
+	_, err = tx.Exec(`UPDATE sessions SET transcript_revision = 'newer'
+		WHERE id = ?`, oldVersion.SessionID)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+	current, err := cache.fill.recheckSourceVersions(
+		t.Context(), []usageSourceVersion{{SessionID: oldVersion.SessionID}})
+	require.NoError(t, err)
+	newVersion := current[oldVersion.SessionID]
+	newResults, err := cache.fill.Ensure(
+		t.Context(), []usageSourceVersion{newVersion}, 0)
+	require.NoError(t, err)
+	close(releaseOld)
+	oldOutcome := <-oldDone
+	require.NoError(t, oldOutcome.err)
+
+	assert.Equal(t, newVersion, newResults[oldVersion.SessionID].source)
+	assert.Equal(t, newVersion, oldOutcome.results[oldVersion.SessionID].source)
+	assert.Equal(t, int32(2), oldExtractions.Load(),
+		"the older fill should re-extract after losing the cache race")
+	var inputTokens int64
+	require.NoError(t, cache.db.QueryRow(`SELECT f.input_tokens
+		FROM usage_facts f JOIN usage_cached_sessions s
+		  ON s.id = f.cached_session_id
+		WHERE s.session_id = ?`, oldVersion.SessionID).Scan(&inputTokens))
+	assert.Equal(t, int64(9), inputTokens)
+}
+
 func TestUsageFillRecheckRestoresReaderBusyTimeout(t *testing.T) {
 	database := usageCandidateFixture(t)
 	database.reader.Load().SetMaxOpenConns(1)
