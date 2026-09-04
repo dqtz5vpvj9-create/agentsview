@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import { CopyButton, EmptyState } from "@kenn-io/kit-ui";
+  import { CopyButton, EmptyState, SearchInput } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
   import {
     ExternalLinkIcon,
@@ -16,6 +16,12 @@
   import { highlightCodeFences } from "../../utils/highlight-fences.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
   import { normalizeMessagePreview } from "../../utils/messages.js";
+  import { filterPins, indexPins } from "./pin-filter.js";
+
+  let filterText = $state("");
+  let pinIndex = $derived(indexPins(pins.pins, (pin) => Object.values(getSessionInfo(pin))));
+  let visiblePins = $derived(filterPins(pinIndex, filterText));
+
   $effect(() => {
     pins.loadAll(sessions.filters.project || undefined);
   });
@@ -97,8 +103,18 @@
     <PinIcon size="18" strokeWidth="2" class="pin-icon" aria-hidden="true" />
     <h2>{m.pinned_title()}</h2>
     {#if pins.pins.length > 0}
-      <span class="pin-count">{pins.pins.length}</span>
+      <span class="pin-count" role="status">{filterText.trim() ? `${visiblePins.length} / ${pins.pins.length}` : pins.pins.length}</span>
     {/if}
+  </div>
+
+  <div class="pin-search">
+    <SearchInput
+      bind:value={filterText}
+      placeholder={m.filter_dropdown_search()}
+      ariaLabel={m.filter_dropdown_search()}
+      clearLabel={m.shared_active_filters_clear_all_label()}
+      block
+    />
   </div>
 
   {#if pins.loading}
@@ -114,9 +130,11 @@
         <PinIcon size="40" strokeWidth="1.6" aria-hidden="true" />
       {/snippet}
     </EmptyState>
+  {:else if visiblePins.length === 0}
+    <EmptyState title={m.command_palette_no_results()} />
   {:else}
     <div class="pin-list">
-      {#each pins.pins as pin (pin.id)}
+      {#each visiblePins as pin (pin.id)}
         {@const info = getSessionInfo(pin)}
         {@const isExpanded = expanded.has(pin.id)}
         {@const preview = previewContent(pin.content)}
@@ -233,9 +251,13 @@
     font-size: 13px;
   }
 
+  .pin-search {
+    margin-bottom: 20px;
+  }
+
   .pin-list {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr));
     gap: 12px;
   }
 
