@@ -1,0 +1,160 @@
+name: Publish in-session find commits
+
+on:
+  push:
+    branches:
+      - automation/in-session-find-publish
+    paths:
+      - .github/workflows/in-session-find-publish.yml
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out publisher payload
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: automation/in-session-find-publish
+          path: publisher
+          fetch-depth: 0
+
+      - name: Check out target branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: feat/in-session-find
+          path: target
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "24"
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: target/go.mod
+
+      - name: Decode and inspect the nine-commit payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          parts=(publisher/.github/patches/in-session-find/part-*.b64)
+          test "${#parts[@]}" -gt 0
+          cat "${parts[@]}" | tr -d '\r\n' | base64 --decode | gzip -dc > "$RUNNER_TEMP/in-session-find.mbox"
+          mkdir -p "$RUNNER_TEMP/mails"
+          git mailsplit -d4 -o "$RUNNER_TEMP/mails" "$RUNNER_TEMP/in-session-find.mbox" >/tmp/mail-count.txt
+          count=$(find "$RUNNER_TEMP/mails" -type f | wc -l | tr -d ' ')
+          test "$count" = "9"
+          mapfile -t subjects < <(grep -h '^Subject: ' "$RUNNER_TEMP"/mails/* | sed -E 's/^Subject: (\[PATCH[^]]*\] )?//')
+          expected=(
+            'feat(search): collect searchable blocks per message'
+            'feat(search): build the in-session match index'
+            'feat(search): add highlight registry and block attachment'
+            'refactor(search): rebuild the in-session search store on the local index'
+            'feat(search): bypass filters and reveal matches precisely'
+            'feat(search): paint blocks through the highlight attachment'
+            'refactor(search): remove the mark-based highlight path'
+            'feat(search): add match overview rail'
+            'feat(search): add grouped find results list'
+          )
+          test "${#subjects[@]}" = "${#expected[@]}"
+          for i in "${!expected[@]}"; do
+            test "${subjects[$i]}" = "${expected[$i]}"
+          done
+
+      - name: Install validation dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C target rev-parse HEAD)" = "8f1dcb6865f9604fe0231b462279618e6b5de726"
+          go run ./internal/pricing/cmd/litellm-snapshot
+          npm ci
+        working-directory: target/frontend
+
+      - name: Apply and validate commits 2 through 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd target
+          git config user.name 'Shinn'
+          git config user.email '453821056@qq.com'
+          report="$RUNNER_TEMP/in-session-find-publish-result.md"
+          printf '# In-session find publication result\n\n' > "$report"
+          printf 'Base: `8f1dcb6865f9604fe0231b462279618e6b5de726`\n\n' >> "$report"
+
+          run_tests() {
+            local regex="$1"
+            mapfile -t tests < <(find frontend/src -type f \( -name '*test.ts' -o -name '*test.js' \) | grep -E "$regex" | sort)
+            test "${#tests[@]}" -gt 0
+            (cd frontend && npx vp test run "${tests[@]#frontend/}")
+          }
+
+          validate_commit() {
+            local number="$1"
+            local regex="$2"
+            mapfile -t changed < <(git diff-tree --no-commit-id --name-only -r HEAD -- frontend | sed 's#^frontend/##' | sort -u)
+            if test "${#changed[@]}" -gt 0; then
+              (cd frontend && npx vp check "${changed[@]}")
+            fi
+            (cd frontend && npx svelte-check --tsconfig ./tsconfig.json)
+            (cd frontend && npm run check:kit-ui)
+            run_tests "$regex"
+            git diff --check HEAD^
+            sha=$(git rev-parse HEAD)
+            subject=$(git log -1 --format=%s)
+            printf '%s. `%s` `%s` — scoped `vp check`, `svelte-check`, kit-ui check, whitespace check, and targeted tests passed.\n' "$number" "$sha" "$subject" >> "$report"
+          }
+
+          index=2
+          for mail in "$RUNNER_TEMP"/mails/*; do
+            git am "$mail"
+            case "$index" in
+              2) validate_commit 2 'search/block-text|content/ToolBlock' ;;
+              3) validate_commit 3 'search/session-index' ;;
+              4) validate_commit 4 'search/(highlight-registry|search-block)' ;;
+              5) validate_commit 5 'stores/inSessionSearch|content/SessionFindBar|utils/keyboard' ;;
+              6) validate_commit 6 'search/reveal|content/MessageList' ;;
+              7) validate_commit 7 'content/(MessageContent|CodeBlock|SkillBlock|ThinkingBlock|ToolBlock|ParallelGroup|ToolCallGroup)' ;;
+              8) validate_commit 8 'content/(MessageContent|CodeBlock|SkillBlock|ThinkingBlock|ToolBlock|ParallelGroup|ToolCallGroup)' ;;
+              9) validate_commit 9 'content/(FindOverviewRail|MessageList)' ;;
+              10) validate_commit 10 'content/(FindResultsList|SessionFindBar|MessageList)' ;;
+            esac
+            index=$((index + 1))
+          done
+
+          test "$index" = "11"
+          (cd frontend && npm run i18n:compile)
+          (cd frontend && npm run check)
+          (cd frontend && npm run check:kit-ui)
+          (cd frontend && npx vp test run)
+          test -z "$(grep -RInE 'applyHighlight|applyMarks|clearMarks|highlightQuery|isCurrentHighlight' frontend/src --exclude='*.test.ts' || true)"
+          git diff --check 8f1dcb6865f9604fe0231b462279618e6b5de726..HEAD
+          printf '\nFinal full validation: i18n compile, repository frontend check, kit-ui check, all frontend tests, legacy-symbol audit, and whitespace check passed.\n' >> "$report"
+          cp "$report" "$RUNNER_TEMP/publish-result.md"
+
+      - name: Publish the validated branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd target
+          git fetch origin feat/in-session-find
+          test "$(git rev-parse origin/feat/in-session-find)" = "8f1dcb6865f9604fe0231b462279618e6b5de726"
+          git push origin HEAD:feat/in-session-find
+
+      - name: Record publication result
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/publish-result.md" publisher/.github/patches/in-session-find/publish-result.md
+          cd publisher
+          git config user.name 'Shinn'
+          git config user.email '453821056@qq.com'
+          git add .github/patches/in-session-find/publish-result.md
+          git commit -m 'chore: record in-session find publication result'
+          git push origin HEAD:automation/in-session-find-publish
