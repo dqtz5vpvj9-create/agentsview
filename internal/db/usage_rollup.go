@@ -707,13 +707,3 @@ func writeUsageHashBool(digest hash.Hash, value bool) {
 		writeUsageHashInt64(digest, 0)
 	}
 }
-
-func compareStrings(left, right string) int {
-	if left < right {
-		return -1
-	}
-	if left > right {
-		return 1
-	}
-	return 0
-}
