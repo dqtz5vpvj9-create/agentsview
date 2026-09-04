@@ -38,7 +38,7 @@ function isInputFocused(): boolean {
 
 function isFindInput(): boolean {
   const el = document.activeElement;
-  return el instanceof HTMLInputElement && el.getAttribute("aria-label") === "Search query";
+  return el instanceof HTMLInputElement && el.closest(".kit-find-bar") !== null;
 }
 
 interface ShortcutOptions {
@@ -101,7 +101,7 @@ export function registerShortcuts(opts: ShortcutOptions): () => void {
     // typeahead) where native find should work normally.
     if (
       meta &&
-      e.key === "f" &&
+      e.key.toLowerCase() === "f" &&
       router.route === "sessions" &&
       sessions.activeSessionId &&
       ui.activeModal === null &&
@@ -112,13 +112,14 @@ export function registerShortcuts(opts: ShortcutOptions): () => void {
       return;
     }
 
-    // Cmd+G / Cmd+Shift+G — next/prev match while find is
+    // Cmd+G / Cmd+Shift+G and F3 / Shift+F3 — next/prev while find is
     // open on the session view. Skip when a modal is open or
     // an unrelated input has focus.
     if (
-      meta &&
-      e.key === "g" &&
+      ((meta && e.key.toLowerCase() === "g") ||
+        (!meta && !e.altKey && e.key === "F3")) &&
       router.route === "sessions" &&
+      sessions.activeSessionId &&
       inSessionSearch.isOpen &&
       ui.activeModal === null &&
       (!isInputFocused() || isFindInput())

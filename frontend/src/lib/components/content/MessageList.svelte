@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { EmptyState } from "@kenn-io/kit-ui";
   // kit-ui-check-ignore: MessageList uses the local TanStack wrapper for pinned-message scroll reconciliation and per-session measurement cache resets; kit-ui VirtualList does not expose those controls yet.
   import type { Virtualizer } from "@tanstack/virtual-core";
@@ -762,6 +762,24 @@
   export function getNormalDisplayItems(): DisplayItem[] {
     return normalDisplayItemsAsc;
   }
+
+  // The list owns scrolling. This ordinal bridge is replaced by block-range
+  // reveal in the next integration step; the search store never scrolls itself.
+  let searchRevealKey = $derived.by(() => {
+    const match = inSessionSearch.resolvedCurrent;
+    return match ? `${match.ordinal}:${match.blockKey}:${match.occurrence}` : "";
+  });
+  $effect(() => {
+    const request = inSessionSearch.revealSeq;
+    const key = searchRevealKey;
+    const sessionId = messages.sessionId;
+    if (!inSessionSearch.isActive || !key || !sessionId || !containerRef) return;
+    void request;
+    untrack(() => {
+      const ordinal = inSessionSearch.currentOrdinal;
+      if (ordinal !== null) void scrollToOrdinalInternal(ordinal);
+    });
+  });
 
   let highlightQuery = $derived(
     inSessionSearch.isOpen && inSessionSearch.query.trim().length > 0
