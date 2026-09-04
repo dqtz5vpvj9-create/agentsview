@@ -3,8 +3,9 @@
   import { copyToClipboard } from "../../utils/clipboard.js";
   import { applyHighlight, applyMarks, clearMarks, escapeHTML } from "../../utils/highlight.js";
   import { highlightToHtml } from "../../utils/syntax-highlight.js";
-  import { CopyButton } from "@kenn-io/kit-ui";
+  import { Button, CopyButton } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
+  import { CODE_PREVIEW_LINES, codeBlockView } from "./code-collapse.js";
 
   interface Props {
     content: string;
@@ -14,6 +15,13 @@
   }
 
   let { content, language, highlightQuery = "", isCurrentHighlight = false }: Props = $props();
+  let collapsedContent = $state<string | null>(null);
+  let view = $derived(codeBlockView(content, collapsedContent, highlightQuery));
+
+  function toggleCollapse() {
+    collapsedContent = view.collapsed ? null : content;
+  }
+
   let copied = $state(false);
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -84,8 +92,20 @@
   {#if language}
     <div class="code-lang">{language}</div>
   {/if}
+  {#if view.canCollapse && !highlightQuery.trim()}
+    <div class="code-disclosure">
+      <Button
+        size="sm"
+        surface="soft"
+        label={view.collapsed ? m.sidebar_row_expand() : m.sidebar_row_collapse()}
+        onclick={toggleCollapse}
+      />
+    </div>
+  {/if}
   <pre
     class="code-content"
+    class:collapsed={view.collapsed}
+    style:--preview-lines={CODE_PREVIEW_LINES}
     bind:this={preEl}
     use:applyHighlight={{ q: highlightQuery, current: isCurrentHighlight, content }}
   ><code>{@html highlighted ?? escapeHTML(content)}</code></pre>
@@ -132,6 +152,17 @@
     line-height: 1.55;
     color: var(--code-text);
     overflow-x: auto;
+  }
+
+  .code-content.collapsed {
+    max-height: calc(var(--preview-lines) * 1.55em + 24px);
+    overflow-y: hidden;
+  }
+
+  .code-disclosure {
+    display: flex;
+    justify-content: flex-end;
+    padding: 4px 44px 4px 12px;
   }
 
   .code-content code {
