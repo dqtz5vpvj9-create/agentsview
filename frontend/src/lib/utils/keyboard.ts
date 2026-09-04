@@ -43,6 +43,10 @@ function handleEscape(): void {
     ui.activeModal = null;
     return;
   }
+  if (sessions.selectMode) {
+    sessions.toggleSelectMode();
+    return;
+  }
   if (sessions.activeSessionId && !isInputFocused()) {
     sessions.deselectSession();
   }
