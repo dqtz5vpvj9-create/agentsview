@@ -1,3 +1,5 @@
+import { m } from "../i18n/index.js";
+import { isComposingKey } from "./keyboard-event.js";
 import { ui } from "../stores/ui.svelte.js";
 import { sessions } from "../stores/sessions.svelte.js";
 import { starred } from "../stores/starred.svelte.js";
@@ -26,7 +28,7 @@ function isInputFocused(): boolean {
 
 function isFindInput(): boolean {
   const el = document.activeElement;
-  return el instanceof HTMLInputElement && el.getAttribute("aria-label") === "Search query";
+  return el instanceof HTMLInputElement && el.getAttribute("aria-label") === m.session_find_search_query();
 }
 
 interface ShortcutOptions {
@@ -58,10 +60,12 @@ function activeResumeModel(sessionId: string): string {
  */
 export function registerShortcuts(opts: ShortcutOptions): () => void {
   function handler(e: KeyboardEvent) {
-    const meta = e.metaKey || e.ctrlKey;
+    if (e.defaultPrevented || isComposingKey(e)) return;
+    const meta = (e.metaKey || e.ctrlKey) && !e.altKey;
+    const modifierKey = e.key.toLowerCase();
 
     // Cmd+K — always works
-    if (meta && e.key === "k") {
+    if (meta && modifierKey === "k") {
       e.preventDefault();
       ui.activeModal = ui.activeModal === "commandPalette" ? null : "commandPalette";
       return;
@@ -73,7 +77,7 @@ export function registerShortcuts(opts: ShortcutOptions): () => void {
     // typeahead) where native find should work normally.
     if (
       meta &&
-      e.key === "f" &&
+      modifierKey === "f" &&
       router.route === "sessions" &&
       sessions.activeSessionId &&
       ui.activeModal === null &&
@@ -89,7 +93,7 @@ export function registerShortcuts(opts: ShortcutOptions): () => void {
     // an unrelated input has focus.
     if (
       meta &&
-      e.key === "g" &&
+      modifierKey === "g" &&
       router.route === "sessions" &&
       inSessionSearch.isOpen &&
       ui.activeModal === null &&
