@@ -6,9 +6,9 @@
   import SubagentInline from "./SubagentInline.svelte";
   import {
     extractToolParamMeta,
-    generateFallbackContent,
   } from "../../utils/tool-params.js";
   import type { MetaTag } from "../../utils/tool-params.js";
+  import { resolveToolInput } from "../../search/tool-input.js";
   import { m } from "../../i18n/index.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
   import { applyHighlight, escapeHTML } from "../../utils/highlight.js";
@@ -301,27 +301,11 @@
       null,
   );
 
-  /** Generate content from input_json when regex content is empty.
-   *  Try category first (e.g. "Edit"), then fall back to raw tool_name
-   *  (e.g. "apply_patch") so tools that don't match their category's
-   *  specific field patterns still get the generic key-value output. */
-  let fallbackContent = $derived.by(() => {
-    if (content || !inputParams || !toolCall) return null;
-    const cat = toolCall.category || null;
-    const result = cat ? generateFallbackContent(cat, inputParams) : null;
-    return result ?? generateFallbackContent(toolCall.tool_name, inputParams);
-  });
-
-  let isTask = $derived(
-    toolCall?.tool_name === "Task" ||
-      toolCall?.tool_name === "Agent" ||
-      toolCall?.category === "Task" ||
-      (toolCall?.tool_name?.includes("subagent") ?? false),
-  );
-
-  let taskPrompt = $derived(
-    isTask ? inputParams?.prompt ?? null : null,
-  );
+  /** Shared with the search index; copy text retains its separate full payload. */
+  let resolvedInput = $derived(resolveToolInput(toolCall, content));
+  let fallbackContent = $derived(resolvedInput.fallbackContent);
+  let isTask = $derived(resolvedInput.isTask);
+  let taskPrompt = $derived(resolvedInput.taskPrompt);
   let inputCopyFallback = $derived.by(() => {
     if (content || !inputParams || !toolCall) return null;
     const cat = toolCall.category || null;
@@ -337,7 +321,7 @@
   let contentFullyExpanded: boolean = $state(false);
 
   let displayContent = $derived.by(() => {
-    const raw = fallbackContent ?? content ?? "";
+    const raw = resolvedInput.text;
     if (!raw) return { text: "", isLong: false };
     const lines = raw.split("\n");
     const isLong = lines.length > CONTENT_PREVIEW_LINES;
@@ -358,13 +342,13 @@
   });
 
   let isDiff = $derived.by(() => {
-    const text = fallbackContent ?? content ?? "";
+    const text = resolvedInput.text;
     return text.startsWith("--- a/") || text.startsWith("@@");
   });
 
   let diffLines = $derived.by(() => {
     if (!isDiff) return [];
-    const raw = fallbackContent ?? content ?? "";
+    const raw = resolvedInput.text;
     return raw.split("\n");
   });
 
