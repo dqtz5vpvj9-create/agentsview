@@ -1,91 +1,13 @@
-name: Publish in-session find
+name: In-session find publisher staging
 
 on:
-  push:
-    branches:
-      - automation/source-export
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  publish:
+  staging:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: feat/in-session-find
-          fetch-depth: 0
-
-      - name: Apply locally completed commits when needed
-        shell: bash
-        run: |
-          set -euo pipefail
-          patch_url='https://filebin.net/oai-agentsview-find-20260903-7f3b5a9d/agentsview-local-commits.patch'
-          if curl --fail --silent --show-error --retry 3 "$patch_url" -o /tmp/in-session-find.patch; then
-            if [ -s /tmp/in-session-find.patch ] && ! git log --format=%s | grep -qx 'feat(search): add grouped find results list'; then
-              git config user.name 'github-actions[bot]'
-              git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-              git am --3way /tmp/in-session-find.patch
-            fi
-          fi
-
-      - name: Require complete implementation
-        shell: bash
-        run: |
-          set -euo pipefail
-          required=(
-            frontend/src/lib/search/dom-text.ts
-            frontend/src/lib/search/block-text.ts
-            frontend/src/lib/search/session-index.ts
-            frontend/src/lib/search/highlight-registry.ts
-            frontend/src/lib/search/search-block.ts
-            frontend/src/lib/search/reveal.ts
-            frontend/src/lib/components/content/FindOverviewRail.svelte
-            frontend/src/lib/components/content/FindResultsList.svelte
-          )
-          for path in "${required[@]}"; do test -f "$path"; done
-          if grep -RInE 'applyHighlight|highlightQuery|isCurrentHighlight' frontend/src --exclude='*.test.ts'; then
-            echo 'Legacy production search references remain.' >&2
-            exit 1
-          fi
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: '24'
-
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
-        with:
-          go-version-file: go.mod
-
-      - name: Generate pricing snapshot
-        run: go run ./internal/pricing/cmd/litellm-snapshot
-
-      - name: Install frontend dependencies
-        run: npm ci
-        working-directory: frontend
-
-      - name: Compile localization
-        run: npm run i18n:compile
-        working-directory: frontend
-
-      - name: Type-check
-        run: npm run check
-        working-directory: frontend
-
-      - name: Check design-system conformance
-        run: npm run check:kit-ui
-        working-directory: frontend
-
-      - name: Run frontend tests
-        run: npx vp test run
-        working-directory: frontend
-
-      - name: Check patch whitespace
-        run: git diff --check HEAD^..HEAD
-
-      - name: Push feature branch
-        shell: bash
-        run: |
-          set -euo pipefail
-          git push origin HEAD:feat/in-session-find
+      - run: echo "Patch payload staging branch"
