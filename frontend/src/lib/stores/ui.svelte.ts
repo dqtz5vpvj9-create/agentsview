@@ -52,6 +52,7 @@ const VITALS_CALLS_EXPANDED_KEY =
   "agentsview-session-vitals-calls-expanded";
 const SIGNAL_PANEL_KEY = "agentsview-signal-panel";
 const FOLLOW_LATEST_KEY = "agentsview-follow-latest";
+const SORT_NEWEST_FIRST_KEY = "agentsview-sort-newest-first";
 
 function readBlockFilters(): Set<BlockType> {
   try {
@@ -261,7 +262,9 @@ class UIStore {
     setHighContrast(value);
   }
 
-  sortNewestFirst: boolean = $state(false);
+  sortNewestFirst: boolean = $state(
+    readStoredBool(SORT_NEWEST_FIRST_KEY, false),
+  );
   messageLayout: MessageLayout = $state(readStoredLayout());
   transcriptMode: TranscriptMode = $state(
     readStoredTranscriptMode(),
@@ -411,6 +414,17 @@ class UIStore {
           localStorage?.setItem(
             FOLLOW_LATEST_KEY,
             String(this.followLatest),
+          );
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(
+            SORT_NEWEST_FIRST_KEY,
+            String(this.sortNewestFirst),
           );
         } catch {
           // ignore
