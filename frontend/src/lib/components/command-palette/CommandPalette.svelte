@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { isComposingKey } from "../../utils/keyboard-event.js";
+  import { hasArchiveQuery, mergePaletteResults } from "./palette-results.js";
   import { m } from "../../i18n/index.js";
   import {
     Button,
@@ -28,6 +30,7 @@
     SearchMode,
   } from "../../stores/search.svelte.js";
 
+  let composing = $state(false);
   let inputRef: HTMLInputElement | undefined = $state(undefined);
   let selectedIndex: number = $state(0);
   let inputValue: string = $state(searchStore.query ?? "");
@@ -46,31 +49,19 @@
     searchStore.resetSort();
   });
 
-  // Filtered recent sessions (client-side filter)
-  let recentSessions = $derived.by(() => {
-    if (inputValue.length > 0 && inputValue.length < 3) {
-      const q = inputValue.toLowerCase();
-      return sessions.sessions
-        .filter(
-          (s) =>
-            s.project.toLowerCase().includes(q) ||
-            (s.display_name?.toLowerCase().includes(q) ?? false) ||
-            (s.first_message?.toLowerCase().includes(q) ?? false),
-        )
-        .slice(0, 10);
-    }
-    if (!inputValue) {
-      return sessions.sessions.slice(0, 10);
-    }
-    return [];
-  });
-
-  // Combined results: search results when query >= 3 chars, else recent
-  let showSearchResults = $derived(inputValue.length >= 3);
+  let recentSessions = $derived(sessions.sessions.slice(0, 10));
+  let showSearchResults = $derived(hasArchiveQuery(inputValue));
+  let paletteResults = $derived(
+    mergePaletteResults(
+      searchStore.isSearching || searchStore.error ? [] : searchStore.results,
+      sessions.sessions,
+      inputValue,
+    ),
+  );
 
   let totalItems = $derived(
     showSearchResults
-      ? searchStore.results.length
+      ? paletteResults.length
       : recentSessions.length,
   );
 
@@ -79,14 +70,27 @@
     inputValue = target.value;
     selectedIndex = 0;
 
-    if (inputValue.length >= 3) {
+    if (composing || (e instanceof InputEvent && e.isComposing)) return;
+    if (hasArchiveQuery(inputValue)) {
       searchStore.search(inputValue, sessions.filters.project);
     } else {
       searchStore.clear();
     }
   }
 
+  function startComposition() {
+    composing = true;
+    searchStore.clear();
+    selectedIndex = 0;
+  }
+
+  function endComposition(e: CompositionEvent) {
+    composing = false;
+    handleInput(e);
+  }
+
   function handleKeydown(e: KeyboardEvent) {
+    if (composing || e.defaultPrevented || isComposingKey(e)) return;
     const interactiveTarget =
       e.target !== inputRef &&
       e.target instanceof Element &&
@@ -100,7 +104,7 @@
 
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      selectedIndex = Math.min(selectedIndex + 1, totalItems - 1);
+      selectedIndex = Math.max(0, Math.min(selectedIndex + 1, totalItems - 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       selectedIndex = Math.max(selectedIndex - 1, 0);
@@ -148,7 +152,7 @@
 
   function selectCurrent() {
     if (showSearchResults) {
-      const result = searchStore.results[selectedIndex];
+      const result = paletteResults[selectedIndex];
       if (result) {
         selectSearchResult(result);
       }
@@ -229,6 +233,8 @@
         placeholder={m.command_palette_placeholder()}
         value={inputValue}
         oninput={handleInput}
+        oncompositionstart={startComposition}
+        oncompositionend={endComposition}
       />
       <KbdBadge keys={["⎋"]} ariaLabel="Escape" />
     </div>
@@ -268,7 +274,7 @@
 
     <div class="palette-results">
       {#if showSearchResults}
-        {#if searchStore.isSearching}
+        {#if composing || searchStore.isSearching}
           <div class="palette-empty">{m.command_palette_searching()}</div>
         {:else if searchStore.error?.kind === "semantic-unavailable"}
           <SemanticSetupHelp
@@ -294,10 +300,9 @@
               <span>{searchStore.error.detail ?? m.command_palette_search_failed()}</span>
             {/if}
           </div>
-        {:else if searchStore.results.length === 0}
-          <div class="palette-empty">{m.command_palette_no_results()}</div>
-        {:else}
-          {#each searchStore.results as result, i}
+        {/if}
+        {#if !composing && paletteResults.length > 0}
+          {#each paletteResults as result, i}
             <button
               class="palette-item"
               class:selected={i === selectedIndex}
@@ -337,6 +342,8 @@
               >{stripIdPrefix(result.session_id, result.agent).slice(0, 8)}</span>
             </button>
           {/each}
+        {:else if !composing && !searchStore.isSearching && !searchStore.error}
+          <div class="palette-empty">{m.command_palette_no_results()}</div>
         {/if}
       {:else}
         <div class="palette-section-label">{m.command_palette_recent_sessions()}</div>
