@@ -7,6 +7,10 @@ import { FIND_HIGHLIGHT, CURRENT_HIGHLIGHT } from "./highlight-registry.js";
 
 class TestHighlight extends Set<AbstractRange> {
   priority = 0;
+
+  constructor(...ranges: AbstractRange[]) {
+    super(ranges);
+  }
 }
 
 const cleanups: (() => void)[] = [];

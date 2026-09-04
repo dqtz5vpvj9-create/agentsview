@@ -4,6 +4,10 @@ import { createHighlightRegistry, FIND_HIGHLIGHT, CURRENT_HIGHLIGHT } from "./hi
 
 class TestHighlight extends Set<AbstractRange> {
   priority = 0;
+
+  constructor(...ranges: AbstractRange[]) {
+    super(ranges);
+  }
 }
 
 function setup() {
