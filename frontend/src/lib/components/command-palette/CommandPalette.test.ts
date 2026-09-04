@@ -45,6 +45,8 @@ const {
       deselectSession: vi.fn(),
     },
     mockSearchStore: {
+      query: "",
+      pause: vi.fn(),
       results: [] as Array<unknown>,
       isSearching: false,
       error: null as {
@@ -173,6 +175,7 @@ async function enterSearchQuery(value = "match") {
 describe("CommandPalette", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockSearchStore.query = "";
     document.body.replaceChildren();
     // jsdom does not implement scrollIntoView
     Element.prototype.scrollIntoView = vi.fn();
@@ -219,7 +222,7 @@ describe("CommandPalette", () => {
     unmount(component);
   });
 
-  it("calls clear() and resetSort() on unmount via onDestroy", async () => {
+  it("pauses requests without discarding the query or sort on unmount", async () => {
     const component = mount(CommandPalette, {
       target: document.body,
     });
@@ -228,8 +231,19 @@ describe("CommandPalette", () => {
 
     unmount(component);
 
-    expect(mockSearchStore.clear).toHaveBeenCalledOnce();
-    expect(mockSearchStore.resetSort).toHaveBeenCalledOnce();
+    expect(mockSearchStore.pause).toHaveBeenCalledOnce();
+    expect(mockSearchStore.clear).not.toHaveBeenCalled();
+    expect(mockSearchStore.resetSort).not.toHaveBeenCalled();
+  });
+
+  it("reopens the saved query against the current project scope", async () => {
+    mockSearchStore.query = "previous query";
+    mockSessions.filters.project = "current-project";
+    const component = mount(CommandPalette, { target: document.body });
+    await tick();
+    expect(document.querySelector<HTMLInputElement>(".palette-input")?.value).toBe("previous query");
+    expect(mockSearchStore.search).toHaveBeenCalledWith("previous query", "current-project");
+    unmount(component);
   });
 
   it("copies canonical session_id to clipboard, not stripped display ID", async () => {

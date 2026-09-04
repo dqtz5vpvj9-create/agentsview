@@ -41,6 +41,7 @@ interface ContentSearchResponse {
 type SearchModeStorage = Pick<Storage, "getItem" | "setItem">;
 
 export const SEARCH_MODE_STORAGE_KEY = "agentsview-search-mode";
+export const SEARCH_SORT_STORAGE_KEY = "agentsview-search-sort";
 const SEARCH_DEBOUNCE_MS = 300;
 const PALETTE_RESULT_LIMIT = 30;
 const CONTENT_SEARCH_LIMIT = 120;
@@ -62,6 +63,14 @@ function loadMode(storage: SearchModeStorage | null): SearchMode {
       : "fulltext";
   } catch {
     return "fulltext";
+  }
+}
+
+function loadSort(storage: SearchModeStorage | null): SearchSort {
+  try {
+    return storage?.getItem(SEARCH_SORT_STORAGE_KEY) === "recency" ? "recency" : "relevance";
+  } catch {
+    return "relevance";
   }
 }
 
@@ -153,6 +162,7 @@ export class SearchStore {
   constructor(storage: SearchModeStorage | null = availableStorage()) {
     this.storage = storage;
     this.mode = loadMode(storage);
+    this.sort = loadSort(storage);
   }
 
   search(query: string, project?: string) {
@@ -194,6 +204,11 @@ export class SearchStore {
 
   setSort(sort: SearchSort) {
     this.sort = sort;
+    try {
+      this.storage?.setItem(SEARCH_SORT_STORAGE_KEY, sort);
+    } catch {
+      // Keep the in-memory choice even if persistence is unavailable.
+    }
     if (this.query.trim()) {
       this.debouncedSearch.cancel();
       this.cancelInFlight();
@@ -208,8 +223,8 @@ export class SearchStore {
     void this.executeSearch(this.query, this.project);
   }
 
-  clear() {
-    this.query = "";
+  /** Cancel view-owned work without losing the search the user is returning to. */
+  pause() {
     this.results = [];
     this.error = null;
     this.isSearching = false;
@@ -217,8 +232,13 @@ export class SearchStore {
     this.cancelInFlight();
   }
 
+  clear() {
+    this.pause();
+    this.query = "";
+  }
+
   resetSort() {
-    this.sort = "relevance";
+    this.setSort("relevance");
   }
 
   private cancelInFlight() {

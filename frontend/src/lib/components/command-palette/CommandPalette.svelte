@@ -9,7 +9,7 @@
     type SegmentedControlOption,
   } from "@kenn-io/kit-ui";
   import { SearchIcon } from "../../icons.js";
-  import { tick, onDestroy, untrack } from "svelte";
+  import { tick, onDestroy, onMount, untrack } from "svelte";
   import { ui } from "../../stores/ui.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { searchStore } from "../../stores/search.svelte.js";
@@ -40,13 +40,12 @@
     { value: "hybrid", label: m.command_palette_mode_hybrid() },
   ]);
 
-  // Clear state and reset sort whenever the palette is unmounted, regardless
-  // of close path (Escape key, overlay click, command-palette toggle, or any other
-  // mechanism). This ensures stale results and in-flight requests are always
-  // cancelled even when the caller bypasses close().
-  onDestroy(() => {
-    searchStore.clear();
-    searchStore.resetSort();
+  // Closing cancels work but retains the user's query and preferences.
+  onDestroy(() => searchStore.pause());
+  onMount(() => {
+    if (hasArchiveQuery(inputValue)) {
+      searchStore.search(inputValue, sessions.filters.project);
+    }
   });
 
   let recentSessions = $derived(sessions.sessions.slice(0, 10));
@@ -187,7 +186,6 @@
   }
 
   function close() {
-    inputValue = "";
     ui.activeModal = null;
   }
 
@@ -286,19 +284,19 @@
             {#if searchStore.error.kind === "timeout"}
               <strong>{m.command_palette_search_timeout_title()}</strong>
               <span>{m.command_palette_search_timeout_detail()}</span>
-              <div class="palette-error-action">
-                <Button
-                  size="sm"
-                  tone="info"
-                  surface="soft"
-                  label={m.shared_retry()}
-                  onclick={() => searchStore.retry()}
-                />
-              </div>
             {:else}
               <strong>{m.command_palette_search_error()}</strong>
               <span>{searchStore.error.detail ?? m.command_palette_search_failed()}</span>
             {/if}
+            <div class="palette-error-action">
+              <Button
+                size="sm"
+                tone="info"
+                surface="soft"
+                label={m.shared_retry()}
+                onclick={() => { searchStore.retry(); selectedIndex = 0; }}
+              />
+            </div>
           </div>
         {/if}
         {#if !composing && paletteResults.length > 0}
