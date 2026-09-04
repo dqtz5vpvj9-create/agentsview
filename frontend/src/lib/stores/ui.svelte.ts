@@ -53,6 +53,7 @@ const VITALS_CALLS_EXPANDED_KEY =
 const SIGNAL_PANEL_KEY = "agentsview-signal-panel";
 const FOLLOW_LATEST_KEY = "agentsview-follow-latest";
 const SORT_NEWEST_FIRST_KEY = "agentsview-sort-newest-first";
+const SIDEBAR_OPEN_KEY = "agentsview-sidebar-open";
 
 function readBlockFilters(): Set<BlockType> {
   try {
@@ -281,7 +282,9 @@ class UIStore {
   zoomLevel: number = $state(readStoredZoom());
   fontScale: number = $state(readStoredFontScale());
 
-  sidebarOpen: boolean = $state(true);
+  sidebarOpen: boolean = $state(
+    readStoredBool(SIDEBAR_OPEN_KEY, true),
+  );
   isMobileViewport: boolean = $state(false);
   vitalsOpen: boolean = $state(
     readStoredBool(VITALS_KEY, false),
@@ -439,14 +442,19 @@ class UIStore {
 
       // Initialize sidebar based on viewport width. MEDIA.medium is the same
       // 760px query the component CSS uses, so the store and stylesheets
-      // agree on where mobile layout starts.
+      // agree on where mobile layout starts. Mobile transitions never replace
+      // the saved desktop preference.
       if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
         const mq = window.matchMedia(MEDIA.medium);
-        this.sidebarOpen = !mq.matches;
         this.isMobileViewport = mq.matches;
+        this.sidebarOpen = mq.matches
+          ? false
+          : readStoredBool(SIDEBAR_OPEN_KEY, true);
         const onChange = (e: MediaQueryListEvent) => {
-          this.sidebarOpen = !e.matches;
           this.isMobileViewport = e.matches;
+          this.sidebarOpen = e.matches
+            ? false
+            : readStoredBool(SIDEBAR_OPEN_KEY, true);
         };
         if (mq.addEventListener) {
           mq.addEventListener("change", onChange);
@@ -518,6 +526,18 @@ class UIStore {
       localStorage?.setItem(
         BLOCK_FILTER_KEY,
         JSON.stringify([...this.visibleBlocks]),
+      );
+    } catch {
+      // ignore
+    }
+  }
+
+  private persistDesktopSidebarOpen() {
+    if (this.isMobileViewport) return;
+    try {
+      localStorage?.setItem(
+        SIDEBAR_OPEN_KEY,
+        String(this.sidebarOpen),
       );
     } catch {
       // ignore
@@ -619,10 +639,12 @@ class UIStore {
 
   toggleSidebar() {
     this.sidebarOpen = !this.sidebarOpen;
+    this.persistDesktopSidebarOpen();
   }
 
   closeSidebar() {
     this.sidebarOpen = false;
+    this.persistDesktopSidebarOpen();
   }
 
   toggleVitals() {
