@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, untrack } from "svelte";
+  import { onDestroy, tick, untrack } from "svelte";
   import { EmptyState } from "@kenn-io/kit-ui";
   // kit-ui-check-ignore: MessageList uses the local TanStack wrapper for pinned-message scroll reconciliation and per-session measurement cache resets; kit-ui VirtualList does not expose those controls yet.
   import type { Virtualizer } from "@tanstack/virtual-core";
@@ -28,15 +28,18 @@
   import { sessionActivity } from "../../stores/sessionActivity.svelte.js";
   import SessionFindBar from "./SessionFindBar.svelte";
   import {
-    getAlignedOffsetScrollAlign,
     getLatestDisplayIndex,
     type ScrollAlign,
   } from "./message-scroll.js";
   import { m } from "../../i18n/index.js";
+  import { settleVirtualScroll } from "./staged-scroll.js";
+  import { revealMatch } from "../../search/reveal.js";
+  import type { Match } from "../../search/session-index.js";
 
   let containerRef: HTMLDivElement | undefined = $state(undefined);
   let scrollRaf: number | null = null;
   let lastScrollRequest = 0;
+  let destroyed = false;
   let activeFollowScrollRequest: number | null = null;
   let followingScrollRaf: number | null = null;
   let followSettleTimer:
@@ -77,6 +80,7 @@
   });
 
   let displayItemsAsc = $derived.by(() => {
+    if (inSessionSearch.isActive) return baseDisplayItemsAsc;
     if (ui.transcriptMode === "normal") {
       return normalDisplayItemsAsc;
     }
@@ -432,6 +436,7 @@
   }
 
   function handleManualScrollIntent() {
+    lastScrollRequest++;
     if (ui.followLatest) {
       cancelFollowLatestWork();
       ui.setFollowLatest(false);
@@ -482,6 +487,8 @@
   }
 
   onDestroy(() => {
+    destroyed = true;
+    lastScrollRequest++;
     if (visibleProgressRaf !== null) {
       cancelAnimationFrame(visibleProgressRaf);
       visibleProgressRaf = null;
@@ -520,90 +527,18 @@
 
   function scrollToDisplayIndex(
     index: number,
-    waitFrames: number = 0,
-    scrollRetries: number = 0,
-    reqId: number = lastScrollRequest,
+    waitFrames = 0,
+    scrollRetries = 0,
+    reqId = lastScrollRequest,
     align: ScrollAlign = "start",
-  ) {
-    if (reqId !== lastScrollRequest) return;
-
-    const v = virtualizer.instance;
-    if (!v) return;
-
-    // Phase 1: wait up to 5 frames for virtualCount to sync.
-    const desiredCount = displayItemsAsc.length;
-    const virtualCount = v.options.count;
-    if (
-      waitFrames < 5 &&
-      (virtualCount !== desiredCount || index >= virtualCount)
-    ) {
-      requestAnimationFrame(() => {
-        scrollToDisplayIndex(
-          index, waitFrames + 1, 0, reqId,
-          align,
-        );
-      });
-      return;
-    }
-
-    // Phase 2a: item already rendered — use exact measured offset.
-    const virtualItems = v.getVirtualItems();
-    const isRendered = virtualItems.some(
-      (vi) => vi.index === index,
-    );
-    if (isRendered) {
-      const offsetAndAlign =
-        v.getOffsetForIndex(index, align);
-      if (offsetAndAlign) {
-        const [offset] = offsetAndAlign;
-        v.scrollToOffset(
-          Math.round(offset),
-          { align: getAlignedOffsetScrollAlign(align) },
-        );
-        return;
-      }
-      v.scrollToIndex(index, { align });
-      if (scrollRetries < 15) {
-        requestAnimationFrame(() => {
-          requestAnimationFrame(() => {
-            scrollToDisplayIndex(
-              index,
-              waitFrames,
-              scrollRetries + 1,
-              reqId,
-              align,
-            );
-          });
-        });
-      }
-      return;
-    }
-
-    // Phase 2b: item not yet in render window. scrollToIndex
-    // scrolls to an estimated position, but TanStack's reconcile
-    // loop exits after 1 stable frame — before ResizeObserver
-    // measurements (delayed by bumpVersion's setTimeout(0)) have
-    // updated the offsets.
-    //
-    // Retry in 2 frames: by then ResizeObserver + bumpVersion have
-    // fired, measurements are updated, and the next attempt either
-    // finds the item rendered (for an exact offset scroll) or
-    // repeats with a more accurate estimate. Limit to 15 scroll
-    // retries (~480 ms) to avoid looping forever.
-    v.scrollToIndex(index, { align });
-    if (scrollRetries < 15) {
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          scrollToDisplayIndex(
-            index,
-            waitFrames,
-            scrollRetries + 1,
-            reqId,
-            align,
-          );
-        });
-      });
-    }
+  ): Promise<boolean> {
+    return settleVirtualScroll({
+      index, align, waitFrames, scrollRetries,
+      getVirtualizer: () => virtualizer.instance,
+      getCount: () => displayItemsAsc.length,
+      isCurrent: () => !destroyed && reqId === lastScrollRequest,
+      nextFrame: raf,
+    });
   }
 
   function raf(): Promise<void> {
@@ -763,32 +698,68 @@
     return normalDisplayItemsAsc;
   }
 
-  // The list owns scrolling. This ordinal bridge is replaced by block-range
-  // reveal in the next integration step; the search store never scrolls itself.
   let searchRevealKey = $derived.by(() => {
     const match = inSessionSearch.resolvedCurrent;
     return match ? `${match.ordinal}:${match.blockKey}:${match.occurrence}` : "";
   });
+
+  async function revealSearchMatch(match: Match, sessionId: string, reqId: number): Promise<boolean> {
+    return revealMatch({
+      ordinal: match.ordinal,
+      blockKey: match.blockKey,
+      getContainer: () => containerRef,
+      isCurrent: () => !destroyed && reqId === lastScrollRequest &&
+        messages.sessionId === sessionId && sessions.activeSessionId === sessionId &&
+        inSessionSearch.isActive,
+      ensureLoaded: (ordinal) => messages.ensureOrdinalLoaded(ordinal),
+      mountMessage: () => {
+        const ascIndex = displayItemsAsc.findIndex((item) => item.ordinals.includes(match.ordinal));
+        if (ascIndex < 0) return Promise.resolve(false);
+        const index = ui.sortNewestFirst ? displayItemsAsc.length - 1 - ascIndex : ascIndex;
+        return scrollToDisplayIndex(index, 0, 0, reqId);
+      },
+      scrollToOffset: (offset) => virtualizer.instance?.scrollToOffset(
+        Math.round(offset), { align: "start" },
+      ),
+      afterUpdate: tick,
+      nextFrame: raf,
+    });
+  }
+
   $effect(() => {
     const request = inSessionSearch.revealSeq;
     const key = searchRevealKey;
     const sessionId = messages.sessionId;
+    const count = displayItemsAsc.length;
+    const newestFirst = ui.sortNewestFirst;
     if (!inSessionSearch.isActive || !key || !sessionId || !containerRef) return;
     void request;
-    untrack(() => {
-      const ordinal = inSessionSearch.currentOrdinal;
-      if (ordinal !== null) void scrollToOrdinalInternal(ordinal);
+    void count;
+    void newestFirst;
+    return untrack(() => {
+      const match = inSessionSearch.resolvedCurrent;
+      if (!match) return;
+      const reqId = ++lastScrollRequest;
+      activeFollowScrollRequest = null;
+      ui.selectOrdinal(match.ordinal);
+      ui.setFollowLatest(false);
+      void revealSearchMatch(match, sessionId, reqId).catch((error: unknown) => {
+        if (reqId === lastScrollRequest) console.warn("Could not reveal search occurrence", error);
+      });
+      return () => {
+        if (reqId === lastScrollRequest) lastScrollRequest++;
+      };
     });
   });
 
   let highlightQuery = $derived(
-    inSessionSearch.isOpen && inSessionSearch.query.trim().length > 0
-      ? inSessionSearch.query
+    inSessionSearch.isActive
+      ? inSessionSearch.debouncedQuery
       : "",
   );
 
   let effectiveLayout = $derived(
-    resolveMessageLayout(ui.messageLayout, highlightQuery !== ""),
+    resolveMessageLayout(ui.messageLayout, inSessionSearch.isActive),
   );
 
   let readProgressDivider = $derived.by(() => {
