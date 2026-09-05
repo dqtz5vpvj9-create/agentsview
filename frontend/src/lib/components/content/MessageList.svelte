@@ -26,7 +26,7 @@
   import { resolveMessageLayout } from "../../utils/message-layout.js";
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
   import { sessionActivity } from "../../stores/sessionActivity.svelte.js";
-  import SessionFindBar from "./SessionFindBar.svelte";
+  import SessionFindView from "./SessionFindView.svelte";
   import {
     getLatestDisplayIndex,
     type ScrollAlign,
@@ -752,12 +752,6 @@
     });
   });
 
-  let highlightQuery = $derived(
-    inSessionSearch.isActive
-      ? inSessionSearch.debouncedQuery
-      : "",
-  );
-
   let effectiveLayout = $derived(
     resolveMessageLayout(ui.messageLayout, inSessionSearch.isActive),
   );
@@ -829,7 +823,12 @@
 {:else if messages.loading && messages.messages.length === 0}
   <EmptyState title={m.message_list_loading()} />
 {:else}
-  <SessionFindBar />
+  <SessionFindView
+    items={displayItemsAsc}
+    totalSize={virtualizer.instance?.getTotalSize() ?? 0}
+    newestFirst={ui.sortNewestFirst}
+    rowOffset={(index) => virtualizer.instance?.getOffsetForIndex(index, "start")?.[0] ?? index * 120}
+  >
   <div
     class="message-list-scroll layout-{effectiveLayout}"
     bind:this={containerRef}
@@ -869,8 +868,7 @@
               <ToolCallGroup
                 messages={item.messages}
                 timestamp={item.timestamp}
-                highlightQuery={highlightQuery}
-                isCurrentHighlight={item.ordinals.includes(inSessionSearch.currentOrdinal ?? -1)}
+                searchable={true}
                 sortNewestFirst={ui.sortNewestFirst}
                 divider={readProgressDivider !== null && item.ordinals.includes(readProgressDivider.ordinal)
                   ? readProgressDivider
@@ -887,8 +885,7 @@
             {:else}
               <MessageContent
                 message={item.message}
-                highlightQuery={highlightQuery}
-                isCurrentHighlight={inSessionSearch.currentOrdinal === item.message.ordinal}
+                searchOrdinal={item.message.ordinal}
               />
             {/if}
           </div>
@@ -896,6 +893,7 @@
       {/each}
     </div>
   </div>
+  </SessionFindView>
 {/if}
 
 <style>
