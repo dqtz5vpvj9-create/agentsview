@@ -2,8 +2,9 @@
   import type { Snippet } from "svelte";
   import type { DisplayItem } from "../../utils/display-items.js";
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
-  import SessionFindBar from "./SessionFindBar.svelte";
+  import FindResultsList from "./FindResultsList.svelte";
   import FindOverviewRail from "./FindOverviewRail.svelte";
+  import SessionFindBar from "./SessionFindBar.svelte";
 
   interface Props {
     children: Snippet;
@@ -16,14 +17,17 @@
 </script>
 
 <SessionFindBar />
-<div class="session-find-transcript" class:has-find-results={inSessionSearch.isActive && inSessionSearch.total > 0}>
+{#if inSessionSearch.isOpen && inSessionSearch.resultsOpen}
+  <FindResultsList />
+{/if}
+<div class="find-viewport" class:has-find={inSessionSearch.isActive}>
   {@render children()}
-  {#if inSessionSearch.isActive && inSessionSearch.total > 0}
+  {#if inSessionSearch.isActive}
     <FindOverviewRail {items} {totalSize} {newestFirst} {rowOffset} />
   {/if}
 </div>
 
 <style>
-  .session-find-transcript { flex: 1; min-height: 0; min-width: 0; position: relative; display: flex; flex-direction: column; }
-  .session-find-transcript.has-find-results { padding-right: 16px; }
+  .find-viewport { position: relative; display: flex; flex-direction: column; flex: 1; min-height: 0; }
+  .has-find :global(.message-list-scroll) { padding-inline-end: 12px; }
 </style>

@@ -82,5 +82,29 @@ describe("SessionFindBar", () => {
     await tick();
     expect(inSessionSearch.currentOccurrence("0:text:0")).toBe(1);
     expect(document.querySelector('.search-announcement')?.textContent?.trim()).toBe("Match 2 of 2");
+    await Promise.resolve();
+    expect(document.querySelectorAll('[aria-live="polite"]')).toHaveLength(1);
+    expect(document.querySelector(".kit-find-bar__counter")?.getAttribute("aria-live")).toBe("off");
+  });
+
+  it("toggles the result panel with matching accessible state", async () => {
+    setLocale("zh-CN"); await render("needle");
+    const toggle = document.querySelector<HTMLButtonElement>('button[aria-controls="session-find-results"]')!;
+    expect(toggle.getAttribute("aria-label")).toBe("显示搜索结果");
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    toggle.click(); await tick();
+    expect(inSessionSearch.resultsOpen).toBe(true);
+    expect(toggle.getAttribute("aria-label")).toBe("隐藏搜索结果");
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    toggle.click(); await tick(); expect(inSessionSearch.resultsOpen).toBe(false);
+  });
+
+  it("closes through the close control and retains the query", async () => {
+    await render("needle");
+    document.querySelector<HTMLButtonElement>(".kit-find-bar__close")!.click();
+    await tick();
+    expect(inSessionSearch.isOpen).toBe(false);
+    expect(inSessionSearch.query).toBe("needle");
+    expect(document.querySelector(".session-find")).toBeNull();
   });
 });
