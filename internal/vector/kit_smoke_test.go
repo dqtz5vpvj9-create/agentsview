@@ -40,8 +40,7 @@ func TestKitSqlitevecRoundTrip(t *testing.T) {
 		}
 		return out, nil
 	}
-	stats, err := kitvec.Fill[string, string](ctx, store, fp, enc,
-		kitvec.FillOptions[string]{})
+	stats, err := kitvec.Fill[string, string](ctx, store, fp, enc)
 	require.NoError(t, err)
 	require.Equal(t, 1, stats.Documents)
 	hits, err := store.QueryGeneration(ctx, fp, kitvec.Vector{1, 0, 0}, 5)

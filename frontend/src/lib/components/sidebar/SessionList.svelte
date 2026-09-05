@@ -17,6 +17,7 @@
   import { TrashIcon, CheckIcon } from "../../icons.js";
   import { formatNumber } from "../../utils/format.js";
   import { agentColor } from "../../utils/agents.js";
+  import { registerSessionList } from "../../utils/arrow-target.js";
   import {
     type DisplayItem,
     type GroupMode,
@@ -24,6 +25,7 @@
     OVERSCAN,
     STORAGE_KEY_GROUP,
     getInitialGroupMode,
+    adjacentVisibleSessionId,
     buildGroupSections,
     buildDisplayItems,
     computeTotalSize,
@@ -49,8 +51,20 @@
   let expandedGroups: Set<string> = $state(new Set());
   let detachSidebar: (() => void) | null = null;
 
+  function navigateVisibleSession(delta: number) {
+    const id = adjacentVisibleSessionId(
+      renderDisplayItems,
+      sessions.activeSessionId,
+      delta,
+    );
+    if (id) sessions.selectSession(id);
+  }
+
   onMount(() => {
     detachSidebar = sessions.attachSidebar();
+    const element = containerRef;
+    if (!element) return;
+    return registerSessionList(element, navigateVisibleSession);
   });
 
   $effect(() => {

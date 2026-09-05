@@ -120,6 +120,18 @@ func TestClaudeProviderSourceMethods(t *testing.T) {
 	assert.Empty(t, ignored)
 }
 
+func TestClaudeFullParseHonorsContextBetweenLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	writeSourceFile(t, path, claudeProviderFixture("question"))
+	ctx := newCancelOnErrCheckContext(t, 4)
+
+	_, _, err := claudeParseFile(
+		path, "project", "machine", claudeParseOptions{ctx: ctx},
+	)
+
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 func TestClaudeProviderDiscoversSymlinkedProjectDirectory(t *testing.T) {
 	root := t.TempDir()
 	targetRoot := t.TempDir()
@@ -257,6 +269,49 @@ func TestClaudeProviderStreamingDiscoveryPropagatesProjectSymlinkErrors(t *testi
 		require.NoError(t, err)
 		assert.Equal(t, []string{healthyPath(root)}, yielded)
 	})
+}
+
+func TestClaudeRawCaptureRootReplacementIsIncomplete(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "sessions")
+	require.NoError(t, os.Mkdir(root, 0o700))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "ignored.txt"), nil, 0o600,
+	))
+	provider, ok := NewProvider(AgentClaude, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	paused := make(chan struct{})
+	resume := make(chan struct{})
+	progressCalls := 0
+	ctx := WithRawCaptureDiscoveryProgress(t.Context(), func() error {
+		progressCalls++
+		if progressCalls == 2 {
+			close(paused)
+			<-resume
+		}
+		return nil
+	})
+	type discoveryResult struct {
+		discovery RawCaptureDiscovery
+		err       error
+	}
+	resultCh := make(chan discoveryResult, 1)
+	go func() {
+		discovery, err := DiscoverRawCaptureSources(ctx, provider)
+		resultCh <- discoveryResult{discovery: discovery, err: err}
+	}()
+
+	<-paused
+	require.NoError(t, os.Rename(root, root+"-old"))
+	require.NoError(t, os.Mkdir(root, 0o700))
+	close(resume)
+	result := <-resultCh
+
+	require.Error(t, result.err)
+	assert.ErrorIs(t, result.err, errStreamingDirectoryChanged)
+	var incomplete DiscoveryIncompleteError
+	assert.ErrorAs(t, result.err, &incomplete)
+	assert.False(t, result.discovery.Complete)
 }
 
 func TestClaudeProviderStreamingDiscoveryStopsAfterYieldError(t *testing.T) {

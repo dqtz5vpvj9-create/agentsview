@@ -18,6 +18,7 @@
 | SQLite, PostgreSQL, CockroachDB, DuckDB, archive resync, or storage queries   | `docs/agents/storage.md`             |
 | Watchers, polling, sync scheduling, background work, or memory investigations | `docs/agents/background-work.md`     |
 | Build commands, toolchains, CI build tags, or dependencies                    | `docs/agents/build.md`               |
+| S3 ingest, `S3Provider`, or `Source.S3Discovery`                              | `docs/agents/s3-providers.md`        |
 | Any frontend file                                                             | `frontend/AGENTS.md`                 |
 | Frontend controls, styling, or reusable components                            | `frontend/AGENTS.md` and `DESIGN.md` |
 
@@ -65,6 +66,10 @@ commands. Do not copy their catalogues into this file.
   details, and absolute user paths out of code, tests, fixtures,
   documentation, commit messages, and pull request text. Run the private-data
   scrub before publishing.
+- Write changelog entries in plain language for people who do not live in the
+  codebase. Lead each entry with the outcome a user or operator will notice.
+  Put implementation details after that outcome, and include them only when
+  they help the reader act or understand a limit.
 - Keep pull request titles and descriptions in sync with the current diff.
 - Do not post pull request or issue comments unless the user asks.
 

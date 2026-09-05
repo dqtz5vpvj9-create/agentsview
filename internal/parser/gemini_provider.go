@@ -33,11 +33,9 @@ func (f geminiProviderFactory) Capabilities() Capabilities {
 func (f geminiProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &geminiProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   geminiProviderCapabilities(),
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    geminiProviderCapabilities(),
+		Config:  cfg,
 		sources: newGeminiSourceSet(cfg.Roots),
 	}
 }
@@ -102,6 +100,16 @@ func (p *geminiProvider) Parse(
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 	sess, msgs, err := p.parseSession(path, req.Source.ProjectHint, machine)
 	if err != nil {
+		if errors.Is(err, errGeminiMissingSessionID) {
+			// A session-shaped file without Gemini's metadata record has no
+			// stable identity to archive. Treat the durable source shape as an
+			// unsupported skip so reconciliation can advance without claiming
+			// authority to retire previously archived sessions.
+			return ParseOutcome{
+				ResultSetComplete: true,
+				SkipReason:        SkipUnsupportedSource,
+			}, nil
+		}
 		return ParseOutcome{}, err
 	}
 	if sess == nil {
@@ -159,15 +167,35 @@ func (s geminiSourceSet) DiscoverEach(ctx context.Context, yield func(SourceRef)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		projects, err := newDiscoveryDiskMapForContext(ctx)
-		if err != nil {
-			return err
-		}
-		if err := projects.loadGeminiConfig(ctx, root); err != nil {
-			return errors.Join(err, projects.close())
+		var projects *discoveryDiskMap
+		resolveProject := func(projectDir string) (string, error) {
+			if projects == nil {
+				var err error
+				projects, err = newGeminiDiscoveryMap(ctx)
+				if err != nil {
+					return "", err
+				}
+				if err := projects.loadGeminiConfig(ctx, root); err != nil {
+					closeErr := projects.close()
+					projects = nil
+					return "", errors.Join(err, closeErr)
+				}
+			}
+			project, _, err := projects.get(ctx, projectDir)
+			if err != nil {
+				return "", err
+			}
+			if project == "" {
+				if isHexHash(projectDir) {
+					project = "unknown"
+				} else {
+					project = NormalizeName(projectDir)
+				}
+			}
+			return project, nil
 		}
 		tmpDir := filepath.Join(root, "tmp")
-		err = streamDirectoryEntries(ctx, tmpDir, func(projectDir os.DirEntry) error {
+		err := streamDirectoryEntries(ctx, tmpDir, func(projectDir os.DirEntry) error {
 			isProjectDir, dirErr := streamingDirCandidateOrIncomplete(
 				AgentGemini, "Gemini project directory", projectDir, tmpDir,
 			)
@@ -177,21 +205,20 @@ func (s geminiSourceSet) DiscoverEach(ctx context.Context, yield func(SourceRef)
 			if !isProjectDir {
 				return nil
 			}
-			project, _, err := projects.get(ctx, projectDir.Name())
-			if err != nil {
-				return err
-			}
-			if project == "" {
-				if isHexHash(projectDir.Name()) {
-					project = "unknown"
-				} else {
-					project = NormalizeName(projectDir.Name())
-				}
-			}
+			project := ""
+			projectResolved := false
 			chatDir := filepath.Join(tmpDir, projectDir.Name(), geminiChatsDir)
 			return streamDirectoryEntries(ctx, chatDir, func(entry os.DirEntry) error {
 				if entry.IsDir() || !isGeminiSessionFilename(entry.Name()) {
 					return nil
+				}
+				if !projectResolved {
+					var err error
+					project, err = resolveProject(projectDir.Name())
+					if err != nil {
+						return err
+					}
+					projectResolved = true
 				}
 				path := filepath.Join(chatDir, entry.Name())
 				source, ok := s.sourceRefForPathWithProjectMap(
@@ -203,7 +230,9 @@ func (s geminiSourceSet) DiscoverEach(ctx context.Context, yield func(SourceRef)
 				return nil
 			})
 		})
-		err = errors.Join(err, projects.close())
+		if projects != nil {
+			err = errors.Join(err, projects.close())
+		}
 		if err != nil {
 			return err
 		}
@@ -220,12 +249,16 @@ func (s geminiSourceSet) discoverRoot(
 	}
 	sources := make([]SourceRef, 0)
 	seen := make(map[string]struct{})
+	paths := s.discoverSessionPaths(root)
+	if len(paths) == 0 {
+		return nil, nil
+	}
 	// Build the project map once per root. It depends only on root, and
 	// BuildGeminiProjectMap re-reads and SHA-256-hashes projects.json on every
 	// call, so resolving it per source path made discovery scale with session
 	// count (the dominant cost on large archives).
 	projectMap := buildGeminiProjectMap(root)
-	for _, path := range s.discoverSessionPaths(root) {
+	for _, path := range paths {
 		source, ok := s.sourceRefForPathWithProjectMap(root, path, true, projectMap)
 		if !ok {
 			continue
@@ -577,6 +610,10 @@ func (s geminiSourceSet) sourceRefForPathWithProjectMap(
 // buildGeminiProjectMap indirects BuildGeminiProjectMap so discovery can build
 // the project map once per root and tests can observe how often it runs.
 var buildGeminiProjectMap = BuildGeminiProjectMap
+
+// newGeminiDiscoveryMap indirects the disk-backed metadata map so tests can
+// verify that empty Gemini roots do not initialize it.
+var newGeminiDiscoveryMap = newDiscoveryDiskMapForContext
 
 // IsGeminiProjectMetadataFile reports whether path names one of the
 // root-level Gemini project-metadata files whose changes fan out to every

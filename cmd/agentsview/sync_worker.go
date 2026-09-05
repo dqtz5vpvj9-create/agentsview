@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"os"
@@ -104,14 +105,14 @@ func runSyncWorker(cfg config.Config, mode string, out io.Writer) error {
 func runSyncWorkerContext(
 	ctx context.Context, cfg config.Config, mode string, out io.Writer,
 ) error {
-	enc := json.NewEncoder(out)
+	enc := jsontext.NewEncoder(out)
 	// Retain the first encode error: a dropped terminal-result line means the
 	// parent never sees the outcome, so the worker must exit non-zero even if the
 	// pass itself succeeded. The parent also treats a missing result as a
 	// protocol failure, but the worker's own exit contract must not lie.
 	var encErr error
 	emit := func(line workerLine) {
-		if err := enc.Encode(line); err != nil && encErr == nil {
+		if err := json.MarshalEncode(enc, line); err != nil && encErr == nil {
 			encErr = err
 		}
 	}
@@ -197,7 +198,7 @@ func runSyncWorkerStartup(
 		var auditErr error
 		if auditRoots := reconcileRootPaths(cfg); len(auditRoots) > 0 {
 			stats, tombstoned, auditErr = engine.ReconcileWatchRootsWithStats(
-				ctx, auditRoots, false,
+				ctx, auditRoots, false, onProgress,
 			)
 		}
 		result = workerResultFromStats(ctx, stats)
@@ -279,6 +280,7 @@ func resyncBuildResultFromStats(
 		Synced:            stats.Synced,
 		Skipped:           stats.Skipped,
 		Failed:            stats.Failed,
+		Tombstoned:        stats.Tombstoned,
 		DiscoveryComplete: stats.AuthoritativeDiscoveryComplete(),
 		Stats:             &statsCopy,
 	}
@@ -293,6 +295,8 @@ func resyncBuildResultFromStats(
 	case stats.Aborted:
 		result.Status = "aborted"
 		result.DiscoveryComplete = false
+	case stats.Deferred > 0:
+		result.Status = "failed"
 	case !result.DiscoveryComplete:
 		result.Status = "failed"
 	default:
@@ -326,6 +330,7 @@ func workerResultFromStats(
 		Synced:            stats.Synced,
 		Skipped:           stats.Skipped,
 		Failed:            stats.Failed,
+		Tombstoned:        stats.Tombstoned,
 		DiscoveryComplete: stats.AuthoritativeDiscoveryComplete(),
 		Stats:             &statsCopy,
 	}
@@ -338,7 +343,7 @@ func workerResultFromStats(
 		if ctx.Err() != nil {
 			result.Error = ctx.Err().Error()
 		}
-	case stats.Failed > 0 || !result.DiscoveryComplete:
+	case !stats.ProcessingComplete() || !result.DiscoveryComplete:
 		result.Status = "failed"
 	default:
 		result.Status = "ok"
@@ -361,6 +366,7 @@ func workerEngineConfig(cfg config.Config) sync.EngineConfig {
 	return sync.EngineConfig{
 		AgentDirs:               cfg.AgentDirs,
 		SourceMachines:          cfg.SourceMachines,
+		DisabledAgents:          cfg.DisabledAgents,
 		IncludeCwdPrefixes:      cfg.SyncIncludeCwdPrefixes,
 		ScanProtectedPaths:      cfg.ScanProtectedPaths,
 		Machine:                 cfg.LocalMachineName,

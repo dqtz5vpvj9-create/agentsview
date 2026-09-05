@@ -10,6 +10,7 @@ import { copyToClipboard } from "../utils/clipboard.js";
 import AppHeader from "../components/layout/AppHeader.svelte";
 import SidebarToggleButton from "../components/layout/SidebarToggleButton.svelte";
 import { registerShortcuts } from "./keyboard.js";
+import { registerSessionList } from "./arrow-target.js";
 
 vi.mock("../utils/clipboard.js", () => ({
   copyToClipboard: vi.fn().mockResolvedValue(true),
@@ -28,6 +29,7 @@ describe("registerShortcuts", () => {
   let cleanup: () => void;
   let navigateMessage: (delta: number) => void;
   let navigateUserPrompt: (delta: number) => void;
+  let detachSessionList: (() => void) | undefined;
 
   beforeEach(() => {
     ui.activeModal = null;
@@ -41,10 +43,13 @@ describe("registerShortcuts", () => {
     navigateMessage = vi.fn();
     navigateUserPrompt = vi.fn();
     cleanup = registerShortcuts({ navigateMessage, navigateUserPrompt });
+    detachSessionList = undefined;
   });
 
   afterEach(() => {
     cleanup();
+    detachSessionList?.();
+    document.body.innerHTML = "";
   });
 
   describe("Cmd+K modal toggle", () => {
@@ -140,6 +145,204 @@ describe("registerShortcuts", () => {
       ui.activeModal = "commandPalette";
       fireKey("J", { shiftKey: true });
       expect(navigateUserPrompt).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("arrow target", () => {
+    function mountSessionList(
+      navigate = (delta: number) =>
+        sessions.navigateSession(
+          delta,
+          starred.filterOnly
+            ? (session) => starred.isStarred(session.id)
+            : undefined,
+        ),
+    ) {
+      const list = document.createElement("div");
+      list.className = "session-list-scroll";
+      document.body.appendChild(list);
+      detachSessionList = registerSessionList(list, navigate);
+      return list;
+    }
+
+    it("navigates sessions up and down in the registered list", () => {
+      const list = mountSessionList();
+      sessions.sessions = [
+        { id: "s1" } as any,
+        { id: "s2" } as any,
+      ];
+      sessions.activeSessionId = "s1";
+      const row = document.createElement("button");
+      list.appendChild(row);
+      row.focus();
+      fireKey("ArrowDown");
+      expect(sessions.activeSessionId).toBe("s2");
+      fireKey("ArrowUp");
+      expect(sessions.activeSessionId).toBe("s1");
+      expect(navigateMessage).not.toHaveBeenCalled();
+    });
+
+    it("switches panes after deliberate pointer interaction, not hover", () => {
+      const navigateSessions = vi.fn();
+      const list = mountSessionList(navigateSessions);
+      const row = document.createElement("button");
+      list.appendChild(row);
+      row.focus();
+
+      fireKey("ArrowDown");
+      expect(navigateSessions).toHaveBeenCalledWith(1);
+
+      const message = document.createElement("div");
+      message.className = "message-list-scroll";
+      document.body.appendChild(message);
+      message.dispatchEvent(new Event("pointermove", { bubbles: true }));
+      fireKey("ArrowDown");
+      expect(navigateSessions).toHaveBeenCalledTimes(2);
+      expect(navigateMessage).not.toHaveBeenCalled();
+
+      message.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+      expect(document.activeElement).toBe(row);
+
+      fireKey("ArrowDown");
+      expect(navigateSessions).toHaveBeenCalledTimes(2);
+      expect(navigateMessage).toHaveBeenCalledWith(1);
+
+      const unrelated = document.createElement("button");
+      document.body.appendChild(unrelated);
+      row.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+      unrelated.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+      fireKey("ArrowDown");
+      expect(navigateSessions).toHaveBeenCalledTimes(3);
+      expect(navigateMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it("uses session navigation after a sidebar control interaction", () => {
+      const navigateSessions = vi.fn();
+      const sidebar = document.createElement("aside");
+      sidebar.id = "session-sidebar";
+      const filter = document.createElement("button");
+      sidebar.appendChild(filter);
+      document.body.appendChild(sidebar);
+      const list = mountSessionList(navigateSessions);
+      sidebar.appendChild(list);
+
+      const messagePane = document.createElement("div");
+      messagePane.className = "message-list-scroll";
+      document.body.appendChild(messagePane);
+      messagePane.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+      filter.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+
+      fireKey("ArrowDown");
+
+      expect(navigateSessions).toHaveBeenCalledWith(1);
+      expect(navigateMessage).not.toHaveBeenCalled();
+    });
+
+    it("keeps arrow navigation within the starred-only list", () => {
+      const list = mountSessionList();
+      sessions.sessions = [
+        { id: "s1" } as any,
+        { id: "s2" } as any,
+        { id: "s3" } as any,
+      ];
+      sessions.activeSessionId = "s1";
+      starred.filterOnly = true;
+      starred.ids = new Set(["s1", "s3"]);
+      const row = document.createElement("button");
+      list.appendChild(row);
+      row.focus();
+
+      fireKey("ArrowDown");
+      expect(sessions.activeSessionId).toBe("s3");
+      fireKey("ArrowUp");
+      expect(sessions.activeSessionId).toBe("s1");
+      expect(navigateMessage).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["direct/root", {}],
+      ["subagent", { relationship_type: "subagent" }],
+      ["forked child", { parent_session_id: "root", relationship_type: "fork" }],
+      ["continuation", { parent_session_id: "root", relationship_type: "continuation" }],
+      ["imported", { agent: "imported-agent" }],
+      ["soft-deleted", { deleted_at: "2026-08-01T00:00:00Z" }],
+      ["tombstoned", { tombstoned: true }],
+    ])("preserves arrow routing for the %s Session lineage variant", (_name, variant) => {
+      const list = mountSessionList();
+      sessions.sessions = [
+        { id: "root" } as any,
+        { id: "variant", ...variant } as any,
+      ];
+      sessions.activeSessionId = "root";
+      const row = document.createElement("button");
+      list.appendChild(row);
+      row.focus();
+
+      fireKey("ArrowDown");
+
+      expect(sessions.activeSessionId).toBe("variant");
+      expect(navigateMessage).not.toHaveBeenCalled();
+    });
+
+    it("keeps message fallback and native vetoes", () => {
+      const list = mountSessionList();
+      list.appendChild(document.createElement("button"));
+      fireKey("ArrowDown");
+      expect(navigateMessage).toHaveBeenCalledWith(1);
+
+      const input = document.createElement("input");
+      list.appendChild(input);
+      input.focus();
+      fireKey("ArrowDown");
+      expect(navigateMessage).toHaveBeenCalledTimes(1);
+      expect(sessions.activeSessionId).toBeNull();
+    });
+
+    it("does not route arrows from a dialog through the message fallback", () => {
+      const list = mountSessionList();
+      const dialog = document.createElement("div");
+      dialog.setAttribute("role", "dialog");
+      const button = document.createElement("button");
+      dialog.appendChild(button);
+      list.appendChild(dialog);
+      button.focus();
+
+      fireKey("ArrowDown");
+
+      expect(navigateMessage).not.toHaveBeenCalled();
+      expect(sessions.activeSessionId).toBeNull();
+    });
+
+    it("clears the list route when the component disconnects", () => {
+      const list = mountSessionList();
+      list.remove();
+      fireKey("ArrowDown");
+      expect(navigateMessage).toHaveBeenCalledWith(1);
+    });
+
+    it("routes arrows to messages after mobile auto-close hides the sidebar", () => {
+      const navigateSessions = vi.fn();
+      const sidebar = document.createElement("aside");
+      document.body.appendChild(sidebar);
+      const list = mountSessionList(navigateSessions);
+      sidebar.appendChild(list);
+      list.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+
+      sidebar.style.display = "none";
+      fireKey("ArrowDown");
+
+      expect(navigateSessions).not.toHaveBeenCalled();
+      expect(navigateMessage).toHaveBeenCalledWith(1);
+    });
+
+    it("clears the list route when registration is unregistered", () => {
+      const list = mountSessionList();
+      detachSessionList?.();
+      detachSessionList = undefined;
+      list.appendChild(document.createElement("button"));
+      fireKey("ArrowDown");
+      expect(navigateMessage).toHaveBeenCalledWith(1);
+      expect(sessions.activeSessionId).toBeNull();
     });
   });
 

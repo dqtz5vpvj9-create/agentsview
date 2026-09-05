@@ -2,7 +2,7 @@ package parser
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -150,6 +150,7 @@ func TestProviderRegistryMirrorsAgentRegistry(t *testing.T) {
 
 func TestStoredSourceHintCapabilitiesMatchConsumers(t *testing.T) {
 	wantSupported := map[AgentType]bool{
+		AgentCursorIDE: true,
 		AgentDevin:     true,
 		AgentForge:     true,
 		AgentKiro:      true,
@@ -312,11 +313,9 @@ func (f testProviderFactory) Capabilities() Capabilities {
 
 func (f testProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	return &testProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   f.caps,
-			Config: cfg.Clone(),
-		},
+		Def:    cloneAgentDef(f.def),
+		Caps:   f.caps,
+		Config: cfg.Clone(),
 	}
 }
 

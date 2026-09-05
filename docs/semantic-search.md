@@ -11,14 +11,14 @@ model or a hosted API.
 
 For the architecture behind this page — storage layout, generations,
 concurrency, and the search path — see
-[Semantic Search Internals](/semantic-search-internals/).
+[Semantic Search Internals](/docs/semantic-search-internals/).
 
 !!! note "Backends"
 
     Semantic and hybrid search run on the local SQLite archive and on
-    [PostgreSQL](#postgresql) via pgvector. The [DuckDB mirror](/duckdb/) has no
-    vector backend, so `--semantic`/`--hybrid` against a DuckDB-backed server return
-    the "not available" error described below.
+    [PostgreSQL](#postgresql) via pgvector. The [DuckDB mirror](/docs/duckdb/) has
+    no vector backend, so `--semantic`/`--hybrid` against a DuckDB-backed server
+    return the "not available" error described below.
 
 ## Enabling `[vector]`
 
@@ -35,6 +35,7 @@ include_automated = false         # default; automated sessions (e.g. roborev) a
 model = "nomic-embed-text"
 dimension = 768                   # every returned vector must have this length
 max_input_chars = 8192            # per-chunk rune cap (default 8192)
+model_context_tokens = 32000      # optional model context used to cap build request size
 query_prefix = "search_query: "    # prepended only to search queries
 document_prefix = "search_document: " # prepended only to indexed document chunks
 # request_dimensions = true      # ask for Matryoshka-reduced vectors of exactly `dimension` (see below)
@@ -45,9 +46,13 @@ default_server = "local"          # server used for query encoding and unnamed b
 endpoint = "http://localhost:11434/v1"  # OpenAI-compatible base URL; "/embeddings" is appended
 api_key_env = "OPENAI_API_KEY"    # name of an env var holding the key; omit for anonymous access
 batch_size = 32                   # inputs per HTTP call (default 32)
+max_batch_tokens = 120000         # optional provider cap across all inputs in one call
 concurrency = 4                   # documents embedded in parallel during a build (default 4)
 timeout = "30s"                   # per-HTTP-call timeout (default "30s")
-max_retries = 3                   # attempts on 429/5xx/network errors; 4xx fails fast (default 3)
+max_retries = 3                   # attempts on 5xx/network errors; 4xx fails fast (default 3)
+                                   # document builds retry a 429 until it clears (or the daemon
+                                   # shuts down) instead of spending this budget on it; query
+                                   # encoders still count it here
 # ollama_cpu_fallback = true      # Ollama only: retry invalid Metal vectors once on CPU
 
 [vector.embed]
@@ -80,8 +85,23 @@ Model identity — `model`, `dimension`, `request_dimensions`, `max_input_chars`
 in the `servers` table must serve that same model and input recipe, so vectors
 produced by any of them are interchangeable and land in the same generation.
 What varies per server is transport and capacity: `endpoint`, `api_key_env`,
-`timeout`, `max_retries`, `batch_size`, `concurrency`, and
+`timeout`, `max_retries`, `batch_size`, `max_batch_tokens`, `concurrency`, and
 `ollama_cpu_fallback`.
+
+When `model_context_tokens` and a server's `max_batch_tokens` are both set,
+builds cap that server's effective batch size at
+`floor(max_batch_tokens / model_context_tokens)`. AgentsView conservatively
+charges every input the full model context because providers may truncate each
+oversized input to exactly that length before enforcing their aggregate request
+cap. For example, a 32,000-token context and a 120,000-token request cap reduce
+`batch_size = 4` to three inputs per call (96,000 worst-case tokens), preventing
+the 128,000-token request that four truncated inputs could produce.
+
+`max_batch_tokens` must be at least `model_context_tokens`, and setting it
+requires `model_context_tokens`. Both default to zero (disabled), so existing
+server configurations retain their document-count batching until their model and
+provider limits are declared. These settings only shape build and repair
+requests; they do not alter input text or the vector-generation fingerprint.
 
 This split exists so you can encode search queries against a fast local server
 while offloading bulk index builds to a bigger remote machine:
@@ -469,7 +489,7 @@ the scan or embedding phase, model and dimension, chunk progress, throughput,
 elapsed time, estimated completion, and the generations already stored in
 `vectors.db`.
 
-![Embedding build progress](/assets/generated/screenshots/settings-embeddings.png)
+![Embedding build progress](/docs/assets/generated/screenshots/settings-embeddings.png)
 
 When a writable local daemon is running, `build`/`activate`/`retire` proxy to it
 over HTTP so the daemon remains the sole writer of `vectors.db`; without a
@@ -516,7 +536,7 @@ starts the build through the local daemon and reports scanning, progress,
 throughput, and completion in place. The palette follows an already running
 build and retries the query after a successful build.
 
-![Guided semantic-search setup in the command palette](/assets/generated/screenshots/semantic-search-setup.png)
+![Guided semantic-search setup in the command palette](/docs/assets/generated/screenshots/semantic-search-setup.png)
 
 Setup and rebuild errors remain visible in the selected mode. To continue with
 Full text after an error, choose it explicitly—the UI never falls back
@@ -851,7 +871,9 @@ differ between the backends.
 
 `agentsview skills install` writes a bundled skill file that teaches a
 coding-agent harness the search workflow described on this page: when to reach
-for `--hybrid` versus `--fts`, how to react to the
+for `--hybrid` versus `--fts`, when to use plain substring search over
+`tool_input`/`tool_result` for identifiers, how to pass `--exclude-session` so
+the live conversation does not fill the page, how to react to the
 [error taxonomy](#error-taxonomy), and how to walk from a hit into its
 surrounding conversation with
 [`session messages --around`](#cursor-follow-from-a-hit-to-its-surrounding-conversation).
@@ -860,6 +882,7 @@ surrounding conversation with
 agentsview skills install                    # both harnesses, user level
 agentsview skills install --harness claude   # one harness only
 agentsview skills install --project          # install under the current git root
+agentsview skills install --server URL       # bake remote-daemon flags into examples
 agentsview skills list                       # show install state per harness
 ```
 

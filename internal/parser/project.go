@@ -59,6 +59,20 @@ func statGitEntry(gitPath string) (os.FileInfo, error) {
 // process that never opts in cannot raise a consent prompt from parsing.
 var allowProtectedPathProbes atomic.Bool
 
+type filesystemProjectDiscoveryKey struct{}
+
+// WithoutFilesystemProjectDiscovery returns a context that limits project
+// attribution to transcript metadata and lexical path rules. Bounded importers
+// use it so recorded working directories are never touched on the local host.
+func WithoutFilesystemProjectDiscovery(ctx context.Context) context.Context {
+	return context.WithValue(ctx, filesystemProjectDiscoveryKey{}, true)
+}
+
+func filesystemProjectDiscoveryDisabled(ctx context.Context) bool {
+	disabled, _ := ctx.Value(filesystemProjectDiscoveryKey{}).(bool)
+	return disabled
+}
+
 // SetAllowProtectedPathProbes sets whether project extraction may probe
 // macOS TCC-protected working directories for git roots. Wired from the
 // scan_protected_paths config option by the sync engine.
@@ -226,19 +240,24 @@ func ExtractProjectFromCwdWithBranch(
 }
 
 // ExtractProjectFromCwdWithBranchContext extracts a canonical project name
-// from cwd and optionally git branch metadata. The context parameter is
-// retained for compatibility: extraction no longer execs git — passive
-// discovery must not let git follow config-derived paths such as
-// [include] path into locations the probe policy never vetted — so all
-// resolution is filesystem-local and needs no cancellation.
+// from cwd and optionally git branch metadata. A context created by
+// WithoutFilesystemProjectDiscovery skips local Git-root discovery.
 func ExtractProjectFromCwdWithBranchContext(
-	_ context.Context, cwd, gitBranch string,
+	ctx context.Context, cwd, gitBranch string,
 ) string {
-	return extractProjectFromCwdWithBranch(cwd, gitBranch)
+	return extractProjectFromCwdWithBranchPolicy(
+		cwd, gitBranch, !filesystemProjectDiscoveryDisabled(ctx),
+	)
 }
 
 func extractProjectFromCwdWithBranch(
 	cwd, gitBranch string,
+) string {
+	return extractProjectFromCwdWithBranchPolicy(cwd, gitBranch, true)
+}
+
+func extractProjectFromCwdWithBranchPolicy(
+	cwd, gitBranch string, discoverFilesystem bool,
 ) string {
 	if cwd == "" {
 		return ""
@@ -249,28 +268,31 @@ func extractProjectFromCwdWithBranch(
 		norm = strings.ReplaceAll(cwd, "\\", "/")
 	}
 	cleaned := filepath.Clean(norm)
-
-	// Recognize tool-anchored worktree manager layouts before walking git
-	// roots. These layouts encode the owning project in the path even when
-	// the git root basename is a branch or generated worktree id.
-	if p := projectFromAnchoredWorktreeLayout(cleaned); p != "" {
-		return NormalizeName(p)
-	}
+	anchoredProject := projectFromAnchoredWorktreeLayout(cleaned)
 
 	// Skip the git-root walk when the cwd cannot resolve to a
 	// real local filesystem location. On macOS a bulk walk under
 	// an unbacked autofs prefix cascades through automountd into
 	// opendirectoryd (/usr/libexec/od_user_homes), so we probe
 	// the prefix once before walking.
-	if filepath.IsAbs(cleaned) && !isForeignOSPath(cwd, cleaned, winPath) &&
+	if discoverFilesystem && filepath.IsAbs(cleaned) &&
+		!isForeignOSPath(cwd, cleaned, winPath) &&
 		probeGitRootForCwd(cleaned) {
-		if root := findGitRepoRoot(cleaned); root != "" {
+		if root, linkedToRecordedPath := findGitRepoRoot(cleaned); root != "" &&
+			(linkedToRecordedPath || anchoredProject == "") {
 			name := filepath.Base(root)
 			if isInvalidPathBase(name) {
 				return ""
 			}
 			return NormalizeName(name)
 		}
+	}
+
+	// Tool-anchored layouts own standalone repositories created inside their
+	// branch directories. Only validated linked-worktree metadata may override
+	// the lexical project with the canonical main checkout name.
+	if anchoredProject != "" {
+		return NormalizeName(anchoredProject)
 	}
 
 	// Generic hosting layouts are intentionally a fallback after live Git
@@ -627,9 +649,9 @@ func isInvalidPathBase(name string) bool {
 // and linked worktrees/submodules (.git file). When cwd no longer
 // exists on disk, sibling directories are checked for worktree
 // .git files that can reveal the true repo root.
-func findGitRepoRoot(cwd string) string {
+func findGitRepoRoot(cwd string) (string, bool) {
 	if cwd == "" {
-		return ""
+		return "", false
 	}
 
 	dir := cwd
@@ -641,7 +663,7 @@ func findGitRepoRoot(cwd string) string {
 	} else {
 		// Avoid treating non-path strings as cwd.
 		if !strings.ContainsRune(dir, filepath.Separator) {
-			return ""
+			return "", false
 		}
 		cwdMissing = true
 		dir = filepath.Dir(dir)
@@ -665,48 +687,50 @@ func findGitRepoRoot(cwd string) string {
 			sibDir = parent
 		}
 		if root := repoRootFromSiblings(sibDir, cwd); root != "" {
-			return root
+			return root, deletedChildIsWorktree(sibDir, cwd, root)
 		}
 	}
 
-	root, _ := findGitRepoRootLocal(dir)
-	return root
+	root, _, canonicalLinked := findGitRepoRootLocal(dir)
+	return root, canonicalLinked
 }
 
-func findGitRepoRootLocal(dir string) (root string, conservative bool) {
+func findGitRepoRootLocal(
+	dir string,
+) (root string, conservative, canonicalLinked bool) {
 	for {
 		gitPath := filepath.Join(dir, ".git")
 		info, err := statGitEntry(gitPath)
 		if errors.Is(err, errRefusedGitEntry) {
 			// A .git symlink into a refused location marks a repo
 			// boundary we must not look through.
-			return dir, false
+			return dir, false, false
 		}
 		if err == nil {
 			if info.IsDir() {
-				return dir, false
+				return dir, false, false
 			}
 			if info.Mode().IsRegular() {
 				if !gitFileTargetsProbeable(dir, gitPath) {
 					// The gitfile targets a directory the protected-path
 					// policy refuses. Stop at the worktree itself.
-					return dir, false
+					return dir, false, false
 				}
 				if root := repoRootFromGitFile(dir, gitPath); root != "" {
 					if root == dir {
-						return root, true
+						return root, true, false
 					}
-					return root, false
+					return root, false, true
 				}
 				// Keep conservative fallback for gitfile repos
 				// when metadata cannot be parsed.
-				return dir, true
+				return dir, true, false
 			}
 		}
 
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return "", false
+			return "", false, false
 		}
 		dir = parent
 	}
@@ -847,9 +871,8 @@ func deletedChildIsWorktree(
 	if err != nil || rel == "." {
 		return false
 	}
-	child := strings.SplitN(
-		filepath.ToSlash(rel), "/", 2,
-	)[0]
+	child, _, _ := strings.Cut(
+		filepath.ToSlash(rel), "/")
 	if child == "" {
 		return false
 	}

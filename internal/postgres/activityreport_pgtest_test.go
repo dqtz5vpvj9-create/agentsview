@@ -62,6 +62,30 @@ func seedPGDailyFixture(t *testing.T, store *Store) {
 	require.NoError(t, err, "insert messages")
 }
 
+func TestPGActivityReportSourceProbeUsesMirrorSchema(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_activity_probe_test")
+	ctx := context.Background()
+
+	before, err := store.ActivityReportSourceProbe(ctx)
+	require.NoError(t, err)
+	seedPGDailyFixture(t, store)
+	after, err := store.ActivityReportSourceProbe(ctx)
+	require.NoError(t, err)
+
+	assert.Equal(t, before.SessionCount+2, after.SessionCount)
+	assert.NotEmpty(t, after.MaxSessionModified)
+	assert.Greater(t, after.MaxMessageID, before.MaxMessageID)
+
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO sync_metadata (key, value)
+		VALUES ('activity_report_project_identity_generation', '1')`)
+	require.NoError(t, err)
+	afterIdentity, err := store.ActivityReportSourceProbe(ctx)
+	require.NoError(t, err)
+	assert.NotEqual(t, after, afterIdentity,
+		"identity-only mirror updates must change the Activity probe")
+}
+
 func TestPGGetActivityReport(t *testing.T) {
 	_, store := prepareUsageSchema(t, "agentsview_daily_report_test")
 	ctx := context.Background()
@@ -73,6 +97,7 @@ func TestPGGetActivityReport(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, r.Peak.Agents)
 	assert.Equal(t, 2, r.Totals.Sessions)
+	assert.Equal(t, 2, r.SessionsTotal)
 	assert.GreaterOrEqual(t, len(r.ByModel), 2)
 }
 
@@ -122,7 +147,7 @@ func TestPGGetActivityReportOpenSessionWithInRangeMessageIncluded(t *testing.T) 
 
 // TestPGGetActivityReportUsageCostAndTokens exercises the PG usage
 // union + cost path: a single priced assistant message must surface
-// its output tokens and computed cost in the day totals, matching
+// its input and output tokens and computed cost in the day totals, matching
 // the SQLite reference behavior.
 func TestPGGetActivityReportUsageCostAndTokens(t *testing.T) {
 	_, store := prepareUsageSchema(t, "agentsview_daily_report_usage_test")
@@ -161,6 +186,8 @@ func TestPGGetActivityReportUsageCostAndTokens(t *testing.T) {
 		pgDayQuery(t, "2026-06-16", "UTC"))
 	require.NoError(t, err)
 	assert.Equal(t, 1, r.Totals.Sessions)
+	require.Len(t, r.Buckets, 288)
+	assert.Equal(t, 1000, r.Buckets[126].InputTokens)
 	assert.Equal(t, 500, r.Totals.OutputTokens)
 	// Cost = (1000*3 + 500*15) / 1e6 = 0.0105
 	assert.Equal(t, money.MustParseDollars("0.0105"), r.Totals.Cost)

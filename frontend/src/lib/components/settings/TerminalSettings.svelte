@@ -25,16 +25,19 @@
   });
 
   async function saveTerminal() {
-    configureGeneratedClient();
-    await ConfigService.postApiV1ConfigTerminal({
-      requestBody: {
-        mode: localMode as TerminalConfigBody.mode,
-        custom_bin: localBin || undefined,
-        custom_args: localArgs || undefined,
-      },
+    if (settings.saving) return;
+    await settings.runMutation(async () => {
+      configureGeneratedClient();
+      await ConfigService.postApiV1ConfigTerminal({
+        requestBody: {
+          mode: localMode as TerminalConfigBody.mode,
+          custom_bin: localBin || undefined,
+          custom_args: localArgs || undefined,
+        },
+      });
+      // Reload settings to pick up the saved values
+      await settings.load();
     });
-    // Reload settings to pick up the saved values
-    await settings.load();
   }
 
   let dirty = $derived(

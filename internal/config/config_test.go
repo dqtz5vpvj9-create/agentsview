@@ -855,6 +855,123 @@ func TestLoadFile_ReadsDirArrays(t *testing.T) {
 	assert.True(t, cfg.IsUserConfigured(parser.AgentAider))
 }
 
+func TestAgentDirsExplicitEmptyArrayOverridesDefaults(t *testing.T) {
+	t.Setenv("GROK_DIR", "")
+	t.Setenv("COPILOT_DIR", "")
+	defaults, err := Default()
+	require.NoError(t, err)
+	require.NotEmpty(t, defaults.ResolveDirs(parser.AgentGrok))
+	require.NotEmpty(t, defaults.ResolveDirs(parser.AgentCopilot))
+
+	cfg := loadMinimalWithConfig(t, map[string]any{
+		"grok_dirs":    []string{},
+		"copilot_dirs": []string{},
+	})
+
+	assert.Empty(t, cfg.ResolveDirs(parser.AgentGrok))
+	assert.True(t, cfg.IsUserConfigured(parser.AgentGrok))
+	assert.Empty(t, cfg.ResolveDirs(parser.AgentCopilot))
+	assert.True(t, cfg.IsUserConfigured(parser.AgentCopilot))
+}
+
+func TestAgentDirsEnvBeatsExplicitEmptyArray(t *testing.T) {
+	f := newConfigFixture(t)
+	f.WriteConfigText(t, "grok_dirs = []\n")
+	t.Setenv("GROK_DIR", "/from/env/grok")
+
+	cfg := f.LoadMinimal(t)
+
+	assert.Equal(t, []string{"/from/env/grok"}, cfg.ResolveDirs(parser.AgentGrok))
+	assert.True(t, cfg.IsUserConfigured(parser.AgentGrok))
+}
+
+func TestAgentDirsArrayPresenceTable(t *testing.T) {
+	t.Setenv("GROK_DIR", "")
+	tests := []struct {
+		name     string
+		config   string
+		wantUser bool
+		want     []string
+		empty    bool
+	}{
+		{name: "omitted retains defaults"},
+		{name: "non-empty replaces defaults", config: `grok_dirs = ["/from/config"]`, wantUser: true, want: []string{"/from/config"}},
+		{name: "empty clears defaults", config: "grok_dirs = []", wantUser: true, empty: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newConfigFixture(t)
+			f.WriteConfigText(t, tt.config)
+			cfg := f.LoadMinimal(t)
+
+			dirs := cfg.ResolveDirs(parser.AgentGrok)
+			assert.Equal(t, tt.wantUser, cfg.IsUserConfigured(parser.AgentGrok))
+			switch {
+			case tt.empty:
+				assert.Empty(t, dirs)
+			case tt.want != nil:
+				assert.Equal(t, tt.want, dirs)
+			default:
+				assert.NotEmpty(t, dirs)
+			}
+		})
+	}
+}
+
+func TestAgentDirsMalformedValuePreservesDefaults(t *testing.T) {
+	t.Setenv("GROK_DIR", "")
+	tests := []struct {
+		name   string
+		config string
+	}{
+		{name: "non-array", config: `grok_dirs = "not-an-array"`},
+		{name: "non-string element", config: "grok_dirs = [\"/valid\", 7]"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newConfigFixture(t)
+			f.WriteConfigText(t, tt.config)
+			cfg := f.LoadMinimal(t)
+
+			assert.NotEmpty(t, cfg.ResolveDirs(parser.AgentGrok))
+			assert.False(t, cfg.IsUserConfigured(parser.AgentGrok))
+		})
+	}
+}
+
+func TestAgentDirsNonexistentOverrideAndBlankEntry(t *testing.T) {
+	t.Setenv("GROK_DIR", "")
+	f := newConfigFixture(t)
+	f.WriteConfigText(t, "grok_dirs = [\"  \", \"C:/path/that/does/not/exist\"]\n")
+
+	cfg := f.LoadMinimal(t)
+
+	assert.Equal(t, []string{"C:/path/that/does/not/exist"},
+		cfg.ResolveDirs(parser.AgentGrok))
+	assert.True(t, cfg.IsUserConfigured(parser.AgentGrok))
+}
+
+func TestAgentDirsEmptyArrayWithSessionSource(t *testing.T) {
+	t.Setenv("GROK_DIR", "")
+	f := newConfigFixture(t)
+	f.WriteConfigText(t, `grok_dirs = []
+
+[[session_sources]]
+agent = "grok"
+dir = "/sessions/archive"
+machine = "archivebox"
+`)
+
+	cfg := f.LoadMinimal(t)
+
+	assert.Equal(t, []string{"/sessions/archive"}, cfg.ResolveDirs(parser.AgentGrok))
+	assert.Equal(t, "archivebox",
+		cfg.SourceMachines[parser.AgentGrok]["/sessions/archive"])
+	assert.True(t, cfg.IsUserConfigured(parser.AgentGrok))
+}
+
 func TestLoadFileSessionSourcesAreAdditiveAndOverrideDuplicateMachine(t *testing.T) {
 	f := newConfigFixture(t)
 	f.WriteConfigText(t, `
@@ -1151,6 +1268,65 @@ func TestResolveDirs_ClaudeConfigDirRootEnvVar(t *testing.T) {
 		assert.Equal(t, []string{"/from/config"},
 			cfg.ResolveDirs(parser.AgentClaude))
 		assert.True(t, cfg.IsUserConfigured(parser.AgentClaude))
+	})
+}
+
+func TestResolveDirs_DeepSeekHarnessPrecedence(t *testing.T) {
+	t.Run("config array overrides default", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		writeConfig(t, dir, map[string]any{
+			"deepseek_harness_sessions_dirs": []string{"/one", "/two"},
+		})
+
+		cfg, err := LoadMinimal()
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{"/one", "/two"},
+			cfg.ResolveDirs(parser.AgentDeepSeekHarness))
+		assert.True(t, cfg.IsUserConfigured(parser.AgentDeepSeekHarness))
+	})
+
+	t.Run("DSH_HOME re-roots implicit default", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		root := t.TempDir()
+		t.Setenv("DSH_HOME", root)
+		writeConfig(t, dir, map[string]any{})
+
+		cfg, err := LoadMinimal()
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{filepath.Join(root, "sessions")},
+			cfg.ResolveDirs(parser.AgentDeepSeekHarness))
+		assert.False(t, cfg.IsUserConfigured(parser.AgentDeepSeekHarness))
+	})
+
+	t.Run("sessions env beats DSH_HOME", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		t.Setenv("DSH_HOME", t.TempDir())
+		t.Setenv("DEEPSEEK_HARNESS_SESSIONS_DIR", "/from/env")
+		writeConfig(t, dir, map[string]any{})
+
+		cfg, err := LoadMinimal()
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{"/from/env"},
+			cfg.ResolveDirs(parser.AgentDeepSeekHarness))
+		assert.True(t, cfg.IsUserConfigured(parser.AgentDeepSeekHarness))
+	})
+
+	t.Run("environment beats config array", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		t.Setenv("DEEPSEEK_HARNESS_SESSIONS_DIR", "/from/env")
+		writeConfig(t, dir, map[string]any{
+			"deepseek_harness_sessions_dirs": []string{"/one", "/two"},
+		})
+
+		cfg, err := LoadMinimal()
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{"/from/env"},
+			cfg.ResolveDirs(parser.AgentDeepSeekHarness))
+		assert.True(t, cfg.IsUserConfigured(parser.AgentDeepSeekHarness))
 	})
 }
 
@@ -2003,6 +2179,34 @@ output_microdollars_per_mtok = 1
 	assert.Contains(t, err.Error(), "rates must not be negative")
 }
 
+func TestLoadFile_CustomModelPricing1hCacheCreation(t *testing.T) {
+	f := newConfigFixture(t)
+	f.WriteConfigText(t, `[custom_model_pricing.model]
+input_microdollars_per_mtok = 10000000
+output_microdollars_per_mtok = 50000000
+cache_creation_microdollars_per_mtok = 12500000
+cache_creation_1h_microdollars_per_mtok = 20000000
+cache_read_microdollars_per_mtok = 1000000
+`)
+
+	cfg := f.LoadMinimal(t)
+	require.Contains(t, cfg.CustomModelPricing, "model")
+	assert.Equal(t, int64(20_000_000),
+		cfg.CustomModelPricing["model"].CacheCreation1hMicrodollarsPerMTok)
+}
+
+func TestLoadFileRejectsNegative1hCustomModelPricing(t *testing.T) {
+	f := newConfigFixture(t)
+	f.WriteConfigText(t, `[custom_model_pricing.model]
+input_microdollars_per_mtok = 1
+cache_creation_1h_microdollars_per_mtok = -1
+`)
+
+	err := f.LoadMinimalErr(t)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rates must not be negative")
+}
+
 func TestLoadFileRejectsLegacyCustomModelPricingFields(t *testing.T) {
 	f := newConfigFixture(t)
 	f.WriteConfigText(t, `[custom_model_pricing.model]
@@ -2400,4 +2604,62 @@ func TestLoadFileSessionSourceAbsoluteDirDeduplicatesRelativeLegacyRoot(t *testi
 	assert.Equal(t, map[string]string{relative: "archivebox"},
 		cfg.SourceMachines[parser.AgentCopilot],
 		"the structured entry must relabel the equivalent legacy root")
+}
+
+func TestDisabledAgentsNormalizeWithoutHidingConfiguredDirs(t *testing.T) {
+	cfg, err := Default()
+	require.NoError(t, err)
+	geminiDirs := append([]string(nil), cfg.AgentDirs[parser.AgentGemini]...)
+
+	require.NoError(t, cfg.applyConfigTOML(`
+disabled_agents = [" gemini ", "claude", "gemini"]
+`))
+
+	assert.Equal(t,
+		[]parser.AgentType{parser.AgentClaude, parser.AgentGemini},
+		cfg.DisabledAgents,
+	)
+	assert.Equal(t, geminiDirs, cfg.ResolveDirs(parser.AgentGemini))
+}
+
+func TestDisabledAgentsRejectInvalidSessionProviders(t *testing.T) {
+	tests := []struct {
+		name    string
+		agent   string
+		wantErr string
+	}{
+		{
+			name:    "unknown",
+			agent:   "not-an-agent",
+			wantErr: `disabled_agents: unknown session provider "not-an-agent"`,
+		},
+		{
+			name:    "import only",
+			agent:   "chatgpt",
+			wantErr: `disabled_agents: "chatgpt" is not a configurable session provider`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := Default()
+			require.NoError(t, err)
+
+			err = cfg.applyConfigTOML(
+				`disabled_agents = ["` + tt.agent + `"]`,
+			)
+
+			require.EqualError(t, err, tt.wantErr)
+		})
+	}
+}
+
+func TestDisabledAgentsExplicitEmptyArrayEnablesDefaults(t *testing.T) {
+	cfg, err := Default()
+	require.NoError(t, err)
+	cfg.DisabledAgents = []parser.AgentType{parser.AgentGemini}
+
+	require.NoError(t, cfg.applyConfigTOML(`disabled_agents = []`))
+
+	assert.Empty(t, cfg.DisabledAgents)
+	assert.NotEmpty(t, cfg.ResolveDirs(parser.AgentGemini))
 }

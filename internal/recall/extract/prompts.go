@@ -3,13 +3,12 @@ package extract
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 )
 
@@ -260,23 +259,12 @@ func Fingerprint(
 		PromptDigests: promptDigests,
 		Request:       request,
 	}
-	// encoding/json writes map keys in sorted order, which makes the
-	// encoding canonical for the JSON-shaped values profiles carry.
-	canonical, err := json.Marshal(identity)
+	// The identity contains maps, so deterministic ordering is part of the
+	// fingerprint contract.
+	canonical, err := json.Marshal(identity, json.Deterministic(true))
 	if err != nil {
 		return "", fmt.Errorf("encoding extraction identity: %w", err)
 	}
 	sum := sha256.Sum256(canonical)
 	return hex.EncodeToString(sum[:]), nil
-}
-
-// ProfileNames lists the built-in profiles for error messages and doctor
-// output, sorted for stable display.
-func ProfileNames() []string {
-	names := make([]string, 0, len(builtinProfiles))
-	for _, profile := range builtinProfiles {
-		names = append(names, profile.Name)
-	}
-	sort.Strings(names)
-	return names
 }

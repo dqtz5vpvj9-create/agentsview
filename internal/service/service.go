@@ -5,7 +5,7 @@ package service
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"io"
 
@@ -168,6 +168,7 @@ type ContentSearchRequest struct {
 	Project, ExcludeProject, Machine, Agent           string
 	Date, DateFrom, DateTo, Timezone, ActiveSince     string
 	IncludeChildren, IncludeAutomated, IncludeOneShot bool
+	ExcludeSessionIDs                                 []string
 	// GitBranch is a branchListSep-joined list of opaque (project, branch) tokens (EncodeBranchFilterToken).
 	GitBranch string
 
@@ -324,7 +325,7 @@ type SessionDetail struct {
 func (d SessionDetail) MarshalJSON() ([]byte, error) {
 	type sessionAlias db.Session
 	return json.Marshal(struct {
-		sessionAlias
+		sessionAlias     `json:",inline"`
 		QualitySignals   *db.QualitySignals `json:"quality_signals,omitempty"`
 		HealthScoreBasis []string           `json:"health_score_basis,omitempty"`
 		HealthPenalties  map[string]int     `json:"health_penalties,omitempty"`
@@ -344,7 +345,7 @@ func (d SessionDetail) MarshalJSON() ([]byte, error) {
 func (d *SessionDetail) UnmarshalJSON(data []byte) error {
 	type sessionAlias db.Session
 	var v struct {
-		sessionAlias
+		sessionAlias     `json:",inline"`
 		QualitySignals   *db.QualitySignals `json:"quality_signals"`
 		HealthScoreBasis []string           `json:"health_score_basis"`
 		HealthPenalties  map[string]int     `json:"health_penalties"`
@@ -387,6 +388,7 @@ type ListFilter struct {
 	IncludeOneShot   bool   `json:"include_one_shot,omitempty"`
 	IncludeAutomated bool   `json:"include_automated,omitempty"`
 	IncludeChildren  bool   `json:"include_children,omitempty"`
+	IncludeSource    bool   `json:"include_source,omitempty"`
 	Outcome          string `json:"outcome,omitempty"`      // comma-separated
 	HealthGrade      string `json:"health_grade,omitempty"` // comma-separated
 	Termination      string `json:"termination,omitempty"`  // comma-separated

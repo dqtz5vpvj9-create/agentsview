@@ -5,9 +5,9 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
+	"errors"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,7 +72,7 @@ func TestPreparedHTTPSyncRebuildContributor(t *testing.T) {
 	require.NoError(t, err)
 	manifestJSON, err := json.Marshal(manifest)
 	require.NoError(t, err)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newCurrentProtocolServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/remote-sync/targets":
 			w.Header().Set("Content-Type", "application/json")
@@ -113,6 +113,14 @@ func TestPreparedHTTPSyncRebuildContributor(t *testing.T) {
 	)
 	require.NoError(t, err)
 	assert.False(t, stats.Aborted)
+	journalPath := mirrorJournalPath(MirrorDir(hs.DataDir, hs.Host))
+	assert.FileExists(t, journalPath,
+		"AfterSync runs before swap and must retain the journal")
+	require.NotNil(t, prepared.mirrorImport)
+	assert.Equal(t, JournalPendingSwap, prepared.mirrorImport.outcome)
+	require.NoError(t, prepared.Commit())
+	assert.NoFileExists(t, journalPath)
+	require.NoError(t, prepared.Commit(), "post-swap commit is idempotent")
 
 	full, err := database.GetSessionFull(context.Background(), "devbox~"+sessionID)
 	require.NoError(t, err)
@@ -149,7 +157,84 @@ func TestPreparedHTTPSyncRebuildContributor(t *testing.T) {
 	activeStats, err := prepared.ImportActive(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, 0, activeStats.Failed)
-	assert.Equal(t, 1, activeStats.Skipped)
+	assert.Equal(t, 0, activeStats.Skipped,
+		"reusing a prepared bootstrap import must preserve its full-parse scope")
+}
+
+func TestPreparedHTTPSyncRebuildOutcomeClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		err          error
+		cachePersist bool
+		want         JournalOutcome
+	}{
+		{name: "cancelled", err: context.Canceled, want: JournalCancelled},
+		{name: "cache persistence", cachePersist: true, want: JournalCachePersistFailed},
+		{name: "processing", err: errors.New("processing sentinel"), want: JournalProcessingFailures},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remote := newMirrorTestRemote(t)
+			remote.writeSession(t, "session.jsonl",
+				time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC), "rebuild outcome")
+			database, hs := newMirrorSync(t, remote, t.TempDir())
+			prepared, err := hs.Prepare(t.Context())
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, prepared.Close()) })
+			contributor, err := prepared.RebuildContributor()
+			require.NoError(t, err)
+
+			outcomeErr := tc.err
+			if tc.cachePersist {
+				engine := syncpkg.NewEngine(database, syncpkg.EngineConfig{})
+				t.Cleanup(engine.Close)
+				replacement, openErr := db.Open(filepath.Join(t.TempDir(), "replacement.db"))
+				require.NoError(t, openErr)
+				require.NoError(t, replacement.Close())
+				outcomeErr = contributor.AfterSync(engine, replacement)
+				require.Error(t, outcomeErr)
+			}
+			contributor.Finished(syncpkg.SyncStats{}, outcomeErr)
+			assert.Equal(t, tc.want, prepared.mirrorImport.outcome)
+			assert.Equal(t, tc.want, prepared.mirrorImport.pending.Stats.JournalOutcome)
+		})
+	}
+}
+
+func TestPreparedHTTPSyncDeferredRebuildIsNotCommitReady(t *testing.T) {
+	remote := newMirrorTestRemote(t)
+	remote.writeSession(t, "session.jsonl",
+		time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC), "deferred rebuild")
+	_, hs := newMirrorSync(t, remote, t.TempDir())
+	prepared, err := hs.Prepare(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, prepared.Close()) })
+	contributor, err := prepared.RebuildContributor()
+	require.NoError(t, err)
+
+	contributor.Finished(syncpkg.SyncStats{Deferred: 1}, nil)
+	assert.False(t, prepared.commitReady)
+	assert.Equal(t, JournalProcessingFailures, prepared.mirrorImport.outcome)
+	require.ErrorContains(t, prepared.Commit(), "not ready to commit")
+	assert.FileExists(t, mirrorJournalPath(MirrorDir(hs.DataDir, hs.Host)))
+}
+
+func TestPreparedHTTPSyncRebuildRetirementFailureRecordsDuration(t *testing.T) {
+	remote := newMirrorTestRemote(t)
+	remote.writeSession(t, "session.jsonl",
+		time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC), "rebuild retirement")
+	_, hs := newMirrorSync(t, remote, t.TempDir())
+	prepared, err := hs.Prepare(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, prepared.Close()) })
+	prepared.commitReady = true
+	prepared.retireJournal = func(string) error {
+		time.Sleep(time.Millisecond)
+		return errors.New("retirement sentinel")
+	}
+
+	require.ErrorContains(t, prepared.Commit(), "retirement sentinel")
+	assert.Equal(t, JournalRetirementFailed, prepared.mirrorImport.outcome)
+	assert.Positive(t, prepared.mirrorImport.pending.Stats.RetirementDuration)
 }
 
 func TestPreparedHTTPSyncImportActiveImportsPreparedRoot(t *testing.T) {
@@ -210,6 +295,163 @@ func TestImporterImportsExtractedRemoteFiles(t *testing.T) {
 	require.NotNil(t, full)
 	require.NotNil(t, full.FilePath)
 	assert.Contains(t, *full.FilePath, "devbox:/home/wes/.claude/projects/test-project/session.jsonl")
+}
+
+func TestRequireCompleteRejectsDeferredWithoutHardFailure(t *testing.T) {
+	err := requireCompleteProcessing(syncpkg.SyncStats{Deferred: 1})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed=0")
+	assert.Contains(t, err.Error(), "deferred=1")
+}
+
+func TestImporterHydratesIcodematePersistedToolResult(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+
+	extracted := t.TempDir()
+	remoteRoot := "/remote/icodemate/projects"
+	remoteSession := remoteRoot + "/project/sidecar.jsonl"
+	remoteResult := remoteRoot + "/project/sidecar/tool-results/output.txt"
+	localSession := remappedRemotePath(extracted, remoteSession)
+	localResult := remappedRemotePath(extracted, remoteResult)
+	require.NoError(t, os.MkdirAll(filepath.Dir(localResult), 0o755))
+	require.NoError(t, os.WriteFile(localResult, []byte("remote persisted output\n"), 0o644))
+
+	persistedPath, err := json.Marshal(remoteResult)
+	require.NoError(t, err)
+	placeholder := "<persisted-output>\nOutput too large. Full output saved to: " +
+		remoteResult + "\n</persisted-output>"
+	placeholderJSON, err := json.Marshal(placeholder)
+	require.NoError(t, err)
+	transcript := strings.Join([]string{
+		`{"type":"user","timestamp":"2024-01-01T00:00:00Z","uuid":"u1","message":{"content":"run it"}}`,
+		`{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"make logs"}}]}}`,
+		`{"type":"user","timestamp":"2024-01-01T00:00:02Z","uuid":"u2","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":` + string(placeholderJSON) + `}]},"toolUseResult":{"persistedOutputPath":` + string(persistedPath) + `}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(localSession, []byte(transcript), 0o644))
+
+	stats, err := Importer{Host: "devbox", DB: database}.ImportExtracted(
+		t.Context(), TargetSet{Dirs: map[parser.AgentType][]string{
+			parser.AgentIcodemate: {remoteRoot},
+		}}, extracted,
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.SessionsSynced)
+	messages, err := database.GetMessages(
+		t.Context(), "devbox~icodemate:sidecar", 0, 10, true,
+	)
+	require.NoError(t, err)
+	require.Len(t, messages, 2)
+	require.Len(t, messages[1].ToolCalls, 1)
+	assert.Equal(t, "remote persisted output\n",
+		messages[1].ToolCalls[0].ResultContent)
+}
+
+func TestImporterReturnsPartialStatsWhenOneSourceFails(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+
+	extracted := t.TempDir()
+	claudeRoot := "/remote/claude"
+	claudeDir := filepath.Join(remappedRemotePath(extracted, claudeRoot), "project")
+	require.NoError(t, os.MkdirAll(claudeDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(claudeDir, "healthy.jsonl"),
+		[]byte(testjsonl.NewSessionBuilder().AddClaudeUserWithSessionID(
+			"2026-08-15T10:00:00Z", "healthy remote source", "healthy",
+		).String()),
+		0o644,
+	))
+	qwenPawRoot := "/remote/qwenpaw"
+	qwenPawDir := filepath.Join(
+		remappedRemotePath(extracted, qwenPawRoot), "default", "sessions",
+	)
+	require.NoError(t, os.MkdirAll(qwenPawDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(qwenPawDir, "broken.json"), []byte("{not valid json"), 0o644,
+	))
+
+	stats, err := Importer{Host: "devbox", DB: database}.ImportExtracted(
+		t.Context(), TargetSet{Dirs: map[parser.AgentType][]string{
+			parser.AgentClaude:  {claudeRoot},
+			parser.AgentQwenPaw: {qwenPawRoot},
+		}}, extracted,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.SessionsSynced)
+	assert.Positive(t, stats.Failed)
+	session, err := database.GetSession(t.Context(), "devbox~healthy")
+	require.NoError(t, err)
+	assert.NotNil(t, session)
+}
+
+func TestImporterImportsEveryRemoteProviderTarget(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+
+	extracted := t.TempDir()
+	claudeRoot := "/remote/claude"
+	claudeDir := filepath.Join(
+		remappedRemotePath(extracted, claudeRoot), "project",
+	)
+	require.NoError(t, os.MkdirAll(claudeDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(claudeDir, "enabled.jsonl"),
+		[]byte(testjsonl.NewSessionBuilder().
+			AddClaudeUserWithSessionID(
+				"2026-08-09T10:00:00Z", "enabled remote", "enabled-remote",
+			).
+			String()),
+		0o644,
+	))
+
+	geminiRoot := "/remote/gemini"
+	geminiDir := filepath.Join(
+		remappedRemotePath(extracted, geminiRoot),
+		"tmp", "project", "chats",
+	)
+	require.NoError(t, os.MkdirAll(geminiDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(geminiDir,
+			"session-2026-08-09T10-00-disabled-remote.json"),
+		[]byte(testjsonl.GeminiSessionJSON(
+			"disabled-remote",
+			"project",
+			"2026-08-09T10:00:00Z",
+			"2026-08-09T10:01:00Z",
+			[]map[string]any{
+				testjsonl.GeminiUserMsg(
+					"user", "2026-08-09T10:00:00Z", "disabled remote",
+				),
+			},
+		)),
+		0o644,
+	))
+
+	stats, err := Importer{
+		Host: "devbox",
+		DB:   database,
+	}.ImportExtracted(t.Context(), TargetSet{
+		Dirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {claudeRoot},
+			parser.AgentGemini: {geminiRoot},
+		},
+	}, extracted)
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, stats.SessionsSynced)
+	page, err := database.ListSessions(t.Context(), db.SessionFilter{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, page.Sessions, 2)
+	ids := []string{page.Sessions[0].ID, page.Sessions[1].ID}
+	assert.ElementsMatch(t, []string{
+		"devbox~enabled",
+		"devbox~gemini:disabled-remote",
+	}, ids)
 }
 
 func TestImporterImportsHermesDatabaseOnlySession(t *testing.T) {

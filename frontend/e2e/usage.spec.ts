@@ -34,10 +34,86 @@ test.describe("Usage page", () => {
     await expect(
       page.locator(".chart-container"),
     ).toBeVisible();
-    // SVG chart should render.
     await expect(
-      page.locator(".chart-container svg"),
+      page
+        .locator(".chart-container")
+        .getByRole("figure", { name: "Cost Over Time" }),
     ).toBeVisible();
+  });
+
+  test("keeps summary cards and the chart fixed through brush selection", async ({
+    page,
+  }) => {
+    await expect(
+      page.locator(".summary-cards .card-value").first(),
+    ).toBeVisible({ timeout: 10_000 });
+
+    const chart = page.locator(".chart-container").first();
+    const plot = chart.locator("svg").first();
+    const brush = chart.locator(".lc-brush-context");
+    const summaryRow = page.locator(".summary-cards");
+    const summaryCards = summaryRow.locator(".card");
+    await expect(plot).toBeVisible({ timeout: 10_000 });
+    await expect(brush).toBeVisible({ timeout: 10_000 });
+
+    const measureLayout = async () => {
+      const row = await summaryRow.boundingBox();
+      const chartBox = await chart.boundingBox();
+      const plotBox = await plot.boundingBox();
+      const cardBoxes = await summaryCards.evaluateAll((cards) =>
+        cards.map((card) => card.getBoundingClientRect().height),
+      );
+      expect(row).not.toBeNull();
+      expect(chartBox).not.toBeNull();
+      expect(plotBox).not.toBeNull();
+      if (!row || !chartBox || !plotBox) {
+        throw new Error("Usage layout is not measurable");
+      }
+      expect(new Set(cardBoxes).size).toBe(1);
+      return { row, chart: chartBox, plot: plotBox, cardBoxes };
+    };
+
+    const beforeLayout = await measureLayout();
+    const brushBounds = await brush.boundingBox();
+    expect(brushBounds).not.toBeNull();
+    if (!brushBounds) return;
+
+    const y = brushBounds.y + brushBounds.height / 2;
+    await page.mouse.move(
+      brushBounds.x + brushBounds.width * 0.25,
+      y,
+    );
+    await page.mouse.down();
+    await page.mouse.move(
+      brushBounds.x + brushBounds.width * 0.65,
+      y,
+      { steps: 8 },
+    );
+    await page.mouse.up();
+
+    await expect(
+      chart.getByRole("button", { name: "Clear selection" }),
+    ).toBeVisible();
+    const selectedLayout = await measureLayout();
+    expect(selectedLayout.plot.y - selectedLayout.chart.y).toBe(
+      beforeLayout.plot.y - beforeLayout.chart.y,
+    );
+    expect(selectedLayout.cardBoxes).toEqual(beforeLayout.cardBoxes);
+    expect(selectedLayout.row.height).toBe(beforeLayout.row.height);
+    expect(selectedLayout.chart.y).toBe(beforeLayout.chart.y);
+    expect(selectedLayout.plot.y).toBe(beforeLayout.plot.y);
+
+    await chart
+      .getByRole("button", { name: "Clear selection" })
+      .click();
+    await expect(
+      chart.getByRole("button", { name: "Clear selection" }),
+    ).toBeHidden();
+    const clearedLayout = await measureLayout();
+    expect(clearedLayout.cardBoxes).toEqual(beforeLayout.cardBoxes);
+    expect(clearedLayout.row.height).toBe(beforeLayout.row.height);
+    expect(clearedLayout.chart.y).toBe(beforeLayout.chart.y);
+    expect(clearedLayout.plot.y).toBe(beforeLayout.plot.y);
   });
 
   test("shows attribution panel with treemap", async ({
@@ -49,9 +125,10 @@ test.describe("Usage page", () => {
     await expect(
       page.locator(".attribution-panel"),
     ).toBeVisible();
-    // Treemap SVG should be rendered.
     await expect(
-      page.locator(".treemap-container svg"),
+      page
+        .locator(".treemap-container")
+        .getByRole("figure", { name: "Treemap" }),
     ).toBeVisible();
   });
 
@@ -127,6 +204,9 @@ test.describe("Usage page", () => {
       .locator(".usage-toolbar .kit-filter-dropdown__btn")
       .first();
     await trigger.click();
+    await expect(
+      page.locator(".usage-toolbar .kit-filter-dropdown__item").first(),
+    ).toBeVisible();
 
     // Click "Deselect all".
     await page
@@ -231,7 +311,9 @@ test.describe("Usage page", () => {
     ).toHaveAttribute("aria-checked", "true");
   });
 
-  test("URL updates when filter changes", async ({ page }) => {
+  test("project filters use stable keys without writing them to the URL", async ({
+    page,
+  }) => {
     // Wait for data.
     await expect(
       page.locator(".summary-cards .card-value").first(),
@@ -242,15 +324,26 @@ test.describe("Usage page", () => {
       .locator(".usage-toolbar .kit-filter-dropdown__btn")
       .first();
     await trigger.click();
-    await page
+    const projectOption = page
       .locator(".usage-toolbar .kit-filter-dropdown__item")
       .filter({ hasText: "project-delta" })
-      .first()
-      .click();
+      .first();
+    await expect(projectOption).toBeVisible();
+    const filteredRequest = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return url.pathname.endsWith("/api/v1/usage/summary") &&
+        !!url.searchParams.get("exclude_project_key");
+    });
+    await projectOption.click();
+    const requestUrl = new URL((await filteredRequest).url());
     await page.mouse.click(10, 10);
 
-    // URL should contain the exclude_project param.
-    await expect(page).toHaveURL(/exclude_project=/);
+    expect(requestUrl.searchParams.get("exclude_project_key")).toBeTruthy();
+    await expect(page).toHaveURL((url) =>
+      url.pathname === "/usage" &&
+      !url.searchParams.has("exclude_project") &&
+      !url.searchParams.has("exclude_project_key")
+    );
   });
 
   test("returning bare refreshes rolling bounds after midnight", async ({

@@ -2,7 +2,7 @@ package parser
 
 import (
 	"bufio"
-	"encoding/json"
+	"encoding/json/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -76,7 +76,7 @@ func TestCodexCapturedForkReplayTotals(t *testing.T) {
 				lookup := resolver.Lookup(message.Model)
 				require.True(t, lookup.OK, "pricing %s", message.Model)
 				cost, costErr := lookup.Rates.CostForTokens(
-					usage.Input, usage.Output, 0, usage.CacheWrite, usage.CacheRead,
+					usage.Input, usage.Output, 0, usage.CacheWrite, 0, usage.CacheRead,
 				)
 				require.NoError(t, costErr)
 				totalCost, costErr = money.Add(totalCost, cost)

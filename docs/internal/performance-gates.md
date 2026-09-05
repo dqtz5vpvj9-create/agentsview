@@ -20,6 +20,7 @@ contracts are documented in
 | Bulk ingest throughput         | Full resync ran per-row inserts and rebuilt FTS incrementally; 26.7k sessions took 1m17s.                                                                                                               | #411                                           |
 | Event storms                   | One SSE emit per watcher flush drove ~1/s dashboard refetch; SQLite WAL sidecar events fanned out to every session in a shared DB.                                                                      | #367, #956                                     |
 | Per-row query shape            | `GetDailyUsage` ran 1.2M `json_extract` calls per scan and had no date pushdown.                                                                                                                        | #309                                           |
+| Usage archive scaling          | Normalized facts removed JSON parsing but warm requests still ranked and priced hundreds of thousands of rows instead of reading daily aggregates.                                                      | Usage aggregate cache                          |
 
 ## Two layers of gates
 
@@ -58,6 +59,9 @@ runner noise and fail loudly:
   `internal/sync/engine_integration_test.go` — safe Codex growth appends only
   new rows while lifecycle metadata, incomplete records, title changes, and
   retroactive updates preserve full-parse behavior.
+- `TestCountDuplicatePromptsAllocationGrowthStaysNearLinear`
+  (`internal/signals/heuristics_test.go`) — session-quality analysis must not
+  rebuild token sets for every pair of user prompts.
 
 When you fix a performance bug, prefer adding a gate at this layer: expose or
 reuse a counter (`SyncStats`, `PhaseStats`, `AnomalyStats`, a swappable
@@ -67,9 +71,9 @@ sessions" or "the manifest is read once per root regardless of session count".
 ### 2. Benchmark gate (runs on every PR via `bench.yml`)
 
 `.github/workflows/bench.yml` runs `make bench-gate` — the single source of
-truth for the gated package list, sample count, and iteration count — on the PR
-head and its merge base on the same runner, then compares the outputs with
-`cmd/benchgate`:
+truth for the gated package list, sample count, and per-tier iteration counts —
+on the PR head and its merge base on the same runner, then compares the outputs
+with `cmd/benchgate`:
 
 - `BenchmarkSyncAllWarmNoop` — full sync over an already-synced archive (stat +
   skip work only; also self-asserts nothing is re-synced or bulk-rewritten).
@@ -87,8 +91,22 @@ head and its merge base on the same runner, then compares the outputs with
 - `BenchmarkReplaceSessionMessagesStreamingMerge` — the streaming chunk-merge
   diff path (one UPDATE, not a full delete+reinsert).
 - `BenchmarkInsertMessagesBatch` — multi-row batched ingest.
-- `BenchmarkGetDailyUsage` — usage aggregation over 100k message rows.
+- `BenchmarkResyncBulkContributorIngest` — the same archive entering the atomic
+  rebuild through a contributor engine.
+- `BenchmarkSearchContentSubstringPage` / `BenchmarkSearchContentFTSPage` — one
+  page of content search through the substring and FTS paths.
+- `BenchmarkGetDailyUsage` — usage aggregation over 100k message rows. The usage
+  aggregate implementation keeps this benchmark name so the gate compares it
+  with the merge-base request path. Its warm cases must scan no normalized
+  facts and scale with aggregate plus exceptional rows.
+- `BenchmarkSQLiteActivityReportCandidateSource100K`,
+  `BenchmarkSQLiteActivityReportCandidateSourceLongSession`, and
+  `BenchmarkSQLiteActivityReportArtifacts100K` — activity-report candidate
+  streaming and artifact building over 100k sessions or a 100k-message
+  session.
 - `BenchmarkScan` / `BenchmarkScanDefinite` — secret-scan regex throughput.
+- `BenchmarkCountDuplicatePromptsLargeSession` — duplicate-prompt analysis over
+  a long session with shared vocabulary and distinct prompt context.
 
 `benchgate` builds on `golang.org/x/perf`: `benchfmt` parses the output and
 `benchmath` — the statistics engine behind `benchstat` — summarizes samples and
@@ -126,10 +144,19 @@ older or partial — is reported as not gated.
 The gate always runs with a fixed `-benchtime=Nx` iteration count (not a
 duration): two of the benchmarks grow their fixture as they iterate, so the
 baseline and candidate must run the same number of iterations to measure
-identical workloads. CI evaluates `make bench-gate-config` on the PR head and
-passes the count and benchtime into the merge-base run, so a PR that changes
-those defaults still compares identical workloads; do the same locally if you
-override them.
+identical workloads. Iterations come in two tiers. Benchmarks whose single
+iteration costs hundreds of milliseconds to seconds (the 100k-row usage and
+activity-report fixtures and cold-archive ingest, matched by `BENCH_GATE_HEAVY`)
+run in a second `go test` pass with `BENCH_GATE_HEAVY_TIME` iterations; every
+other benchmark runs with `BENCH_GATE_TIME`. Per-op ratios at that scale do not
+need the averaging that millisecond-scale samples do, and at the full iteration
+count those few benchmarks were most of the gate's wall clock.
+`BENCH_GATE_COUNT` samples are taken per benchmark, and every sample rebuilds
+the fixture, so the count is kept at benchgate's significance minimum. CI
+evaluates `make bench-gate-config` on the PR head and passes the count, both
+iteration counts, and the heavy-tier regex into the merge-base run, so a PR that
+changes those defaults still compares identical workloads; do the same locally
+if you override them.
 
 Report identifiers are package-qualified benchmark names
 (`go.kenn.io/agentsview/internal/db.InsertMessagesBatch-18`) when the captured
@@ -152,10 +179,30 @@ go run ./cmd/benchgate -old old.txt -new new.txt
 Cross-backend query benchmarks live separately in `internal/backendbench`
 (`make bench-backends`, requires Docker) and are not part of the PR gate.
 
+## Usage aggregate release gates
+
+CI uses fixture-based work invariants and benchmark ratios. Machine-specific
+targets are manual release gates on the protected production-scale clone. Run
+them after cache statistics maintenance so planner state does not exaggerate the
+aggregate tier's benefit.
+
+- Complete warm 30-day CLI result: at most two seconds.
+- Warm in-process 30-day result: target 1.5 seconds.
+- Report warm 1-day, 7-day, 30-day, and all-history results.
+- Report cold timezone/component construction and steady-state rebuild
+  throughput separately.
+- Report exception group and row counts plus exception-resolution time for
+  30-day and all-history reads.
+- Newest-first facts plus process-local rollups: complete within 30 seconds.
+- Full facts plus process-local rollup coverage: complete within five minutes.
+
+The detailed architecture and oracle requirements are in
+[Usage Aggregate Cache](usage-aggregate-cache.md).
+
 `BenchmarkCodexIncrementalCursor` lives in `internal/parser` and compares cold
 prefix reconstruction with an exact warm cursor. It is diagnostic rather than
-PR-gated: `BENCH_GATE_PACKAGES` currently contains only `./internal/sync`,
-`./internal/db`, and `./internal/secrets`.
+PR-gated: `BENCH_GATE_PACKAGES` currently contains `./internal/sync`,
+`./internal/db`, `./internal/secrets`, and `./internal/signals`.
 
 ## Adding a benchmark to the gate
 
@@ -174,7 +221,12 @@ reported without gating; it gates automatically once merged.
    Makefile; each side of the comparison benchmarks its own commit's list, so
    growing the gate cannot break the base run.
 1. Keep per-op cost roughly in the 100µs–100ms band: below the benchgate floors
-   nothing is gated, and far above it the job gets slow.
+   nothing is gated, and far above it the job gets slow. A benchmark that
+   needs a large fixture to expose per-row scaling belongs in
+   `BENCH_GATE_HEAVY` so it runs with the reduced iteration count; a
+   fixture-growing benchmark does not, because its per-op cost depends on the
+   iteration count. Keep fixture seeding cheap too: it is repeated once per
+   `-count` sample.
 1. Keep per-iteration setup out of the timed region (`b.ResetTimer`, pre-built
    fixtures): helper allocations inside the loop are gated as if they were
    product cost and dilute or distort the ratio.

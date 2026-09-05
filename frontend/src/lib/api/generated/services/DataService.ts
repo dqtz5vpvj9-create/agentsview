@@ -3,12 +3,44 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { DataCandidatesResponse } from '../models/DataCandidatesResponse';
+import type { DataCompactRequest } from '../models/DataCompactRequest';
 import type { DataProjectRulesResponse } from '../models/DataProjectRulesResponse';
+import type { DbCompactResult } from '../models/DbCompactResult';
 import type { DbProjectInventory } from '../models/DbProjectInventory';
 import type { CancelablePromise } from '../core/CancelablePromise';
 import { OpenAPI } from '../core/OpenAPI';
 import { request as __request } from '../core/request';
 export class DataService {
+  /**
+   * Compact local archive
+   * @returns DbCompactResult OK
+   * @throws ApiError
+   */
+  public static postApiV1DataCompact({
+    requestBody,
+  }: {
+    requestBody: DataCompactRequest,
+  }): CancelablePromise<DbCompactResult> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/api/v1/data/compact',
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `Bad Request`,
+        401: `Unauthorized`,
+        403: `Forbidden`,
+        404: `Not Found`,
+        409: `Conflict`,
+        422: `Unprocessable Entity`,
+        500: `Internal Server Error`,
+        501: `Not Implemented`,
+        502: `Bad Gateway`,
+        503: `Service Unavailable`,
+        504: `Gateway Timeout`,
+      },
+    });
+  }
   /**
    * List archive-wide reclassification candidates
    * @returns DataCandidatesResponse OK

@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"io/fs"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	httppprof "net/http/pprof"
 	"net/url"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,8 +25,10 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/insight"
+	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/postgres"
 	"go.kenn.io/agentsview/internal/pricingrefresh"
+	"go.kenn.io/agentsview/internal/rawsync"
 	"go.kenn.io/agentsview/internal/recall/extract"
 	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/service"
@@ -47,7 +52,10 @@ type VersionInfo struct {
 // Bump it when a client-visible contract cannot be decoded safely by an older
 // CLI or daemon.
 const (
-	APIVersion = 6
+	APIVersion = 8
+	// ScopedWatchPushAPIVersion is the first daemon API that accepts bounded
+	// watcher batches and their authoritative recovery scope on push requests.
+	ScopedWatchPushAPIVersion = 7
 	// SubagentUsageAPIVersion is the first daemon API that guarantees
 	// combined session-usage scope and targeted descendant synchronization.
 	SubagentUsageAPIVersion = 6
@@ -58,23 +66,32 @@ const daemonService = "agentsview"
 const (
 	defaultInsightLogDrainTimeout    = 2 * time.Second
 	defaultInsightLogStopWaitTimeout = 500 * time.Millisecond
+	defaultHTTPReadTimeout           = 10 * time.Second
+	corsAllowedRequestHeaders        = "Content-Type, Authorization, " +
+		service.SemanticSearchIntentHeader + ", " + rawSyncDeviceIDHeader +
+		", " + rawSyncUploadOffsetHeader
+	corsExposedResponseHeaders = rawSyncUploadOffsetHeader + ", " +
+		rawSyncUploadLengthHeader + ", " + rawSyncUploadCompleteHeader + ", Location"
 )
 
 // Server is the HTTP server that serves the SPA and REST API.
 type Server struct {
-	mu              gosync.RWMutex
-	cfg             config.Config
-	db              db.Store
-	engine          *sync.Engine
-	onDemandEngine  *sync.Engine
-	sessions        service.SessionService
-	broadcaster     *Broadcaster
-	mux             *http.ServeMux
-	api             huma.API
-	httpSrv         *http.Server
-	startupProbeKey []byte
-	version         VersionInfo
-	dataDir         string
+	mu                    gosync.RWMutex
+	cfg                   config.Config
+	activeDisabledAgents  []parser.AgentType
+	db                    db.Store
+	activityReports       *activityReportCache
+	activityReportFlights *activityReportBuildGroup
+	engine                *sync.Engine
+	onDemandEngine        *sync.Engine
+	sessions              service.SessionService
+	broadcaster           *Broadcaster
+	mux                   *http.ServeMux
+	api                   huma.API
+	httpSrv               *http.Server
+	startupProbeKey       []byte
+	version               VersionInfo
+	dataDir               string
 
 	httpRemoteCleanupRegistry *remotesync.CleanupRegistry
 
@@ -89,6 +106,7 @@ type Server struct {
 
 	insightLogDrainTimeout    time.Duration
 	insightLogStopWaitTimeout time.Duration
+	httpReadTimeout           time.Duration
 
 	// handlerDelay is injected before each timeout-wrapped
 	// handler, used only by tests to guarantee handlers
@@ -155,9 +173,39 @@ type Server struct {
 	// with the worker-backed build-and-swap instead of an in-process resync.
 	localResyncRunner LocalResyncRunner
 
+	// localCompactRunner, when set, backs archive compaction with the daemon's
+	// maintenance barrier instead of allowing a CLI to bypass the writer.
+	localCompactRunner LocalCompactRunner
+
 	artifactExchangeRunner ArtifactExchangeRunner
+	rawSyncDeviceAuth      RawSyncDeviceAuth
+	rawSyncCustody         RawSyncCustody
+	rawSyncSchemaOnly      bool
+	rawSyncUploads         RawSyncUploads
 
 	ensurePricing func(context.Context, *db.DB) error
+}
+
+type insightGenerationOptionsContextKey struct{}
+
+func (s *Server) currentInsightGenerateOptions(
+	ctx context.Context,
+) insight.GenerateOptions {
+	if options, ok := ctx.Value(insightGenerationOptionsContextKey{}).(insight.GenerateOptions); ok {
+		return options
+	}
+	s.mu.RLock()
+	cfg := s.cfg
+	s.mu.RUnlock()
+	return insightGenerateOptions(cfg)
+}
+
+func (s *Server) defaultInsightGenerateStream(
+	ctx context.Context, agent, prompt string, onLog insight.LogFunc,
+) (insight.Result, error) {
+	return insight.GenerateStreamWithOptions(
+		ctx, agent, prompt, onLog, s.currentInsightGenerateOptions(ctx),
+	)
 }
 
 // New creates a new Server.
@@ -184,28 +232,22 @@ func New(
 
 	s := &Server{
 		cfg:                       cfg,
+		activeDisabledAgents:      append([]parser.AgentType(nil), cfg.DisabledAgents...),
 		db:                        database,
+		activityReports:           newActivityReportCache(),
+		activityReportFlights:     newActivityReportBuildGroup(),
 		engine:                    engine,
 		sessions:                  sessions,
 		mux:                       http.NewServeMux(),
 		httpRemoteCleanupRegistry: new(remotesync.CleanupRegistry),
 		insightLogDrainTimeout:    defaultInsightLogDrainTimeout,
 		insightLogStopWaitTimeout: defaultInsightLogStopWaitTimeout,
+		httpReadTimeout:           defaultHTTPReadTimeout,
 		ensurePricing:             pricingrefresh.EnsureCurrent,
-		generateStreamFunc: func(
-			ctx context.Context, agent, prompt string,
-			onLog insight.LogFunc,
-		) (insight.Result, error) {
-			return insight.GenerateStreamWithOptions(
-				ctx, agent, prompt, onLog,
-				insight.GenerateOptions{
-					Agents: insightAgentConfig(cfg.Agent),
-				},
-			)
-		},
-		spaFS:      dist,
-		spaHandler: http.FileServerFS(dist),
+		spaFS:                     dist,
+		spaHandler:                http.FileServerFS(dist),
 	}
+	s.generateStreamFunc = s.defaultInsightGenerateStream
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -219,8 +261,102 @@ func New(
 	return s
 }
 
+func insightGenerateOptions(cfg config.Config) insight.GenerateOptions {
+	opts := insight.GenerateOptions{Agents: insightAgentConfig(cfg.Agent)}
+	if strings.TrimSpace(cfg.Insights.Endpoint) != "" &&
+		strings.TrimSpace(cfg.Insights.Model) != "" {
+		opts.Endpoint = &insight.EndpointConfig{
+			Endpoint:  cfg.Insights.Endpoint,
+			Model:     cfg.Insights.Model,
+			APIKey:    cfg.Insights.APIKey(),
+			AllowHTTP: cfg.Insights.AllowHTTP,
+		}
+	}
+	return opts
+}
+
+// ingestionConfig returns the daemon-start configuration for local filesystem
+// provider selection. Settings updates are persisted and reflected by GET
+// immediately, but the running local engine, watchers, and polling keep one
+// provider set until restart. Remote import and export ignore DisabledAgents.
+func (s *Server) ingestionConfig() config.Config {
+	s.mu.RLock()
+	cfg := s.cfg
+	s.mu.RUnlock()
+	cfg.DisabledAgents = append(
+		[]parser.AgentType(nil), s.activeDisabledAgents...,
+	)
+	return cfg
+}
+
 // Option configures a Server.
 type Option func(*Server)
+
+// RawSyncDeviceAuth exchanges device credentials and authenticates scoped
+// raw-transport tokens.
+type RawSyncDeviceAuth interface {
+	AuthenticateCredential(
+		context.Context, string, string,
+	) (rawsync.AuthIdentity, error)
+	IssueToken(
+		context.Context, string, string, rawsync.DeviceTokenScope,
+	) (rawsync.IssuedDeviceToken, error)
+	AuthenticateToken(
+		context.Context, string, rawsync.DeviceTokenScope,
+	) (rawsync.AuthIdentity, error)
+}
+
+// RawSyncCustody exposes authenticated raw-custody control-plane operations.
+type RawSyncCustody interface {
+	MissingObjects(
+		context.Context,
+		rawsync.AuthIdentity,
+		parser.AgentType,
+		[]rawsync.ObjectRef,
+	) ([]rawsync.ObjectRef, error)
+	CommitManifest(
+		context.Context,
+		rawsync.AuthIdentity,
+		rawsync.Manifest,
+	) (rawsync.CommitResult, error)
+}
+
+// RawSyncUploads exposes authenticated resumable raw-object transfers.
+type RawSyncUploads interface {
+	Start(
+		context.Context,
+		rawsync.AuthIdentity,
+		parser.AgentType,
+		rawsync.ObjectRef,
+	) (rawsync.UploadSession, bool, error)
+	Status(
+		context.Context,
+		rawsync.AuthIdentity,
+		string,
+	) (rawsync.UploadSession, error)
+	Append(
+		context.Context,
+		rawsync.AuthIdentity,
+		string,
+		int64,
+		[]byte,
+	) (rawsync.UploadSession, error)
+}
+
+// WithRawSyncServices enables authenticated raw-sync machine routes.
+func WithRawSyncServices(auth RawSyncDeviceAuth, custody RawSyncCustody) Option {
+	return func(s *Server) {
+		s.rawSyncDeviceAuth = auth
+		s.rawSyncCustody = custody
+	}
+}
+
+// WithRawSyncUploads enables the scoped resumable raw-object data plane.
+func WithRawSyncUploads(uploads RawSyncUploads) Option {
+	return func(s *Server) {
+		s.rawSyncUploads = uploads
+	}
+}
 
 func insightAgentConfig(
 	cfg map[string]config.AgentConfig,
@@ -420,12 +556,36 @@ func WithLocalResyncRunner(r LocalResyncRunner) Option {
 	return func(s *Server) { s.localResyncRunner = r }
 }
 
+// LocalCompactRunner runs staged maintenance against the local SQLite archive.
+// The daemon injects this runner so the command shares the archive-wide
+// maintenance barrier with sync and resync.
+type LocalCompactRunner func(
+	ctx context.Context, options db.CompactOptions,
+) (db.CompactResult, error)
+
+// WithLocalCompactRunner injects the daemon-managed compact runner.
+func WithLocalCompactRunner(r LocalCompactRunner) Option {
+	return func(s *Server) { s.localCompactRunner = r }
+}
+
 func (s *Server) humaConfig() huma.Config {
 	version := s.version.Version
 	if version == "" {
 		version = "dev"
 	}
 	cfg := huma.DefaultConfig("AgentsView API", version)
+	jsonFormat := huma.Format{
+		Marshal: func(w io.Writer, value any) error {
+			return json.MarshalWrite(w, value)
+		},
+		Unmarshal: func(data []byte, value any) error {
+			return json.Unmarshal(data, value)
+		},
+	}
+	cfg.Formats = map[string]huma.Format{
+		"application/json": jsonFormat,
+		"json":             jsonFormat,
+	}
 	cfg.Info.Description = "HTTP API for browsing, searching, syncing, and managing local agent sessions."
 	cfg.OpenAPIPath = "/api/openapi"
 	cfg.DocsPath = ""
@@ -435,6 +595,10 @@ func (s *Server) humaConfig() huma.Config {
 		"#/components/schemas/",
 		agentsViewSchemaNamer,
 	)
+	cfg.Components.Schemas.RegisterTypeAlias(
+		reflect.TypeFor[jsontext.Value](),
+		reflect.TypeFor[humaArbitraryJSON](),
+	)
 	if s.basePath != "" {
 		cfg.Servers = []*huma.Server{{
 			URL:         s.basePath,
@@ -442,6 +606,14 @@ func (s *Server) humaConfig() huma.Config {
 		}}
 	}
 	return cfg
+}
+
+// humaArbitraryJSON gives Huma the OpenAPI shape for jsontext.Value. Runtime
+// encoding still uses jsontext.Value directly through JSON v2.
+type humaArbitraryJSON []byte
+
+func (humaArbitraryJSON) Schema(huma.Registry) *huma.Schema {
+	return &huma.Schema{}
 }
 
 func (s *Server) routes() {
@@ -1085,7 +1257,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	srv := &http.Server{
 		Addr:        addr,
 		Handler:     s.Handler(),
-		ReadTimeout: 10 * time.Second,
+		ReadTimeout: s.httpReadTimeout,
 		IdleTimeout: 120 * time.Second,
 	}
 	if s.baseCtx != nil {
@@ -1097,6 +1269,15 @@ func (s *Server) Serve(ln net.Listener) error {
 	s.mu.Lock()
 	s.httpSrv = srv
 	s.mu.Unlock()
+	if cache := s.activityReports; cache != nil {
+		cacheCtx := context.Background()
+		if s.baseCtx != nil {
+			cacheCtx = s.baseCtx
+		}
+		cacheCtx, stopCache := context.WithCancel(cacheCtx)
+		go cache.Run(cacheCtx)
+		defer stopCache()
+	}
 	log.Printf("Starting server at http://%s", addr)
 	return srv.Serve(ln)
 }
@@ -1254,12 +1435,13 @@ func corsMiddleware(
 				ensureVaryHeader(w.Header(), "Origin")
 				w.Header().Set(
 					"Access-Control-Allow-Methods",
-					"GET, POST, PUT, PATCH, DELETE, OPTIONS",
+					"GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
 				)
 				w.Header().Set(
 					"Access-Control-Allow-Headers",
-					"Content-Type, Authorization, "+service.SemanticSearchIntentHeader,
+					corsAllowedRequestHeaders,
 				)
+				w.Header().Set("Access-Control-Expose-Headers", corsExposedResponseHeaders)
 				if r.Method == http.MethodOptions {
 					w.WriteHeader(http.StatusNoContent)
 					return
@@ -1291,12 +1473,13 @@ func corsMiddleware(
 			ensureVaryHeader(w.Header(), "Origin")
 			w.Header().Set(
 				"Access-Control-Allow-Methods",
-				"GET, POST, PUT, PATCH, DELETE, OPTIONS",
+				"GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
 			)
 			w.Header().Set(
 				"Access-Control-Allow-Headers",
-				"Content-Type, Authorization, "+service.SemanticSearchIntentHeader,
+				corsAllowedRequestHeaders,
 			)
+			w.Header().Set("Access-Control-Expose-Headers", corsExposedResponseHeaders)
 			if r.Method == http.MethodOptions {
 				if !safeForReads {
 					http.Error(

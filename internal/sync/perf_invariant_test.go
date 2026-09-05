@@ -2,7 +2,7 @@ package sync
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -164,9 +164,7 @@ func TestScheduledReconcileWorkIsClaudeCardinalityIndependent(t *testing.T) {
 
 		deleted, err := database.GetSessionFull(context.Background(), cowork[2].id)
 		require.NoError(t, err)
-		require.NotNil(t, deleted)
-		require.NotNil(t, deleted.DeletionCause)
-		assert.Equal(t, "source_missing", *deleted.DeletionCause)
+		assertSourceMissingState(t, deleted)
 		for _, id := range claudeIDs {
 			active, err := database.GetSession(context.Background(), id)
 			require.NoError(t, err)

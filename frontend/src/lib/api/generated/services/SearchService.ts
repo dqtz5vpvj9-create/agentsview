@@ -92,6 +92,7 @@ export class SearchService {
     includeChildren,
     includeAutomated,
     includeOneShot,
+    excludeSession,
     limit,
     cursor,
     context,
@@ -177,6 +178,10 @@ export class SearchService {
      */
     includeOneShot?: boolean,
     /**
+     * Session IDs to exclude; repeatable
+     */
+    excludeSession?: any[] | null,
+    /**
      * Maximum number of results
      */
     limit?: number,
@@ -215,6 +220,7 @@ export class SearchService {
         'include_children': includeChildren,
         'include_automated': includeAutomated,
         'include_one_shot': includeOneShot,
+        'exclude_session': excludeSession,
         'limit': limit,
         'cursor': cursor,
         'context': context,

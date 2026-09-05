@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render } from "@testing-library/svelte";
 import { mount, tick, unmount } from "svelte";
 import ConcurrencyTimeline from "./ConcurrencyTimeline.svelte";
@@ -8,6 +8,7 @@ import { testMoney } from "../../test/money.js";
 
 class ResizeObserverMock {
   observe = vi.fn();
+  unobserve = vi.fn();
   disconnect = vi.fn();
 }
 
@@ -40,6 +41,7 @@ function makeReport(overrides: Partial<Report> = {}): Report {
       end: "2026-06-16T09:00:00Z",
       max_agents: 3,
       agent_minutes: 30,
+      input_tokens: 120000,
       output_tokens: 9000,
       cost: testMoney(0.9),
       interactive_at_peak: 2,
@@ -96,7 +98,8 @@ function makeReport(overrides: Partial<Report> = {}): Report {
     by_model: null,
     by_agent: null,
     by_session: null,
-    intervals: [],
+    sessions_total: 0,
+    projects: {},
     ...overrides,
   } as Report;
   // Backfill the peak-automation split onto any bucket literal that omits it
@@ -156,11 +159,6 @@ function popoverReport(): Report {
         timing_quality: "timed",
       },
     ] as Report["by_session"],
-    intervals: [
-      { session_id: "a", start: "2026-06-16T10:00:00Z", end: "2026-06-16T10:01:00Z" },
-      { session_id: "a", start: "2026-06-16T10:01:00Z", end: "2026-06-16T10:02:00Z" },
-      { session_id: "b", start: "2026-06-16T10:01:00Z", end: "2026-06-16T10:03:00Z" },
-    ] as Report["intervals"],
   });
 }
 
@@ -217,6 +215,20 @@ async function chooseOverlayMetric(target: HTMLElement, label: string) {
   ).find((el) => el.textContent?.trim() === label);
   expect(option).toBeTruthy();
   await fireEvent.mouseDown(option!);
+  await tick();
+}
+
+async function dragRange(target: HTMLElement, start: number, end: number) {
+  const hits = target.querySelectorAll<SVGRectElement>(".slot-hit");
+  await fireEvent.pointerDown(hits[start]!, { button: 0 });
+  if (end !== start) {
+    const endX = Number(hits[end]!.getAttribute("x"));
+    const endWidth = Number(hits[end]!.getAttribute("width"));
+    await fireEvent.pointerMove(target.querySelector(".timeline-body")!, {
+      clientX: endX + endWidth / 2,
+    });
+  }
+  await fireEvent.pointerUp(window);
   await tick();
 }
 
@@ -329,6 +341,105 @@ describe("ConcurrencyTimeline", () => {
     unmount(c);
   });
 
+  it("renders no hit target for future buckets and clamps keyboard nav to live ones", async () => {
+    // The last of the three minute buckets starts at the effective end, so it
+    // is entirely in the future: it must not be hoverable, tooltippable, or
+    // reachable, while its bar geometry still renders.
+    const report = minuteReport({
+      elapsed_bucket_count: 2,
+      partial: true,
+      as_of: "2026-06-16T00:10:00Z",
+      effective_end: "2026-06-16T00:10:00Z",
+    });
+    report.buckets![2] = {
+      ...report.buckets![2]!,
+      max_agents: 0,
+      agent_minutes: 0,
+      output_tokens: 0,
+    };
+    const onSelectRange = vi.fn();
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const c = mount(ConcurrencyTimeline, {
+      target,
+      props: { report, onSelectRange },
+    });
+    await tick();
+
+    const hits = target.querySelectorAll(".slot-hit");
+    expect(hits.length).toBe(2);
+    expect(target.querySelector('[data-concurrency-bucket-index="2"]')).toBeNull();
+    // The future bucket keeps its (zero-height) bar segments.
+    expect(target.querySelectorAll(".concurrency-seg.interactive").length).toBe(3);
+
+    // Shift+ArrowRight from the last live slot clamps to the live range
+    // instead of extending the selection into the future bucket.
+    hits[1]!.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "ArrowRight",
+        shiftKey: true,
+        bubbles: true,
+      }),
+    );
+    await tick();
+    expect(onSelectRange).toHaveBeenCalledWith(expect.objectContaining({ start: 1, end: 2 }));
+
+    unmount(c);
+    target.remove();
+  });
+
+  it("clamps the hover tooltip inside the viewport at the top-left edge", async () => {
+    // jsdom reports zero-size boxes, so mock the tooltip's measured size. The
+    // hovered slot's rect is all zeros, anchoring the tooltip at x=0, y=-4.
+    // Hand-computed from viewport geometry (innerWidth 1024, pad 8): the
+    // unclamped box would sit at left -100, top -104; both clamp to 8.
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(200);
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockReturnValue(100);
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const c = mount(ConcurrencyTimeline, { target, props: { report: makeReport() } });
+    await tick();
+    const hit = target.querySelectorAll(".slot-hit")[2] as SVGRectElement;
+    hit.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+    await tick();
+    const tip = target.querySelector<HTMLDivElement>(".tooltip");
+    expect(tip).toBeTruthy();
+    expect(tip!.style.left).toBe("8px");
+    expect(tip!.style.top).toBe("8px");
+    unmount(c);
+    target.remove();
+  });
+
+  it("centers the tooltip above an anchor away from viewport edges", async () => {
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(200);
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockReturnValue(100);
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const c = mount(ConcurrencyTimeline, { target, props: { report: makeReport() } });
+    await tick();
+    const hit = target.querySelectorAll(".slot-hit")[2] as SVGRectElement;
+    vi.spyOn(hit, "getBoundingClientRect").mockReturnValue({
+      left: 400,
+      top: 300,
+      width: 40,
+      height: 180,
+      right: 440,
+      bottom: 480,
+      x: 400,
+      y: 300,
+      toJSON: () => ({}),
+    } as DOMRect);
+    hit.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+    await tick();
+    const tip = target.querySelector<HTMLDivElement>(".tooltip");
+    // Anchor center x = 420, anchor y = 300 - 4 = 296; a 200x100 box centered
+    // above lands at left 320, top 196 with no clamping needed.
+    expect(tip!.style.left).toBe("320px");
+    expect(tip!.style.top).toBe("196px");
+    unmount(c);
+    target.remove();
+  });
+
   it("shows a tooltip on slot hover and clears it on leave", async () => {
     const target = document.createElement("div");
     document.body.appendChild(target);
@@ -341,7 +452,7 @@ describe("ConcurrencyTimeline", () => {
     await tick();
     const tip = target.querySelector(".tooltip");
     expect(tip).toBeTruthy();
-    expect(tip!.textContent).toContain("peak 3");
+    expect(tip!.querySelector(".tooltip-metrics > div")?.textContent).toContain("Peak Concurrency");
     hit.dispatchEvent(new MouseEvent("mouseleave", { bubbles: true }));
     await tick();
     expect(target.querySelector(".tooltip")).toBeNull();
@@ -349,20 +460,26 @@ describe("ConcurrencyTimeline", () => {
     target.remove();
   });
 
-  it("labels the token count as output and surfaces cost in the tooltip", async () => {
+  it("shows structured compact metrics with cost in the tooltip", async () => {
     const target = document.createElement("div");
     document.body.appendChild(target);
-    const c = mount(ConcurrencyTimeline, { target, props: { report: makeReport() } });
+    const report = makeReport();
+    report.buckets![2]!.agent_minutes = 7500;
+    const c = mount(ConcurrencyTimeline, { target, props: { report } });
     await tick();
-    const hit = target.querySelectorAll(".slot-hit")[2] as SVGRectElement; // 9000 tokens, $0.90
+    const hit = target.querySelectorAll(".slot-hit")[2] as SVGRectElement;
     hit.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
     await tick();
     const tip = target.querySelector(".tooltip");
     expect(tip).toBeTruthy();
-    // Disambiguates input vs output tokens and shows the overlay's cost value.
-    expect(tip!.textContent).toContain("output tokens");
-    expect(tip!.textContent).toContain("9,000");
-    expect(tip!.textContent).toContain("$0.90");
+    const rows = Array.from(tip!.querySelectorAll(".tooltip-metrics > div"));
+    expect(rows.map((row) => row.textContent?.replace(/\s+/g, " ").trim())).toEqual([
+      "Peak Concurrency 3 (2 int / 1 auto)",
+      "Agent-min 7.5K",
+      "Input Tokens 120K",
+      "Output Tokens 9K",
+      "Cost $0.90",
+    ]);
     unmount(c);
     target.remove();
   });
@@ -376,9 +493,12 @@ describe("ConcurrencyTimeline", () => {
     hit.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
     await tick();
     const tip = target.querySelector(".tooltip");
-    expect(tip!.textContent).toContain("peak 3 (2 int / 1 auto)");
+    const rows = tip!.querySelectorAll(".tooltip-metrics > div");
+    expect(rows[0]!.textContent?.replace(/\s+/g, " ").trim()).toBe(
+      "Peak Concurrency 3 (2 int / 1 auto)",
+    );
     // agent-minutes stays a single combined figure, not split by automation.
-    expect(tip!.textContent).toContain("30.0 agent-min");
+    expect(rows[1]!.textContent?.replace(/\s+/g, " ").trim()).toBe("Agent-min 30");
     unmount(c);
     target.remove();
   });
@@ -392,34 +512,28 @@ describe("ConcurrencyTimeline", () => {
     hit.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
     await tick();
     const tip = target.querySelector(".tooltip");
-    expect(tip!.textContent).toContain("peak 1");
-    expect(tip!.textContent).not.toContain("int /");
+    const peakRow = tip!.querySelector(".tooltip-metrics > div");
+    expect(peakRow?.textContent?.replace(/\s+/g, " ").trim()).toBe("Peak Concurrency 1");
     unmount(c);
     target.remove();
   });
 
-  it("emits the active session ids for a clicked slot", async () => {
-    const onSelectBucket = vi.fn();
+  it("emits a one-bucket range for server-side membership paging", async () => {
+    const onSelectRange = vi.fn();
     const target = document.createElement("div");
     document.body.appendChild(target);
     const c = mount(ConcurrencyTimeline, {
       target,
-      props: { report: popoverReport(), onSelectBucket },
+      props: { report: popoverReport(), onSelectRange },
     });
     await tick();
-    (target.querySelector(".slot-hit") as SVGRectElement).dispatchEvent(
-      new MouseEvent("click", { bubbles: true }),
-    );
-    await tick();
-    // 3 intervals, "a" deduped to one row, sorted by earliest overlap then id.
-    expect(onSelectBucket).toHaveBeenCalledWith(
-      expect.objectContaining({ idx: 0, sessionIds: ["a", "b"] }),
-    );
+    await dragRange(target, 0, 0);
+    expect(onSelectRange).toHaveBeenCalledWith({ start: 0, end: 1, label: "10:00–10:05" });
     unmount(c);
     target.remove();
   });
 
-  it("emits an empty session list for an idle slot", async () => {
+  it("emits an idle one-bucket range without computing membership locally", async () => {
     const report = makeReport({
       bucket_unit: "minute",
       bucket_seconds: 300,
@@ -444,73 +558,152 @@ describe("ConcurrencyTimeline", () => {
         },
       ],
       by_session: [] as Report["by_session"],
-      intervals: [] as Report["intervals"],
     });
-    const onSelectBucket = vi.fn();
+    const onSelectRange = vi.fn();
     const target = document.createElement("div");
     document.body.appendChild(target);
     const c = mount(ConcurrencyTimeline, {
       target,
-      props: { report, onSelectBucket },
+      props: { report, onSelectRange },
     });
     await tick();
     const hits = target.querySelectorAll(".slot-hit");
     expect(hits.length).toBe(2);
-    (hits[1] as SVGRectElement).dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    await tick();
-    expect(onSelectBucket).toHaveBeenCalledWith(
-      expect.objectContaining({ idx: 1, sessionIds: [] }),
-    );
+    await dragRange(target, 1, 1);
+    expect(onSelectRange).toHaveBeenCalledWith({ start: 1, end: 2, label: "10:05–10:10" });
     unmount(c);
     target.remove();
   });
 
-  it("clears the selection when the already selected slot is clicked again", async () => {
-    const onSelectBucket = vi.fn();
+  it("clears the selection when the selected range is clicked again", async () => {
+    const onSelectRange = vi.fn();
     const target = document.createElement("div");
     document.body.appendChild(target);
-    // selectedBucket=0 marks slot 0 active; clicking it again toggles it off.
     const c = mount(ConcurrencyTimeline, {
       target,
-      props: { report: popoverReport(), selectedBucket: 0, onSelectBucket },
+      props: {
+        report: popoverReport(),
+        selectedRange: { start: 0, end: 1 },
+        onSelectRange,
+      },
     });
     await tick();
-    (target.querySelector(".slot-hit") as SVGRectElement).dispatchEvent(
-      new MouseEvent("click", { bubbles: true }),
+    await dragRange(target, 0, 0);
+    expect(onSelectRange).toHaveBeenCalledWith(null);
+    unmount(c);
+    target.remove();
+  });
+
+  it("shows a clear-selection button for a brushed range", async () => {
+    const onSelectRange = vi.fn();
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const c = mount(ConcurrencyTimeline, {
+      target,
+      props: {
+        report: popoverReport(),
+        selectedRange: { start: 0, end: 1 },
+        onSelectRange,
+      },
+    });
+    await tick();
+
+    const clear = [...target.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent?.trim() === "Clear selection",
+    );
+    expect(clear).toBeDefined();
+    clear!.click();
+    expect(onSelectRange).toHaveBeenCalledExactlyOnceWith(null);
+
+    unmount(c);
+    target.remove();
+  });
+
+  it("extends a keyboard selection with Shift+ArrowRight", async () => {
+    const onSelectRange = vi.fn();
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const c = mount(ConcurrencyTimeline, {
+      target,
+      props: { report: minuteReport(), onSelectRange },
+    });
+    await tick();
+
+    const first = target.querySelector<SVGRectElement>(".slot-hit");
+    first!.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "ArrowRight",
+        shiftKey: true,
+        bubbles: true,
+      }),
     );
     await tick();
-    expect(onSelectBucket).toHaveBeenCalledWith(null);
+
+    expect(onSelectRange).toHaveBeenCalledWith(expect.objectContaining({ start: 0, end: 2 }));
     unmount(c);
     target.remove();
   });
 
   it("selects a slot with a keyboard Enter", async () => {
-    const onSelectBucket = vi.fn();
+    const onSelectRange = vi.fn();
     const target = document.createElement("div");
     document.body.appendChild(target);
     const c = mount(ConcurrencyTimeline, {
       target,
-      props: { report: popoverReport(), onSelectBucket },
+      props: { report: popoverReport(), onSelectRange },
     });
     await tick();
     const hit = target.querySelector(".slot-hit") as SVGRectElement;
     hit.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
     await tick();
-    expect(onSelectBucket).toHaveBeenCalledWith(expect.objectContaining({ idx: 0 }));
+    expect(onSelectRange).toHaveBeenCalledWith(expect.objectContaining({ start: 0, end: 1 }));
     unmount(c);
     target.remove();
   });
 
-  it("marks the selected bucket with an outline and brightened segments", async () => {
+  it("marks the selected range and brightens its segments", async () => {
     const target = document.createElement("div");
     document.body.appendChild(target);
     const c = mount(ConcurrencyTimeline, {
       target,
-      props: { report: popoverReport(), selectedBucket: 0 },
+      props: { report: popoverReport(), selectedRange: { start: 0, end: 1 } },
     });
     await tick();
-    expect(target.querySelector(".concurrency-outline")).toBeTruthy();
-    expect(target.querySelector(".concurrency-seg.selected")).toBeTruthy();
+    const selection = target.querySelector(".range-selection");
+    const selectedSegment = target.querySelector(".concurrency-seg.selected");
+    const stripCell = target.querySelector(".strip-cell");
+    const hitTarget = target.querySelector(".slot-hit");
+    expect(selection).toBeTruthy();
+    expect(selectedSegment).toBeTruthy();
+    expect(stripCell).toBeTruthy();
+    expect(hitTarget).toBeTruthy();
+    expect(
+      selection!.compareDocumentPosition(stripCell!) & Node.DOCUMENT_POSITION_PRECEDING,
+    ).toBeTruthy();
+    expect(
+      selection!.compareDocumentPosition(hitTarget!) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    unmount(c);
+    target.remove();
+  });
+
+  it("drags across buckets to emit a half-open range", async () => {
+    const onSelectRange = vi.fn();
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const c = mount(ConcurrencyTimeline, {
+      target,
+      props: { report: minuteReport(), onSelectRange },
+    });
+    await tick();
+
+    await dragRange(target, 0, 2);
+
+    expect(onSelectRange).toHaveBeenCalledWith({
+      start: 0,
+      end: 3,
+      label: "00:00–00:15",
+    });
     unmount(c);
     target.remove();
   });

@@ -3,7 +3,8 @@ package insight
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"os"
@@ -80,26 +81,8 @@ type AgentConfig struct {
 
 // GenerateOptions holds optional insight generation overrides.
 type GenerateOptions struct {
-	Agents map[string]AgentConfig
-}
-
-// Generate invokes an AI agent CLI to generate an insight.
-// The agent parameter selects which CLI to use (claude,
-// codex, gemini). The prompt is passed via stdin.
-func Generate(
-	ctx context.Context, agent, prompt string,
-) (Result, error) {
-	return GenerateStream(ctx, agent, prompt, nil)
-}
-
-// GenerateStream invokes an AI agent CLI to generate an
-// insight while optionally streaming process logs.
-func GenerateStream(
-	ctx context.Context, agent, prompt string, onLog LogFunc,
-) (Result, error) {
-	return GenerateStreamWithOptions(
-		ctx, agent, prompt, onLog, GenerateOptions{},
-	)
+	Agents   map[string]AgentConfig
+	Endpoint *EndpointConfig
 }
 
 // GenerateStreamWithOptions invokes an AI agent CLI to generate an
@@ -112,6 +95,9 @@ func GenerateStreamWithOptions(
 		return Result{}, fmt.Errorf(
 			"unsupported agent: %s", agent,
 		)
+	}
+	if opts.Endpoint != nil {
+		return generateEndpoint(ctx, *opts.Endpoint, prompt)
 	}
 
 	path, err := resolveAgentBinary(agent, opts)
@@ -312,13 +298,13 @@ func generateClaude(
 // versions: {"result":"...","model":"..."}.
 func parseCLIResult(data []byte) (result, model string) {
 	// Try JSON array format (Claude Code v2+).
-	var events []json.RawMessage
+	var events []jsontext.Value
 	if json.Unmarshal(data, &events) == nil {
 		for _, raw := range events {
 			var ev struct {
-				Type       string                     `json:"type"`
-				Result     string                     `json:"result"`
-				ModelUsage map[string]json.RawMessage `json:"modelUsage"`
+				Type       string                    `json:"type"`
+				Result     string                    `json:"result"`
+				ModelUsage map[string]jsontext.Value `json:"modelUsage"`
 			}
 			if json.Unmarshal(raw, &ev) != nil {
 				continue

@@ -1,7 +1,8 @@
 package parser
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1735,6 +1736,27 @@ func TestParseClaudeSession_PersistedToolResultDoesNotOverwriteSiblings(
 	assert.Equal(t, len("small inline result"), toolResults[1].ContentLength)
 }
 
+func TestResolveClaudePersistedToolResultsPreservesUntouchedNumbers(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	sessionPath := filepath.Join(dir, "parent-session.jsonl")
+	resultPath := filepath.Join(dir, "parent-session", "tool-results", "result.txt")
+	require.NoError(t, os.MkdirAll(filepath.Dir(resultPath), 0o755))
+	require.NoError(t, os.WriteFile(resultPath, []byte("full output"), 0o644))
+
+	resultPathJSON := mustJSONString(t, resultPath)
+	contentJSON := mustJSONString(t, "Full output saved to: "+resultPath)
+	line := `{"future_counter":9007199254740993,"message":{"content":[` +
+		`{"type":"tool_result","content":` + contentJSON + `}` +
+		`]},"toolUseResult":{"persistedOutputPath":` + resultPathJSON + `}}`
+
+	got := resolveClaudePersistedToolResults(sessionPath, line)
+
+	assert.Equal(t, "9007199254740993", gjson.Get(got, "future_counter").Raw)
+	assert.Equal(t, "full output", gjson.Get(got, "message.content.0.content").Str)
+}
+
 func mustJSONString(t *testing.T, value string) string {
 	t.Helper()
 	encoded, err := json.Marshal(value)
@@ -2316,7 +2338,7 @@ func TestParseClaudeSession_TerminationStatus(t *testing.T) {
 func TestParseClaudeSession_TokenUsage(t *testing.T) {
 	t.Run("explicit parser presence beats fallback inference", func(t *testing.T) {
 		msg := ParsedMessage{
-			TokenUsage:         json.RawMessage(`{"input_tokens":100,"output_tokens":50}`),
+			TokenUsage:         jsontext.Value(`{"input_tokens":100,"output_tokens":50}`),
 			tokenPresenceKnown: true,
 		}
 		msgHasCtx, msgHasOut := msg.TokenPresence()
