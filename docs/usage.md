@@ -565,6 +565,9 @@ Appearance:
 Focused mode strips intermediate tool calls, thinking blocks, and partial
 assistant messages, showing only user prompts and final assistant responses.
 This makes long sessions easier to read as a clean conversation transcript.
+Task notifications and stop hook feedback count as part of the turn they
+interrupt rather than as new prompts, so a session that waits on background
+agents still collapses to its prompts and final answers.
 
 ![Focused transcript mode](/docs/assets/generated/screenshots/focused-transcript.png)
 
