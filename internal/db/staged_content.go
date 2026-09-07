@@ -573,7 +573,7 @@ func replaceSessionMessagesTxStaged(
 
 	positions := make(map[string]StagedToolCallPosition)
 	callOccurrences := make(map[string]int)
-	chunk := make([]ToolCall, 0, toolCallStagedChunkSize)
+	chunk := make([]ToolCall, 0, toolCallInsertRowsPerStmt)
 	var chunkBytes int64
 	flush := func() error {
 		if len(chunk) == 0 {
@@ -627,10 +627,10 @@ func replaceSessionMessagesTxStaged(
 			chunk = append(chunk, tc)
 			// Flush by byte budget as well as count: resolved summaries
 			// are the largest per-call strings, and a count-only bound
-			// (toolCallStagedChunkSize) would still accumulate up to
+			// (toolCallInsertRowsPerStmt) would still accumulate up to
 			// count * max-summary-size bytes of resolved content before
 			// the insert.
-			if len(chunk) >= toolCallStagedChunkSize ||
+			if len(chunk) >= toolCallInsertRowsPerStmt ||
 				chunkBytes >= toolCallStagedChunkBytes {
 				if err := flush(); err != nil {
 					return err
@@ -650,11 +650,6 @@ func replaceSessionMessagesTxStaged(
 	return restorePinsTx(tx, sessionID, pins)
 }
 
-// toolCallStagedChunkSize bounds the tool-call insert chunks so the
-// transient per-chunk summary memory stays fixed. toolCallStagedChunkBytes
-// bounds the same chunks by resolved summary content bytes, since one
-// call's summary can dwarf hundreds of ordinary rows.
-const (
-	toolCallStagedChunkSize  = 500
-	toolCallStagedChunkBytes = 16 << 20
-)
+// toolCallStagedChunkBytes bounds resolved summary content in addition to
+// the shared SQL parameter limit, since one summary can dwarf ordinary rows.
+const toolCallStagedChunkBytes = 16 << 20
