@@ -697,6 +697,17 @@ type DB struct {
 	vectorMu       sync.RWMutex
 	vectorSearcher VectorSearcher
 	recallSearcher RecallVectorSearcher
+
+	// messagesLoadCount counts GetAllMessages calls. Tests use it to gate
+	// the incremental signal path: a maintained delta must not load
+	// session history.
+	messagesLoadCount atomic.Int64
+}
+
+// MessagesLoadCount returns the total number of GetAllMessages calls the
+// database has served. Monotonic; used by the incremental-path gates.
+func (db *DB) MessagesLoadCount() int64 {
+	return db.messagesLoadCount.Load()
 }
 
 // Reader exposes guarded read-only query operations. It intentionally does
@@ -1919,6 +1930,14 @@ type schemaColumnMigration struct {
 func legacySchemaColumnMigrations() []schemaColumnMigration {
 	return []schemaColumnMigration{
 		{
+			"tool_result_events", "raw_content_digest",
+			"ALTER TABLE tool_result_events ADD COLUMN raw_content_digest BLOB",
+		},
+		{
+			"tool_result_events", "summary_participates",
+			"ALTER TABLE tool_result_events ADD COLUMN summary_participates INTEGER",
+		},
+		{
 			"sessions", "parent_session_id",
 			"ALTER TABLE sessions ADD COLUMN parent_session_id TEXT",
 		},
@@ -2741,6 +2760,15 @@ func (db *DB) migrateColumns(ctx context.Context) error {
 	); err != nil {
 		return fmt.Errorf(
 			"creating idx_tool_calls_file_path: %w", err,
+		)
+	}
+	if _, err := w.Exec(
+		`CREATE INDEX IF NOT EXISTS idx_tool_calls_session_tool_use
+		 ON tool_calls(session_id, tool_use_id)
+		 WHERE tool_use_id IS NOT NULL`,
+	); err != nil {
+		return fmt.Errorf(
+			"creating idx_tool_calls_session_tool_use: %w", err,
 		)
 	}
 
@@ -4286,32 +4314,50 @@ func (db *DB) RebuildFTS() error {
 	return nil
 }
 
-// DropUsageMessageIndexes drops the archive usage and activity
-// message indexes so bulk message loads avoid per-row B-tree
-// maintenance. Call RebuildUsageMessageIndexes before the archive
-// is served again: read-only opens require these indexes.
-func (db *DB) DropUsageMessageIndexes() error {
+// DropBulkImportIndexes omits derived index maintenance in a disposable
+// full-resync archive. RebuildBulkImportIndexes must succeed before the swap.
+func (db *DB) DropBulkImportIndexes() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	w := db.getWriter()
 	for _, name := range []string{
 		"idx_messages_usage_timestamp",
 		"idx_messages_usage_session_covering",
 		"idx_messages_activity_timestamp",
+		"idx_tool_calls_session_tool_use",
+		"idx_tool_result_events_identity",
+		"idx_tool_result_events_summary",
 	} {
-		if _, err := w.Exec(`DROP INDEX IF EXISTS ` + name); err != nil {
-			return fmt.Errorf("dropping usage index %s: %w", name, err)
+		if _, err := db.getWriter().Exec(`DROP INDEX IF EXISTS ` + name); err != nil {
+			return fmt.Errorf("dropping bulk import index %s: %w", name, err)
 		}
 	}
 	return nil
 }
 
-// RebuildUsageMessageIndexes recreates the archive usage and
-// activity message indexes after a bulk load that dropped them.
-func (db *DB) RebuildUsageMessageIndexes() error {
+// RebuildBulkImportIndexes creates each deferred B-tree once after the bulk
+// load. Source archives and live incremental writers never drop these indexes.
+func (db *DB) RebuildBulkImportIndexes() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return ensureUsageIndexesLocked(db.getWriter())
+	if err := ensureUsageIndexesLocked(db.getWriter()); err != nil {
+		return err
+	}
+	for _, query := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_tool_calls_session_tool_use
+		 ON tool_calls(session_id, tool_use_id) WHERE tool_use_id IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_tool_result_events_identity
+		 ON tool_result_events(session_id, tool_call_message_ordinal, call_index,
+		 agent_id, status, raw_content_digest) WHERE raw_content_digest IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_tool_result_events_summary
+		 ON tool_result_events(session_id, tool_call_message_ordinal, call_index,
+		 (summary_participates IS NULL OR raw_content_digest IS NULL),
+		 summary_participates, event_index)`,
+	} {
+		if _, err := db.getWriter().Exec(query); err != nil {
+			return fmt.Errorf("rebuilding tool result import indexes: %w", err)
+		}
+	}
+	return nil
 }
 
 // HasFTS checks if Full Text Search is available.

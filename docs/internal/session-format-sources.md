@@ -399,8 +399,8 @@ add an archived or maintained mirror without replacing the original identity.
   to the `gpt-5.6-luna` catalog row (Luna list rates, not an OpenAI invoice).
   An exact `[custom_model_pricing."gpt-reserve"]` row still wins. Reverified
   2026-09-06 against OpenAI's Luna Reserve help article
-  <https://help.openai.com/en/articles/20001499-luna-reserve-in-codex-and-chatgpt-work>
-  and Codex `turn_context` model seeding in `internal/parser/codex.go`.
+    <https://help.openai.com/en/articles/20001499-luna-reserve-in-codex-and-chatgpt-work>
+    and Codex `turn_context` model seeding in `internal/parser/codex.go`.
 
 - **Agentsview:** `internal/parser/codex.go` and
   `internal/parser/codex_provider.go`; usage is taken from the last-turn
@@ -420,54 +420,58 @@ add an archived or maintained mirror without replacing the original identity.
   instances; imports do not change process-wide configuration. S3 imports list
   the child's configured Codex root for its explicitly named parent and
   materialize only that one parent beside the child. When the parent is not
-  yet available or has no turns, the child remains visible but is stored below
-  the current data version so a later unchanged-object sync retries and
-  corrects the overcount. Reverified 2026-08-13 against the materialized-S3
-  parser-to-SQLite path: the first missing-parent pass kept replayed content
-  as retryable, and the next pass fetched only the named parent and replaced
-  it with child-owned messages and usage. An appended `session_meta` after an
-  incremental-sync offset forces an authoritative replacement of that derived
-  session, because the metadata can be the copied parent record that activates
-  replay filtering. The original parent session remains valid and is not
-  reparsed. Reverified 2026-08-12 against locally observed multi-agent
-  rollouts that replayed differently shaped opaque turn ids before the first
-  child-owned turn, and against the pinned format sources; the pinned TUI is the
-  evidenced `history.jsonl` producer. No `append_entry` producer call exists
-  under the pinned `app-server` or `exec` trees, so this evidence does not
-  establish IDE, desktop, or `codex exec` activity-hint coverage. Locally
-  observed Codex app builds can write the same schema, but that is
-  observational evidence rather than a public compatibility guarantee. A
-  missing `session_index.jsonl` is verified as normal absence; read or scan
-  failures remain unverified and cannot earn persisted freshness trust, so a
-  transient failure cannot pin a stale stored title. Agentsview derives the
-  hint path as `<configured-sessions-root>/../history.jsonl`; a custom
-  sessions root without that sibling, or `HistoryPersistence::None`, degrades
-  to ordinary watcher behavior, degraded-coverage polling when applicable, and
-  the daily archive audit. Restart bootstrap reads at most the newest 4 MiB
-  and accepts records from the preceding 24 hours. If a daemon restarts during
-  a longer autonomous run whose last prompt falls outside those bounds, the
-  rollout relies on those fallbacks until its next prompt. Reverified
-  2026-08-16 with Codex CLI 0.147.0: `codex exec --json` emitted a
-  `thread.started` record carrying one UUID, followed by turn and item records
-  and a terminal usage record, while its dated rollout began with a
-  `session_meta.id` equal to that UUID and ended with `task_complete`. One-shot
-  capture therefore accepts only this structured mode, tees its bytes without
-  interpreting formatted stderr, and validates the ID against filenames and
-  `session_meta` inside the wrapper-start local and UTC days, each plus or
-  minus one day. It copies and ingests that exact rollout first, then uses
-  parsed `spawn_agent` links and their message timestamps to repeat the same
-  bounded day-shard lookup around each child's spawn time. Final accounting
-  uses only the provider-shaped copies in the capture directory. Malformed
-  JSONL records are counted on both root and delegated sessions so one-shot
-  capture marks otherwise usable accounting as partial instead of silently
-  treating the transcript as complete. Reverified 2026-08-20 that this
-  includes an unterminated invalid final record after `task_complete`;
-  ordinary live parsing still defers that tail while its writer can complete
-  it. This bounded lookup is deliberately separate from the provider's general
-  full-archive UUID discovery. Hosted raw discovery and event-driven capture
-  preserve each physical transcript under its configured root; duplicate
-  ranking remains limited to normalized discovery. Reverified 2026-08-29 with
-  live and archived copies sharing one UUID.
+  yet available, the child remains visible but is stored below the current
+  data version so a later unchanged-object sync retries and corrects the
+  overcount. Reverified 2026-08-13 against the materialized-S3 parser-to-SQLite
+  path: the first missing-parent pass kept replayed content as retryable,
+  and the next pass fetched only the named parent and replaced it with
+  child-owned messages and usage. A readable parent with no turns resolves as
+  current, whether or not the child carries copied parent metadata. Reverified
+  2026-09-06 against the provider parse path with both metadata shapes when
+  integrating the single-pass retry gate with the turnless-parent fix from
+  #1578. An appended `session_meta` after an incremental-sync offset forces an
+  authoritative replacement of that derived session, because the metadata can
+  be the copied parent record that activates replay filtering. The original
+  parent session remains valid and is not reparsed. Reverified 2026-08-12
+  against locally observed multi-agent rollouts that replayed differently
+  shaped opaque turn ids before the first child-owned turn, and against the
+  pinned format sources; the pinned TUI is the evidenced `history.jsonl`
+  producer. No `append_entry` producer call exists under the pinned
+  `app-server` or `exec` trees, so this evidence does not establish IDE,
+  desktop, or `codex exec` activity-hint coverage. Locally observed Codex app
+  builds can write the same schema, but that is observational evidence rather
+  than a public compatibility guarantee. A missing `session_index.jsonl` is
+  verified as normal absence; read or scan failures remain unverified and
+  cannot earn persisted freshness trust, so a transient failure cannot pin a
+  stale stored title. Agentsview derives the hint path as
+  `<configured-sessions-root>/../history.jsonl`; a custom sessions root
+  without that sibling, or `HistoryPersistence::None`, degrades to ordinary
+  watcher behavior, degraded-coverage polling when applicable, and the daily
+  archive audit. Restart bootstrap reads at most the newest 4 MiB and accepts
+  records from the preceding 24 hours. If a daemon restarts during a longer
+  autonomous run whose last prompt falls outside those bounds, the rollout
+  relies on those fallbacks until its next prompt. Reverified 2026-08-16 with
+  Codex CLI 0.147.0: `codex exec --json` emitted a `thread.started` record
+  carrying one UUID, followed by turn and item records and a terminal usage
+  record, while its dated rollout began with a `session_meta.id` equal to that
+  UUID and ended with `task_complete`. One-shot capture therefore accepts only
+  this structured mode, tees its bytes without interpreting formatted stderr,
+  and validates the ID against filenames and `session_meta` inside the
+  wrapper-start local and UTC days, each plus or minus one day. It copies and
+  ingests that exact rollout first, then uses parsed `spawn_agent` links and
+  their message timestamps to repeat the same bounded day-shard lookup around
+  each child's spawn time. Final accounting uses only the provider-shaped
+  copies in the capture directory. Malformed JSONL records are counted on both
+  root and delegated sessions so one-shot capture marks otherwise usable
+  accounting as partial instead of silently treating the transcript as complete.
+  Reverified 2026-08-20 that this includes an unterminated invalid final
+  record after `task_complete`; ordinary live parsing still defers that tail
+  while its writer can complete it. This bounded lookup is deliberately
+  separate from the provider's general full-archive UUID discovery. Hosted raw
+  discovery and event-driven capture preserve each physical transcript under
+  its configured root; duplicate ranking remains limited to normalized
+  discovery. Reverified 2026-08-29 with live and archived copies sharing one
+  UUID.
 
 - **HTTP import verification (2026-09-07):**
   `TestRemoteCodexAliasTitleSurvivesArchiveImport` also checks that unrelated
@@ -475,6 +479,23 @@ add an archived or maintained mirror without replacing the original identity.
   `TestHTTPMirrorCodexIndexRemoval` exercises persisted mirror deletion,
   truncation, home removal, and journal replay. Remaining indexes supply the
   title; absence of all titles preserves the stored name.
+
+- **Import-path parity reverified 2026-09-07:** staged and collecting imports
+  retain the same malformed-line count for an immutable transcript ending in
+  an incomplete JSON record. A mutable transcript may still have a partial
+  record in flight. The streaming entry point now receives the sync context,
+  so cancellation reaches the parser while it emits staged events. These are
+  Agentsview integration checks; they do not change the producer format.
+
+- **Pending calls reverified 2026-09-07:** the pinned upstream
+  [task abort path](https://github.com/openai/codex/blob/406dc9239492aff6d295cca5eebe2a548548d42f/codex-rs/core/src/tasks/mod.rs#L846-L915)
+  cancels work, allows a short grace period, and emits `turn_aborted`; it
+  does not establish that every pending call has received its last output. The
+  [response types](https://github.com/openai/codex/blob/406dc9239492aff6d295cca5eebe2a548548d42f/codex-rs/protocol/src/models.rs#L809-L857)
+  use opaque string call IDs. Agentsview retains unresolved metadata across
+  aborts. Synthetic repeated-ID fixtures preserve its existing latest-call
+  attachment behavior; the schema alone does not establish that the producer
+  emits repeated IDs.
 
 ## TraeX (`traex`)
 
