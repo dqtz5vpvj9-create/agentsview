@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"go.kenn.io/agentsview/internal/secrets"
@@ -308,22 +309,42 @@ func (q signalTxQuery) ToolCallsByPosition(
 	if len(positions) == 0 {
 		return nil, nil
 	}
-	// Materialize only requested occurrences. A cross-table OR predicate
-	// leaves SQLite scanning every tool call in the session, even when the
-	// requested message ordinals have an index.
 	seen := make(map[ToolCallPosition]bool, len(positions))
-	args := make([]any, 0, 1+2*len(positions))
+	unique := make([]ToolCallPosition, 0, len(positions))
 	for _, position := range positions {
 		if seen[position] {
 			continue
 		}
 		seen[position] = true
+		unique = append(unique, position)
+	}
+	var facts []ToolCallSignalFact
+	// Two parameters per position plus one session ID fit 499 positions
+	// within the archive's 999-variable budget.
+	for chunk := range slices.Chunk(unique, 499) {
+		chunkFacts, err := q.toolCallsByPositionChunk(ctx, chunk)
+		if err != nil {
+			return nil, err
+		}
+		facts = append(facts, chunkFacts...)
+	}
+	return facts, nil
+}
+
+func (q signalTxQuery) toolCallsByPositionChunk(
+	ctx context.Context, positions []ToolCallPosition,
+) ([]ToolCallSignalFact, error) {
+	// Materialize only requested occurrences. A cross-table OR predicate
+	// leaves SQLite scanning every tool call in the session, even when the
+	// requested message ordinals have an index.
+	args := make([]any, 0, 1+2*len(positions))
+	for _, position := range positions {
 		args = append(args, position.MessageOrdinal, position.CallIndex)
 	}
 	args = append(args, q.sessionID)
 	rows, err := q.tx.QueryContext(ctx, `
 		WITH wanted(message_ordinal, call_index) AS (
-			VALUES `+multiRowPlaceholders(len(seen), 2)+`
+			VALUES `+multiRowPlaceholders(len(positions), 2)+`
 		)
 		SELECT m.ordinal, COALESCE(tc.call_index, 0),
 		       tc.tool_name, tc.category, COALESCE(tc.input_json, ''),
