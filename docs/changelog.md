@@ -13,6 +13,10 @@ description: Release history for AgentsView
   files are gone remain in the archive. (#1677)
 - Browse and search Open Code Review sessions, including review comments,
   tools, thinking, recorded token usage, and resumed reviews. (#1660)
+- Search Chinese words and individual characters in SQLite message content
+  with an optional tokenizer sidecar. HTTP, CLI, and MCP search use word
+  segmentation; ASCII-only searches keep English stemming. Install with
+  `make install-chinese-fts`. (#1491)
 - Browse and search Tau sessions, including the active conversation branch,
   thinking, tools, session names, and recorded token usage. (#1661)
 - Configure session directories and alternate homes in `[agents.<id>]` tables
