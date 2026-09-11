@@ -2,6 +2,7 @@
 import type { Attachment } from "svelte/attachments";
 import { domText, findOccurrences, type TextOccurrence } from "./dom-text.js";
 import { highlightRegistry } from "./highlight-registry.js";
+import { createDetailsReveal } from "./details-reveal.js";
 import "./search.css";
 
 export interface SearchBlockState {
@@ -91,6 +92,7 @@ export function searchBlock(
     if (!key) return;
     const state = readState();
     const owner = {};
+    const disclosures = createDetailsReveal(element);
     let frame: number | null = null;
     let disposed = false;
     element.dataset.searchBlock = key;
@@ -102,6 +104,7 @@ export function searchBlock(
       currentRanges.delete(element);
       if (!state.query.trim() || state.count === 0) {
         highlightRegistry.remove(owner);
+        disclosures.update();
         return;
       }
       const occurrences = findOccurrences(domText(element), state.query);
@@ -112,7 +115,9 @@ export function searchBlock(
       const selected = state.current ? ranges[state.occurrence] : undefined;
       highlightRegistry.set(owner, ranges, selected ? [selected] : []);
       const selectedBoundary = state.current ? boundaries[state.occurrence] : undefined;
-      if (selectedBoundary) currentRanges.set(element, liveRange(element.ownerDocument, selectedBoundary));
+      const selectedRange = selectedBoundary ? liveRange(element.ownerDocument, selectedBoundary) : undefined;
+      if (selectedRange) currentRanges.set(element, selectedRange);
+      disclosures.update(selectedRange);
       if (import.meta.env.DEV && occurrences.length !== state.count) {
         console.warn("Search block text differs from its index", key, { indexed: state.count, rendered: occurrences.length });
       }
@@ -129,6 +134,7 @@ export function searchBlock(
     observer.observe(element, { childList: true, characterData: true, subtree: true });
     return () => {
       disposed = true;
+      disclosures.destroy();
       observer.disconnect();
       if (frame !== null) cancelAnimationFrame(frame);
       highlightRegistry.remove(owner);

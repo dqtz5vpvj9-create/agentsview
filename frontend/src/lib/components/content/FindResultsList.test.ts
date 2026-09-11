@@ -18,6 +18,7 @@ beforeEach(() => {
   vi.useFakeTimers(); setLocale("en");
   inSessionSearch.close(); inSessionSearch.clearQuery(); messages.clear();
   messages.sessionId = "results-ui"; messages.hasOlder = false; messages.loading = false;
+  messages.historyComplete = true;
   ui.selectedOrdinal = null; ui.sortNewestFirst = false;
   vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(480);
   vi.stubGlobal("ResizeObserver", class {

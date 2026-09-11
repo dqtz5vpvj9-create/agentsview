@@ -21,6 +21,8 @@ export interface SearchMessageSource {
   loading: boolean;
   hasOlder: boolean;
   loadingOlder: boolean;
+  historyComplete: boolean;
+  ensureHistoryLoaded(): Promise<void>;
   ensureOrdinalLoaded(ordinal: number): Promise<void>;
 }
 
@@ -52,7 +54,8 @@ export class InSessionSearchStore {
   private previousSessionId: string | null;
   private historyRequest: { sessionId: string; promise: Promise<void> } | null = null;
 
-  historyError = $derived(this.isOpen && this.source.hasOlder && this.historyFailed);
+  private historyIncomplete = $derived(this.source.hasOlder || this.source.historyComplete === false);
+  historyError = $derived(this.isOpen && this.historyIncomplete && this.historyFailed);
   isActive = $derived(this.isOpen && this.debouncedQuery.trim() !== "");
   index: SessionIndex | null = $derived.by(() => {
     // The session is part of the dependency graph even when its message array
@@ -67,7 +70,7 @@ export class InSessionSearchStore {
   total = $derived(this.index?.total ?? 0);
   loadingHistory = $derived(
     this.isOpen && (this.source.loading || this.source.loadingOlder ||
-      (this.source.hasOlder && !this.historyError)),
+      (this.historyIncomplete && !this.historyError)),
   );
   resolvedCurrent: Match | null = $derived(
     resolveSearchMatch(
@@ -127,10 +130,12 @@ export class InSessionSearchStore {
       $effect(() => {
         const open = this.isOpen;
         const sessionId = this.source.sessionId;
-        const hasOlder = this.source.hasOlder;
+        const incomplete = this.historyIncomplete;
         const loading = this.source.loading;
-        if (open && sessionId && hasOlder && !loading) {
-          untrack(() => this.requestHistory());
+        if (open && sessionId && incomplete && !loading) {
+          untrack(() => {
+            if (!this.historyFailed) this.requestHistory();
+          });
         }
       });
 
@@ -171,13 +176,13 @@ export class InSessionSearchStore {
 
   private requestHistory(): void {
     const sessionId = this.source.sessionId;
-    if (!sessionId || !this.isOpen || !this.source.hasOlder || this.source.loading) return;
+    if (!sessionId || !this.isOpen || !this.historyIncomplete || this.source.loading) return;
     if (this.historyRequest?.sessionId === sessionId) return;
     this.historyFailed = false;
     const promise: Promise<void> = Promise.resolve().then(() => {
       if (this.historyRequest?.promise === promise &&
           this.source.sessionId === sessionId && this.isOpen) {
-        return this.source.ensureOrdinalLoaded(0);
+        return this.source.ensureHistoryLoaded();
       }
     });
     this.historyRequest = { sessionId, promise };
@@ -192,7 +197,7 @@ export class InSessionSearchStore {
       // history still means these counts are partial and an explicit retry is
       // needed; do not leave the find bar announcing loading indefinitely.
       if (this.source.sessionId === sessionId) {
-        this.historyFailed = this.source.hasOlder;
+        this.historyFailed = this.historyIncomplete;
       }
     });
   }

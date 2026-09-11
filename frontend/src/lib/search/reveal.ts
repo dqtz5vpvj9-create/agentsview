@@ -1,4 +1,5 @@
 /** Cancelable, bounded reveal of an occurrence inside a virtual transcript. */
+import { rangeIsDisclosed } from "./details-reveal.js";
 import { currentRangeForBlock } from "./search-block.svelte.js";
 import { revealInContainer, scrollNestedContainers, type SearchRect } from "./scroll-geometry.js";
 
@@ -78,5 +79,9 @@ export async function revealMatch(options: RevealOptions): Promise<boolean> {
     currentRangeForBlock(block)?.startContainer,
   );
   revealInContainer(root, () => readRect(block!), true, false, options.scrollToOffset);
+  if (!options.readTargetRect) {
+    const range = currentRangeForBlock(block);
+    if (!range || !rangeIsDisclosed(block, range)) return false;
+  }
   return true;
 }

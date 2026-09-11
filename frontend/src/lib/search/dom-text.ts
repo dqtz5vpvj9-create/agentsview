@@ -48,24 +48,6 @@ export function domText(root: Node): string {
   return parts.join("");
 }
 
-interface FoldedText {
-  value: string;
-  lengthChanged: boolean;
-}
-
-function fold(value: string): FoldedText {
-  const parts: string[] = [];
-  let lengthChanged = false;
-  for (const codePoint of value) {
-    const folded = codePoint.toLowerCase();
-    parts.push(folded);
-    if (folded.length !== codePoint.length) {
-      lengthChanged = true;
-    }
-  }
-  return { value: parts.join(""), lengthChanged };
-}
-
 function isCodePointBoundary(value: string, index: number): boolean {
   if (index <= 0 || index >= value.length) return true;
   const previous = value.charCodeAt(index - 1);
@@ -101,30 +83,79 @@ function findFoldedOffsets(
   return occurrences;
 }
 
-interface FoldedIndexMap {
-  value: string;
-  starts: number[];
-  ends: number[];
+/** Prepared text is immutable and can be retained with a stable content block. */
+export interface PreparedSearchText {
+  readonly value: string;
+  /** Packed expansion boundaries: folded start/end, then original start/end. */
+  readonly expansions?: Uint32Array;
 }
 
-function foldWithIndexMap(value: string): FoldedIndexMap {
+/** Fold ASCII runs natively and non-ASCII code points independently. */
+export function prepareSearchText(text: string): PreparedSearchText {
+  if (/^[\x00-\x7f]*$/.test(text)) return { value: text.toLowerCase() };
   const parts: string[] = [];
-  const starts: number[] = [];
-  const ends: number[] = [];
-  let originalOffset = 0;
-
-  for (const codePoint of value) {
-    const folded = codePoint.toLowerCase();
-    const originalEnd = originalOffset + codePoint.length;
-    parts.push(folded);
-    for (let i = 0; i < folded.length; i += 1) {
-      starts.push(originalOffset);
-      ends.push(originalEnd);
+  const expansions: number[] = [];
+  let previous = 0;
+  let delta = 0;
+  for (const match of text.matchAll(/[^\x00-\x7f]/gu)) {
+    const start = match.index;
+    if (start > previous) parts.push(text.slice(previous, start).toLowerCase());
+    const point = match[0];
+    const lower = point.toLowerCase();
+    parts.push(lower);
+    previous = start + point.length;
+    if (lower.length !== point.length) {
+      expansions.push(start + delta, start + delta + lower.length, start, previous);
+      delta += lower.length - point.length;
     }
-    originalOffset = originalEnd;
   }
+  if (previous < text.length) parts.push(text.slice(previous).toLowerCase());
+  return {
+    value: parts.join(""),
+    // A single expanding character must not allocate maps for the entire block.
+    expansions: expansions.length ? new Uint32Array(expansions) : undefined,
+  };
+}
 
-  return { value: parts.join(""), starts, ends };
+function originalPosition(position: number, end: boolean, expansions: Uint32Array): number {
+  let lo = 0;
+  let hi = expansions.length / 4;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (expansions[mid * 4]! <= position) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo === 0) return position;
+  const offset = (lo - 1) * 4;
+  const foldedStart = expansions[offset]!;
+  const foldedEnd = expansions[offset + 1]!;
+  const sourceStart = expansions[offset + 2]!;
+  const sourceEnd = expansions[offset + 3]!;
+  if (position === foldedStart) return sourceStart;
+  if (position < foldedEnd || (end && position === foldedEnd)) return end ? sourceEnd : sourceStart;
+  return position - (foldedEnd - sourceEnd);
+}
+
+/** Compile the query once for a scan across many independently cached blocks. */
+export function createOccurrenceMatcher(
+  query: string,
+): (text: PreparedSearchText) => TextOccurrence[] {
+  const foldedQuery = query.trim() ? prepareSearchText(query).value : "";
+  return (text) => {
+    if (!foldedQuery) return [];
+    const matches = findFoldedOffsets(text.value, foldedQuery);
+    if (!text.expansions) return matches;
+    const occurrences: TextOccurrence[] = [];
+    let previousEnd = -1;
+    for (const match of matches) {
+      const start = originalPosition(match.start, false, text.expansions);
+      const end = originalPosition(match.end, true, text.expansions);
+      if (start < previousEnd) continue;
+      occurrences.push({ start, end });
+      previousEnd = end;
+    }
+    return occurrences;
+  };
 }
 
 /**
@@ -133,36 +164,7 @@ function foldWithIndexMap(value: string): FoldedIndexMap {
  * Matching lowercases each Unicode code point. Returned offsets always refer
  * to the original UTF-16 string and never divide a surrogate pair.
  */
-export function findOccurrences(
-  text: string,
-  query: string,
-): TextOccurrence[] {
-  if (query.trim() === "") return [];
-
-  const foldedQuery = fold(query).value;
-  if (foldedQuery.length === 0) return [];
-
-  const foldedText = fold(text);
-  if (!foldedText.lengthChanged) {
-    return findFoldedOffsets(foldedText.value, foldedQuery);
-  }
-
-  const mapped = foldWithIndexMap(text);
-  const foldedOccurrences = findFoldedOffsets(
-    mapped.value,
-    foldedQuery,
-  );
-  const occurrences: TextOccurrence[] = [];
-  let previousEnd = -1;
-
-  for (const occurrence of foldedOccurrences) {
-    const start = mapped.starts[occurrence.start];
-    const end = mapped.ends[occurrence.end - 1];
-    if (start === undefined || end === undefined || start < previousEnd) {
-      continue;
-    }
-    occurrences.push({ start, end });
-    previousEnd = end;
-  }
-  return occurrences;
+export function findOccurrences(text: string, query: string): TextOccurrence[] {
+  if (!query.trim()) return [];
+  return createOccurrenceMatcher(query)(prepareSearchText(text));
 }
