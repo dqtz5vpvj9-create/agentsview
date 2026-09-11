@@ -62,7 +62,10 @@ export async function revealMatch(options: RevealOptions): Promise<boolean> {
   if (!root || !block) return false;
 
   const readRect = options.readTargetRect ?? targetRect;
-  scrollNestedContainers(block, root, () => readRect(block!));
+  scrollNestedContainers(
+    block, root, () => readRect(block!),
+    currentRangeForBlock(block)?.startContainer,
+  );
   revealInContainer(root, () => readRect(block!), true, false, options.scrollToOffset);
 
   // One recheck covers virtual-row height changes after expanding a block.
@@ -70,7 +73,10 @@ export async function revealMatch(options: RevealOptions): Promise<boolean> {
   if (!options.isCurrent() || options.getContainer() !== root) return false;
   block = findSearchBlock(root, options.blockKey);
   if (!block) return false;
-  scrollNestedContainers(block, root, () => readRect(block!));
+  scrollNestedContainers(
+    block, root, () => readRect(block!),
+    currentRangeForBlock(block)?.startContainer,
+  );
   revealInContainer(root, () => readRect(block!), true, false, options.scrollToOffset);
   return true;
 }

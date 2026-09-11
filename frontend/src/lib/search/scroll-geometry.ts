@@ -79,10 +79,19 @@ export function scrollNestedContainers(
   block: HTMLElement,
   root: HTMLElement,
   readTarget: () => SearchRect,
+  targetNode: Node = block,
 ): boolean {
   if (!root.contains(block)) return false;
+  // Markdown/skill attachments can own an entire block with scrolling code or
+  // tables inside it. Start at the match, otherwise those descendant panes are
+  // skipped. Ignore stale or foreign nodes and retain the block fallback.
+  const start = block.contains(targetNode)
+    ? targetNode.nodeType === Node.ELEMENT_NODE
+      ? targetNode as HTMLElement
+      : targetNode.parentElement ?? block
+    : block;
   let moved = false;
-  for (let node: HTMLElement | null = block; node && node !== root; node = node.parentElement) {
+  for (let node: HTMLElement | null = start; node && node !== root; node = node.parentElement) {
     const style = getComputedStyle(node);
     const vertical = /^(auto|scroll|overlay)$/.test(style.overflowY) && node.scrollHeight > node.clientHeight;
     const horizontal = /^(auto|scroll|overlay)$/.test(style.overflowX) && node.scrollWidth > node.clientWidth;
