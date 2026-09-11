@@ -9,5 +9,8 @@
   "session_find_hide_results": "隐藏搜索结果",
   "session_find_subagent_excluded": "搜索范围不包含内嵌子会话消息。",
   "session_find_rail_label": [{"declarations":["input count","local countPlural = count: plural"],"selectors":["countPlural"],"match":{"countPlural=one":"当前会话共有 {count} 个匹配项","countPlural=other":"当前会话共有 {count} 个匹配项"}}],
-  "session_find_raw_output": "搜索期间显示原始输出"
+  "session_find_raw_output": "搜索期间显示原始输出",
+  "session_find_history_incomplete": "历史消息加载失败，当前搜索结果不完整。",
+  "session_find_retry_history": "重新加载历史消息",
+  "session_find_partial_results": "部分结果"
 }

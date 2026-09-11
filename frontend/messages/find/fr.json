@@ -9,5 +9,8 @@
   "session_find_hide_results": "Masquer les résultats de recherche",
   "session_find_subagent_excluded": "Les messages des sous-agents intégrés sont exclus.",
   "session_find_rail_label": [{"declarations":["input count","local countPlural = count: plural"],"selectors":["countPlural"],"match":{"countPlural=one":"{count} résultat dans cette session","countPlural=other":"{count} résultats dans cette session"}}],
-  "session_find_raw_output": "Sortie brute pendant la recherche"
+  "session_find_raw_output": "Sortie brute pendant la recherche",
+  "session_find_history_incomplete": "Impossible de charger les messages précédents. Les résultats sont incomplets.",
+  "session_find_retry_history": "Réessayer le chargement",
+  "session_find_partial_results": "Résultats partiels"
 }

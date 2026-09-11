@@ -3,6 +3,7 @@ import { sessions } from "../stores/sessions.svelte.js";
 import { starred } from "../stores/starred.svelte.js";
 import { sync } from "../stores/sync.svelte.js";
 import { router } from "../stores/router.svelte.js";
+import { ignoreShortcut } from "../search/find-input.js";
 import { inSessionSearch } from "../stores/inSessionSearch.svelte.js";
 import { messages } from "../stores/messages.svelte.js";
 import { getExportUrl } from "../api/client.js";
@@ -47,12 +48,12 @@ interface ShortcutOptions {
 }
 
 function handleEscape(): void {
-  if (inSessionSearch.isOpen) {
-    inSessionSearch.close();
-    return;
-  }
   if (ui.activeModal !== null) {
     ui.activeModal = null;
+    return;
+  }
+  if (inSessionSearch.isOpen) {
+    inSessionSearch.close();
     return;
   }
   if (sessions.activeSessionId && !isInputFocused()) {
@@ -86,6 +87,7 @@ export function registerShortcuts(opts: ShortcutOptions): () => void {
   }
 
   function handler(e: KeyboardEvent) {
+    if (ignoreShortcut(e)) return;
     const meta = e.metaKey || e.ctrlKey;
 
     // Cmd+K — always works

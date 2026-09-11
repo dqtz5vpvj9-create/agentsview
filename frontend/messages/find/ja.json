@@ -9,5 +9,8 @@
   "session_find_hide_results": "検索結果を非表示",
   "session_find_subagent_excluded": "埋め込みのサブエージェントメッセージは検索対象外です。",
   "session_find_rail_label": [{"declarations":["input count","local countPlural = count: plural"],"selectors":["countPlural"],"match":{"countPlural=one":"このセッションに {count} 件の一致","countPlural=other":"このセッションに {count} 件の一致"}}],
-  "session_find_raw_output": "検索中は元の出力を表示"
+  "session_find_raw_output": "検索中は元の出力を表示",
+  "session_find_history_incomplete": "過去のメッセージを読み込めませんでした。検索結果は一部のみです。",
+  "session_find_retry_history": "過去のメッセージを再読み込み",
+  "session_find_partial_results": "一部の結果"
 }

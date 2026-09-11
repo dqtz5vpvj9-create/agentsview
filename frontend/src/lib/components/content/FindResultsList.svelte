@@ -53,7 +53,8 @@
       {/snippet}
     </VirtualList>
   {:else}
-    <EmptyState title={inSessionSearch.loadingHistory ? m.session_find_loading_history() : m.session_find_results_empty()} />
+    <EmptyState title={inSessionSearch.loadingHistory ? m.session_find_loading_history()
+      : inSessionSearch.historyError ? m.session_find_history_incomplete() : m.session_find_results_empty()} />
   {/if}
   <p class="result-scope">{m.session_find_subagent_excluded()}</p>
 </section>

@@ -147,13 +147,16 @@ describe("local in-session search", () => {
     store.next();
     expect(store.currentOccurrence("0:text:0")).toBe(1);
     view.sortNewestFirst = true;
-    expect(store.currentIndex).toBe(1);
-    store.next();
-    expect(store.currentOccurrence("0:text:0")).toBe(0);
     expect(store.currentIndex).toBe(2);
     store.next();
     expect(store.currentOrdinal).toBe(2);
     expect(store.currentIndex).toBe(0);
+    store.next();
+    expect(store.currentOccurrence("0:text:0")).toBe(0);
+    expect(store.currentIndex).toBe(1);
+    store.next();
+    expect(store.currentOccurrence("0:text:0")).toBe(1);
+    expect(store.currentIndex).toBe(2);
     expect(setFollowLatest).toHaveBeenLastCalledWith(false);
   });
 
@@ -216,7 +219,7 @@ describe("local in-session search", () => {
     source.sessionId = "session-b";
     source.messages = [message(7, "needle")];
     await tick();
-    expect(store.current).toBeNull();
+    expect(store.current).toEqual({ ordinal: 7, blockKey: "7:text:0", occurrence: 0 });
     expect(store.currentOrdinal).toBe(7);
     store.query = "missing";
     await tick();

@@ -66,10 +66,8 @@ export function groupFindResults(
     group.entries.push({ match, block, snippet: matchSnippet(block.text, match.start, match.end) });
   }
   const result = [...groups.values()].sort((a, b) => a.message.ordinal - b.message.ordinal);
-  if (newestFirst) {
-    result.reverse();
-    for (const group of result) group.entries.reverse();
-  }
+  // The transcript reverses messages, not their block or character order.
+  if (newestFirst) result.reverse();
   return result;
 }
 

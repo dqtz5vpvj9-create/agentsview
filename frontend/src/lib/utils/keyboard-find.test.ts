@@ -86,4 +86,32 @@ describe("session find keyboard navigation", () => {
     expect(next).not.toHaveBeenCalled();
     ui.activeModal = null;
   });
+
+  it("preserves find while Escape dismisses a foreground modal", () => {
+    ui.activeModal = "shortcuts";
+    fire("Escape");
+    expect(ui.activeModal).toBeNull();
+    expect(inSessionSearch.isOpen).toBe(true);
+    fire("Escape");
+    expect(inSessionSearch.isOpen).toBe(false);
+    expect(sessions.activeSessionId).toBe("find-keyboard");
+  });
+
+  it.each([{ isComposing: true }, { keyCode: 229 }])("ignores composition shortcut events %j", (options) => {
+    const next = vi.spyOn(inSessionSearch, "next");
+    fire("F3", options);
+    fire("k", { ...options, ctrlKey: true });
+    fire("Escape", options);
+    expect(next).not.toHaveBeenCalled();
+    expect(ui.activeModal).toBeNull();
+    expect(inSessionSearch.isOpen).toBe(true);
+  });
+
+  it("does not process an event already consumed by a nested control", () => {
+    const next = vi.spyOn(inSessionSearch, "next");
+    const event = new KeyboardEvent("keydown", { key: "F3", bubbles: true, cancelable: true });
+    event.preventDefault();
+    document.dispatchEvent(event);
+    expect(next).not.toHaveBeenCalled();
+  });
 });

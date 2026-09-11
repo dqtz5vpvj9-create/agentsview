@@ -41,10 +41,10 @@ describe("find result groups", () => {
     groupFindResults([message(1)], [match(1), match(1, 1)], (source) => { calls++; return [block(source.ordinal)]; });
     expect(calls).toBe(1);
   });
-  it("reverses groups and within-message occurrences for newest-first", () => {
+  it("reverses message groups while retaining within-message reading order", () => {
     const groups = groupFindResults([message(1), message(2)], [match(1), match(1, 1), match(2)], (source) => [block(source.ordinal)], true);
     expect(groups.map((group) => group.message.ordinal)).toEqual([2, 1]);
-    expect(groups[1]?.entries.map((entry) => entry.match.occurrence)).toEqual([1, 0]);
+    expect(groups[1]?.entries.map((entry) => entry.match.occurrence)).toEqual([0, 1]);
   });
   it("ignores unloaded messages and stale block identities", () => {
     expect(groupFindResults([message(1)], [match(2)], () => [block(1)])).toEqual([]);

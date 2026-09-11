@@ -18,15 +18,30 @@ export function centeredOffset(
   targetEnd: number,
   viewportStart: number,
   viewportEnd: number,
+  scale = 1,
 ): number {
-  return currentOffset + (targetStart + targetEnd - viewportStart - viewportEnd) / 2;
+  return currentOffset + (targetStart + targetEnd - viewportStart - viewportEnd) /
+    (2 * validScale(scale));
 }
 
-function viewportFor(element: HTMLElement): SearchRect {
+function validScale(scale: number): number {
+  return Number.isFinite(scale) && scale > 0 ? scale : 1;
+}
+
+function viewportFor(element: HTMLElement) {
   const rect = element.getBoundingClientRect();
-  const top = rect.top + element.clientTop;
-  const left = rect.left + element.clientLeft;
-  return { top, left, bottom: top + element.clientHeight, right: left + element.clientWidth };
+  // CSS zoom and axis-aligned scale affect client rectangles, while scrolling,
+  // borders, and client dimensions still use the element's layout coordinates.
+  const scaleX = validScale(rect.width / element.offsetWidth);
+  const scaleY = validScale(rect.height / element.offsetHeight);
+  const top = rect.top + element.clientTop * scaleY;
+  const left = rect.left + element.clientLeft * scaleX;
+  return {
+    top, left,
+    bottom: top + element.clientHeight * scaleY,
+    right: left + element.clientWidth * scaleX,
+    scaleX, scaleY,
+  };
 }
 
 /** Move only clipped axes; a visible occurrence never causes recentering. */
@@ -44,7 +59,7 @@ export function revealInContainer(
       (target.top < viewport.top || target.bottom > viewport.bottom)) {
     const offset = Math.max(0, Math.min(
       element.scrollHeight - element.clientHeight,
-      centeredOffset(element.scrollTop, target.top, target.bottom, viewport.top, viewport.bottom),
+      centeredOffset(element.scrollTop, target.top, target.bottom, viewport.top, viewport.bottom, viewport.scaleY),
     ));
     if (offset !== element.scrollTop) { scrollVertical(offset); moved = true; }
   }
@@ -52,7 +67,7 @@ export function revealInContainer(
       (target.left < viewport.left || target.right > viewport.right)) {
     const offset = Math.max(0, Math.min(
       element.scrollWidth - element.clientWidth,
-      centeredOffset(element.scrollLeft, target.left, target.right, viewport.left, viewport.right),
+      centeredOffset(element.scrollLeft, target.left, target.right, viewport.left, viewport.right, viewport.scaleX),
     ));
     if (offset !== element.scrollLeft) { element.scrollLeft = offset; moved = true; }
   }

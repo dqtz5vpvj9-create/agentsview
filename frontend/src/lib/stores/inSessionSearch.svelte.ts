@@ -2,10 +2,18 @@
 import { untrack } from "svelte";
 import type { Message } from "../api/types.js";
 import { buildSessionIndex, type Match, type SessionIndex } from "../search/session-index.js";
+import {
+  cursorFor,
+  matchesInDisplayOrder,
+  resolveSearchMatch,
+  sameCursor,
+  stepSearchMatch,
+  type SearchCursor,
+} from "../search/navigation.js";
 import { messages } from "./messages.svelte.js";
 import { ui } from "./ui.svelte.js";
 
-export type SearchCursor = Pick<Match, "ordinal" | "blockKey" | "occurrence">;
+export type { SearchCursor } from "../search/navigation.js";
 
 export interface SearchMessageSource {
   sessionId: string | null;
@@ -25,20 +33,18 @@ export interface SearchView {
 
 const EMPTY_MATCHES: Match[] = [];
 
-function sameCursor(a: SearchCursor, b: SearchCursor): boolean {
-  return a.ordinal === b.ordinal && a.blockKey === b.blockKey && a.occurrence === b.occurrence;
-}
-
 export class InSessionSearchStore {
   isOpen = $state(false);
   query = $state("");
   debouncedQuery = $state("");
+  composing = $state(false);
   current: SearchCursor | null = $state.raw(null);
   currentSeq = $state(0);
   revealSeq = $state(0);
   anchorOrdinal: number | null = $state(null);
   focusRequest = $state(0);
   resultsOpen = $state(false);
+  private historyFailed = $state(false);
 
   private source: SearchMessageSource = messages;
   private view: SearchView = ui;
@@ -46,6 +52,7 @@ export class InSessionSearchStore {
   private previousSessionId: string | null;
   private historyRequest: { sessionId: string; promise: Promise<void> } | null = null;
 
+  historyError = $derived(this.isOpen && this.source.hasOlder && this.historyFailed);
   isActive = $derived(this.isOpen && this.debouncedQuery.trim() !== "");
   index: SessionIndex | null = $derived.by(() => {
     // The session is part of the dependency graph even when its message array
@@ -54,26 +61,22 @@ export class InSessionSearchStore {
     return buildSessionIndex(this.source.messages, this.debouncedQuery);
   });
   matches: Match[] = $derived(this.index?.matches ?? EMPTY_MATCHES);
+  orderedMatches: readonly Match[] = $derived(
+    matchesInDisplayOrder(this.matches, this.view.sortNewestFirst),
+  );
   total = $derived(this.index?.total ?? 0);
   loadingHistory = $derived(
-    this.isOpen && (this.source.loading || this.source.hasOlder || this.source.loadingOlder),
+    this.isOpen && (this.source.loading || this.source.loadingOlder ||
+      (this.source.hasOlder && !this.historyError)),
   );
-  resolvedCurrent: Match | null = $derived.by(() => {
-    if (!this.matches.length) return null;
-    if (this.current) {
-      const exact = this.matches.find((match) => sameCursor(match, this.current!));
-      if (exact) return exact;
-    }
-    const anchor = this.current?.ordinal ?? this.anchorOrdinal;
-    return (anchor === null
-      ? this.matches[0]
-      : this.matches.find((match) => match.ordinal >= anchor)) ?? null;
-  });
+  resolvedCurrent: Match | null = $derived(
+    resolveSearchMatch(
+      this.orderedMatches, this.current, this.anchorOrdinal, this.view.sortNewestFirst,
+    ),
+  );
   currentIndex = $derived.by(() => {
     const current = this.resolvedCurrent;
-    if (!current) return -1;
-    const index = this.matches.indexOf(current);
-    return this.view.sortNewestFirst ? this.total - 1 - index : index;
+    return current ? this.orderedMatches.indexOf(current) : -1;
   });
 
   constructor(source: SearchMessageSource = messages, view: SearchView = ui) {
@@ -88,6 +91,9 @@ export class InSessionSearchStore {
           this.previousSessionId = sessionId;
           this.current = null;
           this.anchorOrdinal = null;
+          this.composing = false;
+          this.historyRequest = null;
+          this.historyFailed = false;
           this.currentSeq++;
           this.revealSeq++;
           if (!sessionId) this.close();
@@ -98,13 +104,20 @@ export class InSessionSearchStore {
         const query = this.query;
         const open = this.isOpen;
         const sessionId = this.source.sessionId;
-        if (!open || !sessionId || !query.trim()) {
+        const composing = this.composing;
+        if (!open || !sessionId) {
+          untrack(() => this.applyQuery(""));
+          return;
+        }
+        if (composing) return;
+        if (!query.trim()) {
           untrack(() => this.applyQuery(""));
           return;
         }
         if (query === untrack(() => this.debouncedQuery)) return;
         const timer = setTimeout(() => {
-          if (this.isOpen && this.source.sessionId === sessionId && this.query === query) {
+          if (this.isOpen && !this.composing &&
+              this.source.sessionId === sessionId && this.query === query) {
             this.applyQuery(query);
           }
         }, 150);
@@ -119,6 +132,20 @@ export class InSessionSearchStore {
         if (open && sessionId && hasOlder && !loading) {
           untrack(() => this.requestHistory());
         }
+      });
+
+      $effect(() => {
+        const match = this.resolvedCurrent;
+        if (!match) return;
+        untrack(() => {
+          if (this.current && sameCursor(this.current, match)) return;
+          // Pin the first implicit match too. Loading older pages must not
+          // silently move it, even before the first explicit next/previous.
+          this.current = cursorFor(match);
+          this.currentSeq++;
+          this.revealSeq++;
+          this.selectCurrent();
+        });
       });
     });
   }
@@ -135,6 +162,9 @@ export class InSessionSearchStore {
   private selectCurrent(): void {
     const match = this.resolvedCurrent;
     if (!match) return;
+    if (!this.current || !sameCursor(this.current, match)) {
+      this.current = cursorFor(match);
+    }
     this.view.selectOrdinal(match.ordinal);
     this.view.setFollowLatest(false);
   }
@@ -143,13 +173,32 @@ export class InSessionSearchStore {
     const sessionId = this.source.sessionId;
     if (!sessionId || !this.isOpen || !this.source.hasOlder || this.source.loading) return;
     if (this.historyRequest?.sessionId === sessionId) return;
-    const promise = this.source.ensureOrdinalLoaded(0);
+    this.historyFailed = false;
+    const promise: Promise<void> = Promise.resolve().then(() => {
+      if (this.historyRequest?.promise === promise &&
+          this.source.sessionId === sessionId && this.isOpen) {
+        return this.source.ensureOrdinalLoaded(0);
+      }
+    });
     this.historyRequest = { sessionId, promise };
     void promise.catch((error: unknown) => {
-      console.warn("Could not load session history for search", error);
+      if (this.historyRequest?.promise === promise && this.source.sessionId === sessionId) {
+        console.warn("Could not load session history for search", error);
+      }
     }).finally(() => {
-      if (this.historyRequest?.promise === promise) this.historyRequest = null;
+      if (this.historyRequest?.promise !== promise) return;
+      this.historyRequest = null;
+      // The shared message loader can handle its own rejection. Remaining
+      // history still means these counts are partial and an explicit retry is
+      // needed; do not leave the find bar announcing loading indefinitely.
+      if (this.source.sessionId === sessionId) {
+        this.historyFailed = this.source.hasOlder;
+      }
     });
+  }
+
+  retryHistory(): void {
+    this.requestHistory();
   }
 
   countForBlock(key: string | undefined): number {
@@ -183,6 +232,7 @@ export class InSessionSearchStore {
   /** Closing hides search without erasing the last query. */
   close(): void {
     this.isOpen = false;
+    this.composing = false;
     this.debouncedQuery = "";
     this.current = null;
     this.resultsOpen = false;
@@ -201,41 +251,42 @@ export class InSessionSearchStore {
   }
 
   goTo(cursor: SearchCursor): void {
+    // A result panel can remain visible during debounce. Its old rows cannot
+    // navigate a different query that has already been entered in the input.
+    if (!this.isOpen || this.composing || this.query !== this.debouncedQuery) return;
     const match = this.matches.find((candidate) => sameCursor(candidate, cursor));
     if (!match) return;
-    this.current = {
-      ordinal: match.ordinal,
-      blockKey: match.blockKey,
-      occurrence: match.occurrence,
-    };
+    this.current = cursorFor(match);
     this.currentSeq++;
     this.revealSeq++;
     this.selectCurrent();
   }
 
-  private step(delta: number): void {
-    if (!this.matches.length) return;
-    const direction = this.view.sortNewestFirst ? -delta : delta;
-    const current = this.resolvedCurrent ? this.matches.indexOf(this.resolvedCurrent) : -1;
-    const next = current < 0
-      ? direction > 0 ? 0 : this.total - 1
-      : (current + direction + this.total) % this.total;
-    this.goTo(this.matches[next]!);
+  private step(delta: 1 | -1): void {
+    if (!this.isOpen || this.composing) return;
+    const query = this.query.trim() ? this.query : "";
+    const freshQuery = query !== this.debouncedQuery;
+    if (freshQuery) this.applyQuery(query);
+    const match = stepSearchMatch(
+      this.orderedMatches, this.resolvedCurrent, delta, freshQuery,
+    );
+    if (match) this.goTo(match);
   }
 
   next(): void { this.step(1); }
   prev(): void { this.step(-1); }
 
-  // Compatibility names for callers migrating in the subsequent UI commits.
   get currentMatchIndex(): number { return this.currentIndex; }
   get currentOrdinal(): number | null { return this.resolvedCurrent?.ordinal ?? null; }
   get loading(): boolean {
-    return this.loadingHistory || (this.isOpen && !!this.query.trim() && this.query !== this.debouncedQuery);
+    return this.loadingHistory || (this.isOpen && !!this.query.trim() &&
+      (this.composing || this.query !== this.debouncedQuery));
   }
 
   /** Release effects for isolated store instances and embedded session views. */
   destroy(): void {
     this.disposeEffects();
+    this.historyRequest = null;
     this.close();
   }
 }
