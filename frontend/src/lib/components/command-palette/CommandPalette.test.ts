@@ -357,6 +357,53 @@ describe("CommandPalette", () => {
     unmount(component);
   });
 
+  it.each([
+    { query: "消融", searches: true },
+    { query: "検索", searches: true },
+    { query: "검색", searches: true },
+    { query: "a消", searches: true },
+    { query: "abc", searches: true },
+    { query: "消", searches: false },
+    { query: "ab", searches: false },
+  ])("sends $query to the server: $searches", async ({ query, searches }) => {
+    mockSearchStore.results = [makeSearchResult({ snippet: "server hit" })];
+    const component = mount(CommandPalette, { target: document.body });
+    await tick();
+
+    await enterSearchQuery(query);
+
+    if (searches) {
+      expect(mockSearchStore.search).toHaveBeenCalledWith(query, "");
+      expect(mockSearchStore.clear).not.toHaveBeenCalled();
+    } else {
+      expect(mockSearchStore.search).not.toHaveBeenCalled();
+      expect(mockSearchStore.clear).toHaveBeenCalled();
+    }
+    const snippets = Array.from(document.querySelectorAll(".item-snippet")).map((el) =>
+      el.textContent?.trim(),
+    );
+    expect(snippets.includes("server hit")).toBe(searches);
+
+    unmount(component);
+  });
+
+  it("filters recent sessions locally for a single CJK character", async () => {
+    mockSessions.sessions = [
+      { ...makeSession("s1", "codex"), first_message: "消融实验的结果" },
+      { ...makeSession("s2", "codex"), first_message: "unrelated" },
+    ];
+    const component = mount(CommandPalette, { target: document.body });
+    await tick();
+
+    await enterSearchQuery("消");
+
+    const items = document.querySelectorAll(".palette-item");
+    expect(items).toHaveLength(1);
+    expect(items[0]?.textContent).toContain("消融实验的结果");
+
+    unmount(component);
+  });
+
   it("search result click navigates to the session route", async () => {
     mockSearchStore.results = [makeSearchResult()];
 

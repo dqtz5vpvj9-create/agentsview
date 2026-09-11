@@ -46,9 +46,19 @@
     searchStore.resetSort();
   });
 
+  // Most Chinese, Japanese, and Korean words are one or two characters long,
+  // so the three-character minimum that suits Latin text would keep common
+  // CJK queries such as "消融" from ever reaching the server.
+  const CJK_TEXT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+
+  function isServerSearchQuery(query: string): boolean {
+    if (CJK_TEXT.test(query)) return Array.from(query).length >= 2;
+    return query.length >= 3;
+  }
+
   // Filtered recent sessions (client-side filter)
   let recentSessions = $derived.by(() => {
-    if (inputValue.length > 0 && inputValue.length < 3) {
+    if (inputValue.length > 0 && !isServerSearchQuery(inputValue)) {
       const q = inputValue.toLowerCase();
       return sessions.sessions
         .filter(
@@ -65,8 +75,9 @@
     return [];
   });
 
-  // Combined results: search results when query >= 3 chars, else recent
-  let showSearchResults = $derived(inputValue.length >= 3);
+  // Combined results: server search results once the query is long enough,
+  // else recent sessions
+  let showSearchResults = $derived(isServerSearchQuery(inputValue));
 
   let totalItems = $derived(
     showSearchResults
@@ -79,7 +90,7 @@
     inputValue = target.value;
     selectedIndex = 0;
 
-    if (inputValue.length >= 3) {
+    if (isServerSearchQuery(inputValue)) {
       searchStore.search(inputValue, sessions.filters.project);
     } else {
       searchStore.clear();
