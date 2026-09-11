@@ -4,7 +4,8 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"io"
 	"os"
 	"os/exec"
@@ -186,7 +187,7 @@ func TestExportSessionsAllJSONPreservesCostOnlyReportedPricingAcrossPages(
 	require.NoError(t, database.InsertMessages([]db.Message{{
 		SessionID: "computed", Ordinal: 0, Role: "assistant",
 		Timestamp: "2026-06-16T11:05:00Z", Model: "computed-model",
-		TokenUsage: json.RawMessage(`{"input_tokens":1000000}`),
+		TokenUsage: jsontext.Value(`{"input_tokens":1000000}`),
 	}}))
 	insertExportSessionsTestSession(t, database, db.Session{
 		ID: "cost-only-reported", Project: "alpha", Machine: "local",
@@ -753,7 +754,7 @@ func TestExportSessionsJSONGolden(t *testing.T) {
 	assert.NotContains(t, stdout, `"machine":"golden-host"`)
 	assert.NotContains(t, stdout, `"root_path":"/`)
 
-	assertGoldenBytes(t, "session_export_v5.json", []byte(stdout))
+	assertGoldenBytes(t, "session_export_v6.json", []byte(stdout))
 }
 
 func TestExportSessionsNDJSONGolden(t *testing.T) {
@@ -768,7 +769,7 @@ func TestExportSessionsNDJSONGolden(t *testing.T) {
 	require.NoError(t, err, "export sessions ndjson golden")
 	require.Empty(t, stderr)
 
-	assertGoldenBytes(t, "session_export_v5.ndjson", []byte(stdout))
+	assertGoldenBytes(t, "session_export_v6.ndjson", []byte(stdout))
 }
 
 func firstExportSessionsCursor(t *testing.T) string {
@@ -810,7 +811,7 @@ func TestExportSessionsFallbackPricingOnUnseededArchive(t *testing.T) {
 			SessionID: "fallback-priced", Ordinal: 1, Role: "assistant",
 			Content: "answer", ContentLength: len("answer"),
 			Timestamp: "2026-06-01T10:05:00Z", Model: model,
-			TokenUsage: json.RawMessage(
+			TokenUsage: jsontext.Value(
 				`{"input_tokens":1000,"output_tokens":500}`),
 		},
 		{
@@ -929,10 +930,13 @@ func decodeExportSessionsDocument(
 
 func decoderRemainder(t *testing.T, input string) string {
 	t.Helper()
-	dec := json.NewDecoder(strings.NewReader(input))
+	reader := strings.NewReader(input)
+	dec := jsontext.NewDecoder(reader)
 	var doc any
-	require.NoError(t, dec.Decode(&doc))
-	rest, err := io.ReadAll(dec.Buffered())
+	require.NoError(t, json.UnmarshalDecode(dec, &doc))
+	rest, err := io.ReadAll(io.MultiReader(
+		bytes.NewReader(dec.UnreadBuffer()), reader,
+	))
 	require.NoError(t, err)
 	return string(rest)
 }

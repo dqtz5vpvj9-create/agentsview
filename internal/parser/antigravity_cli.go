@@ -2,11 +2,14 @@ package parser
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -79,7 +82,7 @@ type AntigravityCLIParseStatus struct {
 // package-level ParseAntigravityCLISessionWithStatus entrypoint was folded onto
 // the provider.
 func (p *antigravityCLIProvider) parseSessionWithStatus(
-	path, project, machine string,
+	ctx context.Context, path, project, cwd, machine string,
 ) (*ParsedSession, []ParsedMessage, []ParsedUsageEvent, AntigravityCLIParseStatus, error) {
 	var status AntigravityCLIParseStatus
 	info, err := os.Stat(path)
@@ -237,14 +240,40 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		messages[i].Ordinal = i
 	}
 
-	if project == "" {
-		project = inferAntigravityProject(
-			filepath.Join(root, "history.jsonl"), id,
-		)
-		if project == "" {
-			project = inferAntigravityProjectFromHistoryFallback(
-				filepath.Join(root, "history.jsonl"), messages, info.ModTime(),
+	historyPath := filepath.Join(root, "history.jsonl")
+	if cwd == "" {
+		workspace := buildAntigravityCLIProjectMap(root)[id]
+		if workspace == "" {
+			workspace = inferAntigravityProjectFromHistoryFallback(
+				historyPath, messages, info.ModTime(),
 			)
+		}
+		cwd = normalizeAntigravityCLIWorkspace(workspace)
+		if project == "" {
+			project = workspace
+		}
+	}
+	if project == "" {
+		project = cwd
+	}
+	// project is the raw workspace filesystem path recorded by history.jsonl.
+	// Keep an absolute workspace unchanged as Cwd, but run the project through
+	// the shared cwd normalizer so sessions from different
+	// git worktrees of the same repo resolve to one project, matching how
+	// the Codex and Claude providers normalize their own cwd hints. A
+	// path-rewritten parse (remote sync) describes another machine's
+	// filesystem, so it keeps the lexical rules but skips local git-root
+	// discovery: the remote workspace path could name an unrelated
+	// repository that happens to exist on the importing host.
+	if project != "" {
+		projectCtx := ctx
+		if p.Config.PathRewriter != nil {
+			projectCtx = WithoutFilesystemProjectDiscovery(projectCtx)
+		}
+		if normalized := ExtractProjectFromCwdWithBranchContext(
+			projectCtx, project, "",
+		); normalized != "" {
+			project = normalized
 		}
 	}
 
@@ -291,6 +320,7 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 	sess := &ParsedSession{
 		ID:                 antigravityCLIIDPrefix + storageID,
 		Project:            project,
+		Cwd:                cwd,
 		Machine:            machine,
 		Agent:              AgentAntigravityCLI,
 		FirstMessage:       firstMessage,
@@ -326,6 +356,24 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		return sess, nil, usageEvents, status, nil
 	}
 	return sess, messages, usageEvents, status, nil
+}
+
+func normalizeAntigravityCLIWorkspace(workspace string) string {
+	workspace = strings.TrimSpace(workspace)
+	if workspace == "" {
+		return ""
+	}
+	if strings.HasPrefix(workspace, "/") || strings.HasPrefix(workspace, `\\`) {
+		return workspace
+	}
+	if len(workspace) >= 3 && workspace[1] == ':' &&
+		(workspace[2] == '/' || workspace[2] == '\\') {
+		letter := workspace[0]
+		if letter >= 'A' && letter <= 'Z' || letter >= 'a' && letter <= 'z' {
+			return workspace
+		}
+	}
+	return ""
 }
 
 func loadAntigravityCLIDBSteps(
@@ -457,6 +505,41 @@ func hasDisplayableAntigravityCLITrajectoryMessage(
 // often it runs.
 var buildAntigravityProjectMap = antigravityProjectMapFromHistory
 
+func buildAntigravityCLIProjectMap(root string) map[string]string {
+	out := buildAntigravityProjectMap(filepath.Join(root, "history.jsonl"))
+	// The current cache is newer than history and wins for matching IDs.
+	maps.Copy(out, antigravityProjectMapFromLastConversations(
+		filepath.Join(root, "cache", "last_conversations.json"),
+	))
+	return out
+}
+
+// antigravityProjectMapFromLastConversations reverses the current CLI cache's
+// workspace -> conversationId object into the provider's
+// conversationId -> workspace lookup shape.
+func antigravityProjectMapFromLastConversations(path string) map[string]string {
+	out := make(map[string]string)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	root := gjson.ParseBytes(raw)
+	if !root.IsObject() {
+		return out
+	}
+	root.ForEach(func(workspace, conversationID gjson.Result) bool {
+		id := strings.TrimSpace(conversationID.String())
+		path := strings.TrimSpace(workspace.String())
+		if id != "" && path != "" {
+			if _, exists := out[id]; !exists {
+				out[id] = path
+			}
+		}
+		return true
+	})
+	return out
+}
+
 // antigravityProjectMapFromHistory reads history.jsonl and returns a
 // map of conversationId -> workspace path.
 func antigravityProjectMapFromHistory(path string) map[string]string {
@@ -480,11 +563,6 @@ func antigravityProjectMapFromHistory(path string) map[string]string {
 		}
 	}
 	return out
-}
-
-func inferAntigravityProject(path, id string) string {
-	m := buildAntigravityProjectMap(path)
-	return m[id]
 }
 
 func inferAntigravityProjectFromHistoryFallback(
@@ -719,17 +797,23 @@ func decryptAntigravityCLITranscript(
 // AntigravityCLIFileInfo returns a fake os.FileInfo whose size and
 // mtime combine the session file with everything else the parser
 // renders: SQLite WAL/SHM siblings, the .trajectory.json sidecar,
-// history.jsonl, and the brain/<id> artifacts. History stays here while
-// legacy sync skip checks use this effective file info; provider hashes
-// additionally scope tagged history rows by conversation ID.
+// history.jsonl, cache/last_conversations.json, and the brain/<id> artifacts.
+// History and the workspace cache stay here while legacy sync skip checks use
+// this effective file info; provider hashes additionally scope tagged history
+// rows and workspace values by conversation ID.
 func AntigravityCLIFileInfo(path string) (os.FileInfo, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, err
 	}
+	root := filepath.Dir(filepath.Dir(path))
+	companions := append(
+		antigravityCLICompanionPaths(path),
+		filepath.Join(root, "cache", "last_conversations.json"),
+	)
 	return antigravityCLICombinedFileInfo(
 		info,
-		antigravityCLICompanionPaths(path)...,
+		companions...,
 	), nil
 }
 
@@ -857,16 +941,29 @@ func antigravityCompositeHashWithExtra(
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
-func antigravityCLICompositeHash(path, id string) (string, error) {
+func antigravityCLICompositeHash(path, id, workspace string) (string, error) {
 	return antigravityCompositeHashWithExtra(
 		path,
 		antigravityCLIProviderCompanionPaths(path),
 		func(h interface{ Write([]byte) (int, error) }) error {
-			return addAntigravityCLIHistoryFingerprintPart(
+			if err := addAntigravityCLIHistoryFingerprintPart(
 				h,
 				filepath.Join(filepath.Dir(filepath.Dir(path)), "history.jsonl"),
 				strings.TrimPrefix(id, antigravityImplicitTag),
-			)
+			); err != nil {
+				return err
+			}
+			if workspace == "" {
+				return nil
+			}
+			if _, err := fmt.Fprintf(h, "workspace\x00%d\x00", len(workspace)); err != nil {
+				return err
+			}
+			if _, err := h.Write([]byte(workspace)); err != nil {
+				return err
+			}
+			_, err := h.Write([]byte{0})
+			return err
 		},
 	)
 }
@@ -989,7 +1086,7 @@ type agyTrajectory struct {
 	CascadeID         string                 `json:"cascadeId"`
 	Steps             []agyStep              `json:"steps"`
 	GeneratorMetadata []agyGeneratorMetadata `json:"generatorMetadata"`
-	AgyReader         json.RawMessage        `json:"agyReader"`
+	AgyReader         jsontext.Value         `json:"agyReader"`
 }
 
 type agyReaderMetadata struct {
@@ -1098,11 +1195,11 @@ type agyToolCall struct {
 }
 
 type agyRunCommand struct {
-	CommandLine         string          `json:"commandLine"`
-	ProposedCommandLine string          `json:"proposedCommandLine"`
-	Cwd                 string          `json:"cwd"`
-	ExitCode            *int            `json:"exitCode"`
-	CombinedOutput      json.RawMessage `json:"combinedOutput"`
+	CommandLine         string         `json:"commandLine"`
+	ProposedCommandLine string         `json:"proposedCommandLine"`
+	Cwd                 string         `json:"cwd"`
+	ExitCode            *int           `json:"exitCode"`
+	CombinedOutput      jsontext.Value `json:"combinedOutput"`
 }
 
 func (rc *agyRunCommand) CombinedOutputString() string {
@@ -1113,7 +1210,7 @@ func (rc *agyRunCommand) CombinedOutputString() string {
 	if err := json.Unmarshal(rc.CombinedOutput, &s); err == nil {
 		return s
 	}
-	var obj map[string]json.RawMessage
+	var obj map[string]jsontext.Value
 	if err := json.Unmarshal(rc.CombinedOutput, &obj); err == nil {
 		parts := make([]string, 0, 4)
 		for _, key := range []string{"stdout", "stderr", "output", "text", "full"} {
@@ -1139,9 +1236,9 @@ type agyViewFile struct {
 }
 
 type agyCodeAction struct {
-	Description  string          `json:"description"`
-	ActionSpec   json.RawMessage `json:"actionSpec"`
-	ActionResult json.RawMessage `json:"actionResult"`
+	Description  string         `json:"description"`
+	ActionSpec   jsontext.Value `json:"actionSpec"`
+	ActionResult jsontext.Value `json:"actionResult"`
 }
 
 type agyCodeActionResult struct {
@@ -1241,7 +1338,7 @@ func agyToolDetail(name, inputJSON string) string {
 	if !strings.HasPrefix(strings.TrimSpace(inputJSON), "{") {
 		return name
 	}
-	var input map[string]json.RawMessage
+	var input map[string]jsontext.Value
 	if err := json.Unmarshal([]byte(inputJSON), &input); err != nil {
 		return name
 	}
@@ -1321,7 +1418,7 @@ type agyTrajectoryParseResult struct {
 	parentCascadeID string
 }
 
-func parseAgyReaderParentCascadeID(raw json.RawMessage) string {
+func parseAgyReaderParentCascadeID(raw jsontext.Value) string {
 	if len(raw) == 0 {
 		return ""
 	}

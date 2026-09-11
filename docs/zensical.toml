@@ -1,6 +1,6 @@
 [project]
 site_name = "AgentsView"
-site_url = "https://agentsview.io"
+site_url = "https://agentsview.io/docs/"
 site_description = "Local-first desktop and web app for AI agent sessions"
 site_author = "Kenn Software LLC"
 copyright = 'Copyright &copy; 2026 <a href="https://kenn.io">Kenn Software LLC</a>. MIT License.'
@@ -13,6 +13,7 @@ extra_javascript = ["javascripts/lightbox.js"]
 use_directory_urls = true
 nav = [
   {"Quick Start" = "quickstart.md"},
+  {"Changelog" = "changelog.md"},
   {"Contributing" = "contributing.md"},
   {"Configuration" = "configuration.md"},
   {"Usage Guide" = "usage.md"},
@@ -22,6 +23,7 @@ nav = [
   {"Session Intelligence" = "session-intelligence.md"},
   {"MCP Server" = "mcp.md"},
   {"Token Usage & Costs" = "token-usage.md"},
+  {"One-shot CI Capture" = "one-shot-capture.md"},
   {"Chat Import" = "chat-import.md"},
   {"Quality" = "quality.md"},
   {"CLI Reference" = "commands.md"},
@@ -36,8 +38,8 @@ nav = [
   {"Artifact Folder Sync" = "artifact-sync.md"},
   {"Filesystem Session Sync" = "filesystem-sync.md"},
   {"PostgreSQL Sync" = "pg-sync.md"},
+  {"Hosted Raw Sync" = "hosted-raw-sync.md"},
   {"DuckDB Mirror" = "duckdb.md"},
-  {"Changelog" = "changelog.md"},
 ]
 
 [project.extra]

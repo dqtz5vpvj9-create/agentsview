@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/sync"
 )
 
@@ -375,6 +376,192 @@ func TestRunWorkerSyncPassRecordsSyncBookkeeping(t *testing.T) {
 	}
 }
 
+func TestRunForegroundWorkerSyncPassRejectsBusyEngineBeforeWorkerLaunch(
+	t *testing.T,
+) {
+	engine := sync.NewEngine(dbtest.OpenTestDB(t), sync.EngineConfig{})
+	t.Cleanup(engine.Close)
+	entered := make(chan struct{})
+	release := make(chan struct{}, 1)
+	defer func() {
+		select {
+		case release <- struct{}{}:
+		default:
+		}
+	}()
+	done := make(chan error, 1)
+	go func() {
+		done <- engine.RunExclusive(func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		require.FailNow(t, "first exclusive sync did not acquire the lock")
+	}
+	restore := stubLaunchSyncWorker(t, func(
+		context.Context, config.Config, string, func(workerLine),
+	) (workerResult, error) {
+		t.Error("busy foreground sync must not launch another worker")
+		return workerResult{}, nil
+	})
+	defer restore()
+
+	_, ran, err := runForegroundWorkerSyncPass(
+		t.Context(), t.Context(), config.Config{}, engine, nil, nil, nil,
+	)
+
+	require.ErrorIs(t, err, sync.ErrSyncInProgress)
+	assert.False(t, ran)
+	release <- struct{}{}
+	require.NoError(t, <-done)
+}
+
+func TestRunForegroundWorkerSyncPassPublishesAndClearsWorkerProgress(
+	t *testing.T,
+) {
+	cfg := testConfigWithClaudeFixture(t)
+	database, lock := openTestWriteDB(t, cfg)
+	engine := sync.NewEngine(database, sync.EngineConfig{})
+	t.Cleanup(engine.Close)
+	progressSeen := make(chan struct{})
+	release := make(chan struct{}, 1)
+	defer func() {
+		select {
+		case release <- struct{}{}:
+		default:
+		}
+	}()
+	restore := stubLaunchSyncWorker(t, func(
+		_ context.Context, _ config.Config, _ string, onLine func(workerLine),
+	) (workerResult, error) {
+		onLine(workerLine{Progress: &sync.Progress{
+			Phase: sync.PhaseSyncing, SessionsTotal: 4, SessionsDone: 1,
+		}})
+		close(progressSeen)
+		<-release
+		return workerResult{Status: "ok", DiscoveryComplete: true}, nil
+	})
+	defer restore()
+	type passResult struct {
+		ran bool
+		err error
+	}
+	done := make(chan passResult, 1)
+	go func() {
+		_, ran, err := runForegroundWorkerSyncPass(
+			t.Context(), t.Context(), cfg, engine, database, lock,
+			func(workerLine) {},
+		)
+		done <- passResult{ran: ran, err: err}
+	}()
+	select {
+	case <-progressSeen:
+	case <-time.After(time.Second):
+		require.FailNow(t, "worker did not publish progress")
+	}
+
+	current, active := engine.CurrentProgress()
+	require.True(t, active,
+		"daemon health must observe progress from the worker process")
+	assert.Equal(t, sync.PhaseSyncing, current.Phase)
+	assert.Equal(t, 4, current.SessionsTotal)
+	assert.Equal(t, 1, current.SessionsDone)
+	assert.False(t, current.StartedAt.IsZero())
+	assert.False(t, current.UpdatedAt.IsZero())
+
+	release <- struct{}{}
+	result := <-done
+	require.NoError(t, result.err)
+	assert.True(t, result.ran)
+	_, active = engine.CurrentProgress()
+	assert.False(t, active,
+		"completed worker pass must clear daemon-visible progress")
+}
+
+func TestRunWorkerResyncBuildPublishesAndClearsWorkerProgress(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	database, _ := openTestWriteDB(t, cfg)
+	engine := sync.NewEngine(database, sync.EngineConfig{})
+	t.Cleanup(engine.Close)
+	workerStarted := make(chan struct{})
+	emitProgress := make(chan struct{}, 1)
+	progressSeen := make(chan struct{})
+	release := make(chan struct{}, 1)
+	defer func() {
+		select {
+		case emitProgress <- struct{}{}:
+		default:
+		}
+		select {
+		case release <- struct{}{}:
+		default:
+		}
+	}()
+	sentinel := errors.New("resync worker stopped")
+	restore := stubLaunchSyncWorker(t, func(
+		_ context.Context, _ config.Config, mode string, onLine func(workerLine),
+	) (workerResult, error) {
+		assert.Equal(t, "resync-build", mode)
+		close(workerStarted)
+		<-emitProgress
+		onLine(workerLine{Progress: &sync.Progress{
+			Phase: sync.PhaseSyncing, SessionsTotal: 8, SessionsDone: 3,
+		}})
+		close(progressSeen)
+		<-release
+		return workerResult{}, sentinel
+	})
+	defer restore()
+	type buildResult struct {
+		err         error
+		spawnFailed bool
+	}
+	done := make(chan buildResult, 1)
+	go func() {
+		_, err, spawnFailed := runWorkerResyncBuild(
+			t.Context(), t.Context(), cfg, engine, database, nil,
+		)
+		done <- buildResult{err: err, spawnFailed: spawnFailed}
+	}()
+	select {
+	case <-workerStarted:
+	case <-time.After(time.Second):
+		require.FailNow(t, "resync worker did not start")
+	}
+
+	current, active := engine.CurrentProgress()
+	require.True(t, active,
+		"daemon health must observe resync before its first worker update")
+	assert.Equal(t, sync.PhasePreparingResync, current.Phase)
+	assert.False(t, current.StartedAt.IsZero())
+	assert.False(t, current.UpdatedAt.IsZero())
+
+	emitProgress <- struct{}{}
+	select {
+	case <-progressSeen:
+	case <-time.After(time.Second):
+		require.FailNow(t, "resync worker did not publish progress")
+	}
+	current, active = engine.CurrentProgress()
+	require.True(t, active,
+		"daemon health must receive progress from the resync worker")
+	assert.Equal(t, sync.PhaseSyncing, current.Phase)
+	assert.Equal(t, 8, current.SessionsTotal)
+	assert.Equal(t, 3, current.SessionsDone)
+
+	release <- struct{}{}
+	result := <-done
+	require.ErrorIs(t, result.err, sentinel)
+	assert.False(t, result.spawnFailed)
+	_, active = engine.CurrentProgress()
+	assert.False(t, active,
+		"completed resync worker must clear daemon-visible progress")
+}
+
 // TestRunWorkerSyncPassNoWorkerRecordsNothing pins first-attempt semantics for
 // every failure mode in which no worker process ran: a pre-launch writer-close
 // failure, a pre-launch lock-release failure, and a spawn failure. The pass
@@ -511,7 +698,9 @@ func TestRunWorkerSyncPassWorkerFailureStillRecords(t *testing.T) {
 	cfg := testConfigWithClaudeFixture(t)
 	database, lock := openTestWriteDB(t, cfg)
 	reconciled := make(chan error, 1)
+	em := &scopedEmitter{scopes: make(chan string, 1)}
 	engine := sync.NewEngine(database, sync.EngineConfig{
+		Emitter: em,
 		OnStartupReconciled: func(_ sync.SyncStats, err error) {
 			reconciled <- err
 		},
@@ -522,7 +711,7 @@ func TestRunWorkerSyncPassWorkerFailureStillRecords(t *testing.T) {
 	restore := stubLaunchSyncWorker(t, func(
 		context.Context, config.Config, string, func(workerLine),
 	) (workerResult, error) {
-		return workerResult{Status: "failed"}, workerErr
+		return workerResult{Status: "failed", Tombstoned: 1}, workerErr
 	})
 	defer restore()
 
@@ -536,6 +725,13 @@ func TestRunWorkerSyncPassWorkerFailureStillRecords(t *testing.T) {
 		"an incomplete worker pass must surface as aborted stats")
 	assert.Equal(t, stats, engine.LastSyncStats(),
 		"the failed pass must reach last-sync bookkeeping")
+	select {
+	case scope := <-em.scopes:
+		assert.Equal(t, "sync", scope)
+	default:
+		require.FailNow(t,
+			"committed worker tombstones must emit despite a later failure")
+	}
 	select {
 	case cbErr := <-reconciled:
 		assert.ErrorIs(t, cbErr, workerErr,
@@ -965,4 +1161,43 @@ func TestRunWorkerWritePassShutdownStopsPersistentRecovery(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("recovery kept retrying past daemon shutdown")
 	}
+}
+
+// TestRunWorkerResyncBuildDropsTombstonesWhenSwapFailsBeforeInstall pins the
+// daemon-side counterpart of the in-process rule: a worker build's tombstones
+// live only in the staged replacement, so a swap that fails before the rename
+// must not report them.
+func TestRunWorkerResyncBuildDropsTombstonesWhenSwapFailsBeforeInstall(
+	t *testing.T,
+) {
+	cfg := testConfigWithClaudeFixture(t)
+	database, _ := openTestWriteDB(t, cfg)
+	engine := sync.NewEngine(database, sync.EngineConfig{})
+	defer engine.Close()
+
+	restore := stubLaunchSyncWorker(t, func(
+		_ context.Context, _ config.Config, mode string, _ func(workerLine),
+	) (workerResult, error) {
+		assert.Equal(t, "resync-build", mode)
+		// Report a build that tombstoned a row but stage no replacement, so
+		// the daemon's swap fails at the rename with the original intact.
+		return workerResult{
+			Status: "ok", DiscoveryComplete: true, Tombstoned: 1,
+			Stats: &sync.SyncStats{Tombstoned: 1},
+		}, nil
+	})
+	defer restore()
+
+	result, err, spawnFailed := runWorkerResyncBuild(
+		context.Background(), context.Background(), cfg, engine, database, nil,
+	)
+	require.False(t, spawnFailed)
+	require.ErrorContains(t, err, "swap resync database")
+	assert.Zero(t, result.Tombstoned,
+		"a discarded replacement's tombstones must not be reported")
+	require.NotNil(t, result.Stats)
+	assert.Zero(t, result.Stats.Tombstoned,
+		"the worker stats payload must not carry discarded tombstones")
+	assert.NoError(t, writeOneSession(database),
+		"writes must recover without a daemon restart")
 }

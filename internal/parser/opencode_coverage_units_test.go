@@ -42,7 +42,7 @@ func TestOpenCodeWatchPlanKeepsTheContainerOffTheRecursiveBudget(t *testing.T) {
 	assert.Equal(t, root, container.Path)
 	assert.False(t, container.Recursive,
 		"the container unit must never enter the recursive budget")
-	assert.Equal(t, []string{"opencode.db", "opencode.db-wal"}, container.IncludeGlobs)
+	assert.Equal(t, []string{"opencode*.db", "opencode*.db-wal"}, container.IncludeGlobs)
 
 	storage := plan.Roots[1]
 	assert.Equal(t, filepath.Join(root, "storage"), storage.Path)

@@ -2,7 +2,7 @@ package duckdb
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"testing"
 
 	"go.kenn.io/agentsview/internal/config"
@@ -48,7 +48,7 @@ func TestDailyUsageKimiDateAliasPricing(t *testing.T) {
 	// Token mix per message: 1M input + 100k output + 1M cache read.
 	// K2.6 cost: 0.95 + 0.40 + 0.16 = 1.51
 	// K3 cost:   3.00 + 1.50 + 0.30 = 4.80
-	tokenUsage := json.RawMessage(
+	tokenUsage := jsontext.Value(
 		`{"input_tokens":1000000,"output_tokens":100000,` +
 			`"cache_creation_input_tokens":0,"cache_read_input_tokens":1000000}`)
 	kimiMessage := func(sessionID string, ordinal int, model, ts string) db.Message {
@@ -148,7 +148,7 @@ func TestDailyUsageKimiFixedK26AliasPricing(t *testing.T) {
 			Role:      "assistant",
 			Timestamp: "2026-07-20T12:00:00.000Z",
 			Model:     "k2d6-agent",
-			TokenUsage: json.RawMessage(
+			TokenUsage: jsontext.Value(
 				`{"input_tokens":1000000,"output_tokens":0}`),
 		}},
 		DataVersion:     1,
@@ -198,7 +198,7 @@ func TestSessionUsageKimiDateAliasPricing(t *testing.T) {
 		},
 	}), "UpsertModelPricing")
 
-	tokenUsage := json.RawMessage(
+	tokenUsage := jsontext.Value(
 		`{"input_tokens":1000000,"output_tokens":100000,` +
 			`"cache_creation_input_tokens":0,"cache_read_input_tokens":1000000}`)
 	session := syncSession(
@@ -278,7 +278,7 @@ func TestSessionUsageKimiExactCustomAliasPricing(t *testing.T) {
 			Role:      "assistant",
 			Timestamp: "2026-07-20T12:00:00.000Z",
 			Model:     "kimi-for-coding",
-			TokenUsage: json.RawMessage(
+			TokenUsage: jsontext.Value(
 				`{"input_tokens":1000000,"output_tokens":0}`),
 		}},
 		DataVersion:     1,
@@ -310,4 +310,127 @@ func TestSessionUsageKimiExactCustomAliasPricing(t *testing.T) {
 	assert.True(t, usage.Breakdown[0].HasCost)
 	assert.Equal(t, want.Breakdown[0].Cost, usage.Breakdown[0].Cost,
 		"DuckDB breakdown must match SQLite's exact reported-model override")
+}
+
+// TestDailyUsageClaude1hCacheWritePricing replays issue #1452's sample
+// session through the DuckDB mirror: the nested cache_creation TTL split
+// prices 1h writes at the 1h rate, matching Claude Code's total_cost_usd.
+func TestDailyUsageClaude1hCacheWritePricing(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern:           "claude-fable-5",
+		InputPerMTok:           money.MustParseDollars("10.0"),
+		OutputPerMTok:          money.MustParseDollars("50.0"),
+		CacheCreationPerMTok:   money.MustParseDollars("12.50"),
+		CacheCreation1hPerMTok: money.MustParseDollars("20.0"),
+		CacheReadPerMTok:       money.MustParseDollars("1.00"),
+	}}), "UpsertModelPricing")
+
+	session := syncSession(
+		"duck-1h-cache", "alpha", "1h cache writes",
+		"2026-08-13T11:59:00.000Z", 1)
+	session.Agent = "claude"
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
+		Session: session,
+		Messages: []db.Message{
+			{
+				SessionID: "duck-1h-cache", Ordinal: 0,
+				Role: "assistant", Timestamp: "2026-08-13T12:00:05.000Z",
+				Model: "claude-fable-5",
+				TokenUsage: jsontext.Value(
+					`{"input_tokens":2,"output_tokens":62,` +
+						`"cache_creation_input_tokens":8989,` +
+						`"cache_read_input_tokens":15892,` +
+						`"cache_creation":{"ephemeral_1h_input_tokens":8989,` +
+						`"ephemeral_5m_input_tokens":0}}`),
+			},
+			{
+				SessionID: "duck-1h-cache", Ordinal: 1,
+				Role: "assistant", Timestamp: "2026-08-13T12:01:00.000Z",
+				Model: "claude-fable-5",
+				TokenUsage: jsontext.Value(
+					`{"input_tokens":2,"output_tokens":6,` +
+						`"cache_creation_input_tokens":77,` +
+						`"cache_read_input_tokens":24881,` +
+						`"cache_creation":{"ephemeral_1h_input_tokens":77,` +
+						`"ephemeral_5m_input_tokens":0}}`),
+			},
+		},
+		DataVersion:     1,
+		ReplaceMessages: true,
+	}})
+	require.NoError(t, err)
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+	store := NewStoreFromDB(syncer.DB())
+
+	got, err := store.GetDailyUsage(ctx, db.UsageFilter{
+		From:     "2026-08-01",
+		To:       "2026-08-31",
+		Timezone: "UTC",
+	})
+	require.NoError(t, err)
+
+	// 2x10 + 62x50 + 8989x20 + 15892x1 = $0.198792, plus
+	// 2x10 + 6x50 + 77x20 + 24881x1 = $0.026741: $0.225533 total,
+	// matching Claude Code's own total_cost_usd. The 5m-rate misprice
+	// would read $0.157539.
+	require.Len(t, got.Daily, 1)
+	assert.Equal(t, money.Money{Microdollars: 225_533},
+		got.Daily[0].TotalCost)
+
+	usage, err := store.GetSessionUsage(ctx, "duck-1h-cache", false)
+	require.NoError(t, err)
+	assert.Equal(t, money.Money{Microdollars: 225_533}, usage.Cost,
+		"per-session cost")
+}
+
+func TestDuckPositBillingPublicAPIReproduction(t *testing.T) {
+	ctx := context.Background()
+	session := syncSession(
+		"duck-posit-billing", "posit", "Posit billing",
+		"2026-08-01T10:00:00Z", 1)
+	session.Agent = "posit-assistant"
+	local := newLocalDB(t)
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern: "duck-posit-model",
+		InputPerMTok: money.MustParseDollars("1"),
+	}}))
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
+		Session: session,
+		Messages: []db.Message{{
+			SessionID: session.ID, Ordinal: 0, Role: "assistant",
+			Timestamp: "2026-08-01T10:01:00Z", Model: "duck-posit-model",
+			ProviderID: "positai",
+			TokenUsage: jsontext.Value(`{"input_tokens":1000000}`),
+		}},
+		DataVersion: 1, ReplaceMessages: true,
+	}})
+	require.NoError(t, err)
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+	store := NewStoreFromDB(syncer.DB())
+	usage, err := store.GetSessionUsage(ctx, session.ID, true)
+	require.NoError(t, err)
+	require.NotNil(t, usage)
+	assert.Equal(t, money.MustParseDollars("1.1"), usage.Cost)
+	assert.Equal(t, "posit-assistant", usage.Agent)
+
+	daily, err := store.GetDailyUsage(ctx, db.UsageFilter{
+		From: "2026-08-01", To: "2026-08-01", Timezone: "UTC",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, money.MustParseDollars("1.1"), daily.Totals.TotalCost)
+
+	report, err := store.GetActivityReport(ctx,
+		db.AnalyticsFilter{Timezone: "UTC"},
+		duckDayQuery(t, "2026-08-01", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, money.MustParseDollars("1.1"), report.Totals.Cost)
 }

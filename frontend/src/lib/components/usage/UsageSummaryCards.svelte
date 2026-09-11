@@ -209,9 +209,7 @@
           label: () => m.analytics_summary_projects(),
           value: () =>
             String(
-              Object.keys(
-                usage.summary?.sessionCounts.byProject ?? {},
-              ).length,
+              usage.summary?.projectTotals.length ?? 0,
             ),
         },
         {
@@ -232,7 +230,7 @@
         sub: () => vsPrior ?? "",
         featured: true,
       },
-      ...(usage.summary?.totals.copilotAICredits
+      ...(usage.timeSeriesSummary?.totals.copilotAICredits
         ? [
             {
               label: () => m.usage_summary_copilot_ai_credits(),
@@ -273,9 +271,7 @@
         label: () => m.analytics_summary_projects(),
         value: () =>
           String(
-            Object.keys(
-              usage.summary?.sessionCounts.byProject ?? {},
-            ).length,
+            usage.summary?.projectTotals.length ?? 0,
           ),
       },
       {
@@ -338,6 +334,7 @@
   .summary-cards :global(.card) {
     flex: 1;
     min-width: 120px;
+    height: 90px;
     padding: 12px;
     display: flex;
     flex-direction: column;

@@ -59,6 +59,41 @@ test.describe("Session list", () => {
     await expect(sp.sessionItems.first()).toHaveClass(/active/);
   });
 
+  test("plain arrows follow the last session or message interaction", async ({
+    page,
+  }) => {
+    const sessionWithMessages = sp.sessionItems
+      .filter({
+        has: page.locator(".session-count", { hasText: /[1-9]/ }),
+      })
+      .first();
+    const sessionId = await sessionWithMessages.getAttribute("data-session-id");
+    expect(sessionId).toBeTruthy();
+    await page.goto(`/sessions/${encodeURIComponent(sessionId!)}`);
+    const hasMessages = await expect(sp.messageRows.first())
+      .toBeVisible({ timeout: 5_000 })
+      .then(() => true)
+      .catch(() => false);
+    expect(hasMessages || process.env.AGENTSVIEW_E2E_BACKEND === "duckdb").toBe(
+      true,
+    );
+    await expect(sessionWithMessages).toHaveClass(/active/);
+
+    await sessionWithMessages.focus();
+    const activeSessionBefore =
+      await sessionWithMessages.getAttribute("data-session-id");
+    await page.keyboard.press("ArrowDown");
+    await expect(
+      page.locator('.session-item[aria-current="page"]'),
+    ).not.toHaveAttribute("data-session-id", activeSessionBefore!);
+
+    if (!hasMessages) return;
+
+    await sp.messageRows.first().click();
+    await page.keyboard.press("ArrowDown");
+    await expect(sp.messageRows.nth(1)).toHaveClass(/selected/);
+  });
+
   const filterCases = [
     { project: "project-alpha", expectedCount: ALPHA_SESSIONS },
     { project: "project-beta", expectedCount: BETA_SESSIONS },

@@ -5,7 +5,8 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"mime/multipart"
@@ -605,6 +606,36 @@ func TestOpenAPIEndpointDocumentsExistingAPIRoutes(t *testing.T) {
 	assert.Contains(t, spec.Paths["/api/v1/session-stats"], "get")
 }
 
+func TestTypedRoutesRejectDuplicateJSONMembers(t *testing.T) {
+	te := setup(t)
+
+	w := te.post(t, "/api/v1/config/terminal", `{"mode":"auto","mode":"clipboard"}`)
+
+	assertStatus(t, w, http.StatusBadRequest)
+}
+
+func TestOpenAPIEndpointDocumentsTokenUsageAsArbitraryJSON(t *testing.T) {
+	te := setup(t)
+
+	w := te.get(t, "/api/openapi.json")
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var spec struct {
+		Components struct {
+			Schemas map[string]struct {
+				Properties map[string]jsontext.Value `json:"properties"`
+			} `json:"schemas"`
+		} `json:"components"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &spec))
+
+	messageSchema, ok := spec.Components.Schemas["DbMessage"]
+	require.True(t, ok, "spec missing DbMessage schema")
+	tokenUsage, ok := messageSchema.Properties["token_usage"]
+	require.True(t, ok, "DbMessage schema missing token_usage")
+	assert.JSONEq(t, `{}`, string(tokenUsage))
+}
+
 func TestOpenAPIEndpointKeepsUsageSummaryContract(t *testing.T) {
 	te := setup(t)
 
@@ -912,7 +943,7 @@ func TestOpenAPIEndpointDocumentsBatchDeleteSessionIDsAsNonNullableArray(t *test
 			Schemas map[string]struct {
 				Required   []string `json:"required"`
 				Properties map[string]struct {
-					Type json.RawMessage `json:"type"`
+					Type jsontext.Value `json:"type"`
 				} `json:"properties"`
 			} `json:"schemas"`
 		} `json:"components"`
@@ -1170,6 +1201,20 @@ func (te *testEnv) upload(
 	w := httptest.NewRecorder()
 	te.handler.ServeHTTP(w, req)
 	return w
+}
+
+func claudeTranscriptWithMessageCount(count int) string {
+	b := testjsonl.NewSessionBuilder()
+	base := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC)
+	for i := range count {
+		timestamp := base.Add(time.Duration(i) * time.Second).Format(time.RFC3339)
+		if i%2 == 0 {
+			b.AddClaudeUser(timestamp, fmt.Sprintf("question %d", i/2))
+		} else {
+			b.AddClaudeAssistant(timestamp, fmt.Sprintf("answer %d", i/2))
+		}
+	}
+	return b.String()
 }
 
 // decode unmarshals the response body into a typed struct.
@@ -1451,7 +1496,7 @@ func TestListSessions_Empty(t *testing.T) {
 
 	// Verify raw JSON has "sessions":[] not "sessions":null.
 	var raw struct {
-		Sessions json.RawMessage `json:"sessions"`
+		Sessions jsontext.Value `json:"sessions"`
 	}
 	if err := json.Unmarshal(
 		w.Body.Bytes(), &raw,
@@ -1485,6 +1530,35 @@ func TestListSessions_WithData(t *testing.T) {
 		t.Fatalf("expected 3 sessions, got %d",
 			len(resp.Sessions))
 	}
+}
+
+func TestListSessions_IncludesSourcePathOnlyWhenRequested(t *testing.T) {
+	te := setup(t)
+	sourcePath := filepath.Join(t.TempDir(), "session.jsonl")
+	te.seedSession(t, "s1", "my-app", 5, func(s *db.Session) {
+		s.FilePath = &sourcePath
+	})
+
+	decodeSession := func(t *testing.T, path string) map[string]jsontext.Value {
+		t.Helper()
+		w := te.get(t, path)
+		assertStatus(t, w, http.StatusOK)
+		var raw struct {
+			Sessions []map[string]jsontext.Value `json:"sessions"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
+		require.Len(t, raw.Sessions, 1)
+		return raw.Sessions[0]
+	}
+
+	withoutSource := decodeSession(t, "/api/v1/sessions")
+	assert.NotContains(t, withoutSource, "file_path")
+
+	withSource := decodeSession(t, "/api/v1/sessions?include_source=true")
+	require.Contains(t, withSource, "file_path")
+	var gotPath string
+	require.NoError(t, json.Unmarshal(withSource["file_path"], &gotPath))
+	assert.Equal(t, sourcePath, gotPath)
 }
 
 func TestListSessions_ProjectFilter(t *testing.T) {
@@ -1832,6 +1906,19 @@ func TestGetSession_Found(t *testing.T) {
 	if resp.ID != "s1" {
 		t.Fatalf("expected id=s1, got %v", resp.ID)
 	}
+}
+
+func TestGetSession_RoundTripsReservedIDCharacters(t *testing.T) {
+	te := setup(t)
+	const sessionID = "deepseek-harness:child%7E/%25?#"
+	te.seedSession(t, sessionID, "my-app", 2)
+
+	w := te.get(t, "/api/v1/sessions/"+
+		"deepseek-harness%3Achild%257E%2F%2525%3F%23")
+	assertStatus(t, w, http.StatusOK)
+
+	resp := decode[db.Session](t, w)
+	assert.Equal(t, sessionID, resp.ID)
 }
 
 func TestGetSession_NotFound(t *testing.T) {
@@ -3209,6 +3296,83 @@ func TestAuthRequiredProtectsPing(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 }
 
+func TestPingReportsStalledSyncWithoutLosingDaemonIdentity(t *testing.T) {
+	dir := tempDirWithRetryCleanup(t)
+	cfg := config.Config{
+		Host: "127.0.0.1", Port: 0, DataDir: dir,
+		DBPath: filepath.Join(dir, "test.db"), WriteTimeout: 30 * time.Second,
+	}
+	database := dbtest.OpenTestDBAt(t, cfg.DBPath)
+	engine := sync.NewEngine(database, sync.EngineConfig{
+		Machine: "test", ProgressStallAfter: time.Nanosecond,
+	})
+	t.Cleanup(engine.Close)
+	te := &testEnv{
+		srv: server.New(cfg, database, engine), db: database, engine: engine,
+		dataDir: dir,
+	}
+	te.handler = wrapTestHandler(cfg, te.srv.Handler())
+	type pingResponse struct {
+		OK      bool `json:"ok"`
+		Healthy bool `json:"healthy"`
+		Sync    *struct {
+			Phase     sync.Phase `json:"phase"`
+			Stalled   bool       `json:"stalled"`
+			StartedAt string     `json:"started_at"`
+			UpdatedAt string     `json:"updated_at"`
+		} `json:"sync,omitempty"`
+	}
+
+	healthy := decode[pingResponse](t, te.get(t, "/api/ping"))
+	assert.True(t, healthy.OK)
+	assert.True(t, healthy.Healthy)
+	assert.Nil(t, healthy.Sync)
+
+	progressSeen := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce stdlibsync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	done := make(chan struct{})
+	var once stdlibsync.Once
+	go func() {
+		engine.SyncAll(t.Context(), func(sync.Progress) {
+			once.Do(func() { close(progressSeen) })
+			<-release
+		})
+		close(done)
+	}()
+	select {
+	case <-progressSeen:
+	case <-time.After(time.Second):
+		require.FailNow(t, "sync did not publish progress")
+	}
+	require.Eventually(t, func() bool {
+		progress, active := engine.CurrentProgress()
+		return active && progress.Stalled
+	}, time.Second, time.Millisecond,
+		"sync progress did not age into the stalled state")
+
+	stalled := decode[pingResponse](t, te.get(t, "/api/ping"))
+	assert.True(t, stalled.OK,
+		"ping must keep proving the running daemon's identity")
+	assert.False(t, stalled.Healthy)
+	require.NotNil(t, stalled.Sync)
+	assert.Equal(t, sync.PhaseDiscovering, stalled.Sync.Phase)
+	assert.True(t, stalled.Sync.Stalled)
+	assert.NotEmpty(t, stalled.Sync.StartedAt)
+	assert.NotEmpty(t, stalled.Sync.UpdatedAt)
+
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		require.FailNow(t, "sync did not finish after progress callback returned")
+	}
+	finished := decode[pingResponse](t, te.get(t, "/api/ping"))
+	assert.True(t, finished.Healthy)
+	assert.Nil(t, finished.Sync)
+}
+
 func TestGetGithubConfig(t *testing.T) {
 	t.Setenv("AGENTSVIEW_GITHUB_TOKEN", "")
 	t.Setenv("PATH", t.TempDir())
@@ -3500,6 +3664,109 @@ func TestSettingsRejectInvalidChartPaletteWithoutChangingSelection(t *testing.T)
 	}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
 	assert.Equal(t, config.ChartPaletteMatplotlib, got.ChartPalette)
+}
+
+func TestSettingsDisabledProvidersRoundTrip(t *testing.T) {
+	geminiDir := filepath.Join(t.TempDir(), "gemini")
+	te := setup(t, func(cfg *config.Config) {
+		cfg.AgentDirs = map[parser.AgentType][]string{
+			parser.AgentClaude: {"/sessions/claude"},
+			parser.AgentGemini: {geminiDir},
+		}
+	})
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	w := put(`{"disabled_agents":["gemini","claude","gemini"]}`)
+	assertStatus(t, w, http.StatusOK)
+	type sessionProvider struct {
+		ID          parser.AgentType `json:"id"`
+		DisplayName string           `json:"display_name"`
+		Dirs        []string         `json:"dirs"`
+	}
+	var got struct {
+		SessionProviders []sessionProvider  `json:"session_providers"`
+		DisabledAgents   []parser.AgentType `json:"disabled_agents"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.Equal(t,
+		[]parser.AgentType{parser.AgentClaude, parser.AgentGemini},
+		got.DisabledAgents,
+	)
+	require.NotEmpty(t, got.SessionProviders)
+	assert.Equal(t, parser.AgentClaude, got.SessionProviders[0].ID)
+	assert.Equal(t, "Claude Code", got.SessionProviders[0].DisplayName)
+	assert.Equal(t, []string{"/sessions/claude"}, got.SessionProviders[0].Dirs)
+	geminiIndex := slices.IndexFunc(got.SessionProviders,
+		func(provider sessionProvider) bool {
+			return provider.ID == parser.AgentGemini
+		})
+	require.NotEqual(t, -1, geminiIndex)
+	gemini := got.SessionProviders[geminiIndex]
+	assert.Equal(t, "Gemini", gemini.DisplayName)
+	assert.Equal(t, []string{geminiDir}, gemini.Dirs)
+
+	var persisted struct {
+		DisabledAgents []parser.AgentType `toml:"disabled_agents"`
+	}
+	_, err := toml.DecodeFile(filepath.Join(te.dataDir, "config.toml"), &persisted)
+	require.NoError(t, err)
+	assert.Equal(t, got.DisabledAgents, persisted.DisabledAgents)
+}
+
+func TestSettingsDisabledProvidersDefaultToEmptyArray(t *testing.T) {
+	te := setup(t)
+
+	w := te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	var got struct {
+		DisabledAgents jsontext.Value `json:"disabled_agents"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.JSONEq(t, `[]`, string(got.DisabledAgents))
+}
+
+func TestSettingsRejectInvalidDisabledProviderWithoutMutation(t *testing.T) {
+	te := setup(t)
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	assertStatus(t, put(`{"disabled_agents":["gemini"]}`), http.StatusOK)
+	w := put(`{"disabled_agents":["nope"]}`)
+	assertStatus(t, w, http.StatusBadRequest)
+	assertBodyContains(t, w, "unknown session provider")
+
+	w = te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	var got struct {
+		DisabledAgents []parser.AgentType `json:"disabled_agents"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.Equal(t, []parser.AgentType{parser.AgentGemini}, got.DisabledAgents)
+}
+
+func TestSettingsDisabledProvidersRemainLockedInPGMode(t *testing.T) {
+	te := setupPGMode(t)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+		strings.NewReader(`{"disabled_agents":["gemini"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	te.handler.ServeHTTP(w, req)
+
+	assertStatus(t, w, http.StatusNotImplemented)
+	assertBodyContains(t, w, "settings cannot be modified")
 }
 
 func TestSettingsRemainLockedInPGMode(t *testing.T) {
@@ -3917,6 +4184,47 @@ func TestUploadSession_ExcludedOrTrashedConflict(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUploadSession_RejectsShorterReplacementWithoutConsent(t *testing.T) {
+	te := setup(t)
+	const sessionID = "upload-shorter"
+	query := "project=myproj&machine=remote"
+	longTranscript := claudeTranscriptWithMessageCount(96)
+	shortTranscript := claudeTranscriptWithMessageCount(24)
+
+	w := te.upload(t, sessionID+".jsonl", longTranscript, query)
+	assertStatus(t, w, http.StatusOK)
+	destPath := filepath.Join(
+		te.dataDir, "uploads", "myproj", sessionID+".jsonl",
+	)
+	requireSessionMessages := func(want int) {
+		t.Helper()
+		messages, err := te.db.GetAllMessages(t.Context(), sessionID)
+		require.NoError(t, err)
+		require.Len(t, messages, want)
+	}
+	requireArchive := func(want string) {
+		t.Helper()
+		content, err := os.ReadFile(destPath)
+		require.NoError(t, err)
+		require.Equal(t, want, string(content))
+	}
+	requireSessionMessages(96)
+	requireArchive(longTranscript)
+
+	w = te.upload(t, sessionID+".jsonl", shortTranscript, query)
+	assertStatus(t, w, http.StatusConflict)
+	assertErrorResponse(t, w,
+		"session upload rejected: session upload-shorter has 96 messages, upload has 24; retry with allow_shorter=true")
+	requireSessionMessages(96)
+	requireArchive(longTranscript)
+
+	w = te.upload(t, sessionID+".jsonl", shortTranscript,
+		query+"&allow_shorter=true")
+	assertStatus(t, w, http.StatusOK)
+	requireSessionMessages(24)
+	requireArchive(shortTranscript)
 }
 
 func TestUploadSession_MultiSessionConflictDoesNotPartiallyWrite(t *testing.T) {
@@ -5056,7 +5364,7 @@ func TestHandleToolCalls_Basic(t *testing.T) {
 		ToolCalls []service.ToolCall `json:"tool_calls"`
 		Count     int                `json:"count"`
 	}
-	require.NoError(t, json.NewDecoder(w.Body).Decode(&body))
+	require.NoError(t, json.UnmarshalRead(w.Body, &body))
 	require.Equal(t, 2, body.Count)
 	require.Len(t, body.ToolCalls, 2)
 	assert.Equal(t, "Read", body.ToolCalls[0].ToolName)

@@ -18,6 +18,7 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   { name: "kilo-legacy", color: "var(--accent-purple)", label: "Kilo (legacy)" },
   { name: "openhands", color: "var(--accent-teal)", label: "OpenHands" },
   { name: "cursor", color: "var(--accent-black)" },
+  { name: "cursor-ide", color: "var(--accent-black)", label: "Cursor IDE" },
   { name: "amp", color: "var(--accent-coral)", label: "Amp" },
   { name: "zencoder", color: "var(--accent-red)", label: "Zencoder" },
   { name: "zed", color: "var(--accent-green)", label: "Zed" },
@@ -43,6 +44,11 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
     name: "deepseek-tui",
     color: "var(--accent-cyan)",
     label: "DeepSeek TUI",
+  },
+  {
+    name: "deepseek-harness",
+    color: "var(--accent-cyan)",
+    label: "DeepSeek Harness",
   },
   {
     name: "openclaw",
@@ -120,7 +126,7 @@ export function agentColor(agent: string): string {
   return agentColorMap.get(agent) ?? defaultFillColor;
 }
 
-export function accentForeground(color: string): string {
+function accentForeground(color: string): string {
   return accentForegroundMap.get(color) ?? "var(--accent-blue-foreground)";
 }
 

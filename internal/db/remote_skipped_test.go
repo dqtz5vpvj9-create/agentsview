@@ -1,6 +1,7 @@
 package db_test
 
 import (
+	"context"
 	"maps"
 	"testing"
 
@@ -96,6 +97,53 @@ func TestRemoteSkippedFiles(t *testing.T) {
 		require.NoError(t, err, "LoadRemoteSkippedFiles replace-other-2")
 		assert.True(t, maps.Equal(loaded2, host2),
 			"replace-other-2: loaded %v, want %v", loaded2, host2)
+	})
+
+	t.Run("scoped load excludes unrelated rows", func(t *testing.T) {
+		entries := map[string]int64{
+			"/sessions/changed.jsonl":                     10,
+			"/sessions/changed.jsonl?agent=claude":        11,
+			"/sessions/changed.jsonl-other":               12,
+			"/sessions/fallback/one.jsonl":                20,
+			"/sessions/fallback/nested/two.jsonl?agent=x": 21,
+			"/sessions/unrelated.jsonl":                   30,
+		}
+		require.NoError(t,
+			d.ReplaceRemoteSkippedFiles("scoped-host", entries))
+
+		loaded, err := d.LoadRemoteSkippedFilesForScopes(
+			context.Background(), "scoped-host",
+			[]string{"/sessions/changed.jsonl"},
+			[]string{"/sessions/fallback"},
+		)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]int64{
+			"/sessions/changed.jsonl":                     10,
+			"/sessions/changed.jsonl?agent=claude":        11,
+			"/sessions/fallback/one.jsonl":                20,
+			"/sessions/fallback/nested/two.jsonl?agent=x": 21,
+		}, loaded)
+	})
+
+	t.Run("scoped mutation preserves unrelated rows", func(t *testing.T) {
+		require.NoError(t, d.ReplaceRemoteSkippedFiles(
+			"mutate-host", map[string]int64{
+				"/changed.jsonl":   10,
+				"/unchanged.jsonl": 20,
+			},
+		))
+		require.NoError(t, d.ApplyRemoteSkippedFileChanges(
+			"mutate-host", []string{"/changed.jsonl"}, map[string]int64{
+				"/new.jsonl": 30,
+			},
+		))
+
+		loaded, err := d.LoadRemoteSkippedFiles("mutate-host")
+		require.NoError(t, err)
+		assert.Equal(t, map[string]int64{
+			"/unchanged.jsonl": 20,
+			"/new.jsonl":       30,
+		}, loaded)
 	})
 }
 

@@ -974,7 +974,7 @@ type sessionCacheTotals struct {
 // the same way keeps merge semantics stable.
 //
 // dollars_spent prices every eligible Claude message using the
-// model_pricing table. dollars_saved_vs_uncached reprices cache_read
+// effective pricing catalog. dollars_saved_vs_uncached reprices cache_read
 // tokens at the input rate and zeroes cache_creation (the
 // counterfactual where the workload never cached), then subtracts
 // dollars_spent. A missing pricing row zeroes out that model's
@@ -1097,7 +1097,7 @@ func (db *DB) accumulateCacheTotals(
 	// The cross-session fold in computeCacheEconomics already sorts
 	// session IDs; the per-message order completes the determinism
 	// chain so golden tests stay byte-stable.
-	q := `SELECT session_id, model, token_usage
+	q := `SELECT session_id, model, token_usage, COALESCE(timestamp, '')
 		FROM messages
 		WHERE session_id IN ` + ph + `
 			AND token_usage != ''
@@ -1110,14 +1110,14 @@ func (db *DB) accumulateCacheTotals(
 	}
 	defer sqlRows.Close()
 	for sqlRows.Next() {
-		var sessionID, model, tokenJSON string
+		var sessionID, model, tokenJSON, timestamp string
 		if err := sqlRows.Scan(
-			&sessionID, &model, &tokenJSON,
+			&sessionID, &model, &tokenJSON, &timestamp,
 		); err != nil {
 			return fmt.Errorf("scanning cache tokens: %w", err)
 		}
 		if err := addMessageToCacheTotals(
-			perSession, sessionID, model, tokenJSON, pricing,
+			perSession, sessionID, model, tokenJSON, timestamp, pricing,
 		); err != nil {
 			return err
 		}
@@ -1130,11 +1130,12 @@ func (db *DB) accumulateCacheTotals(
 // accumulateCacheTotals so the row loop stays a thin scan+dispatch.
 func addMessageToCacheTotals(
 	perSession map[string]*sessionCacheTotals,
-	sessionID, model, tokenJSON string,
+	sessionID, model, tokenJSON, timestamp string,
 	pricing *export.PricingResolver,
 ) error {
 	inputTok, outputTok, cacheCrTok, cacheRdTok :=
 		clampedUsageTokenCounters(tokenJSON)
+	cacheCr1hTok := clampedCacheCreation1hTokens(tokenJSON)
 
 	totals, ok := perSession[sessionID]
 	if !ok {
@@ -1145,9 +1146,12 @@ func addMessageToCacheTotals(
 	totals.cacheCreateT += int64(cacheCrTok)
 	totals.cacheReadT += int64(cacheRdTok)
 
-	rates := pricing.Lookup(model).Rates
+	_, lookup := pricing.ResolveAt(
+		model, usageLookupModel(model, timestamp), usagePricingTimestamp(timestamp),
+	)
+	rates := lookup.Rates
 	spent, err := rates.CostForTokens(
-		inputTok, outputTok, 0, cacheCrTok, cacheRdTok)
+		inputTok, outputTok, 0, cacheCrTok, cacheCr1hTok, cacheRdTok)
 	if err != nil {
 		return fmt.Errorf("pricing cache usage for model %q: %w", model, err)
 	}
@@ -1162,7 +1166,7 @@ func addMessageToCacheTotals(
 	// (see internal/db/usage.go and the savings calculation in
 	// frontend/src/lib/utils/usageSavings.ts).
 	uncached, err := rates.CostForTokens(
-		inputTok+cacheCrTok+cacheRdTok, outputTok, 0, 0, 0)
+		inputTok+cacheCrTok+cacheRdTok, outputTok, 0, 0, 0, 0)
 	if err != nil {
 		return fmt.Errorf("pricing uncached usage for model %q: %w", model, err)
 	}
@@ -1527,10 +1531,11 @@ func (db *DB) computeOutcomeStats(
 	var cache *git.Cache
 	// Snapshot the writer pool once: CloseWriter can nil it concurrently for a
 	// worker maintenance pass, so a check-then-load would hand git.NewCache a nil
-	// *sql.DB and panic on first use. When the snapshot is nil (writer closed) or
-	// the store is read-only, fall back to the read-only cache: analytics keep
-	// computing from the reader without persisting git stats.
-	if writer := db.rawWriter(); !db.ReadOnly() && writer != nil {
+	// *sql.DB and panic on first use. Compaction reopens the pool before its
+	// rollback window closes, so writerClosed remains the authority even when the
+	// snapshot is non-nil. Fall back to the read-only cache while either barrier
+	// is active so analytics never persists git stats that a rollback can discard.
+	if writer := db.rawWriter(); !db.ReadOnly() && !db.WriterClosed() && writer != nil {
 		cache = git.NewCache(writer)
 	} else {
 		cache = git.NewReadOnlyCache(db.rawReader())

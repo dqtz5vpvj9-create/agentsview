@@ -3,6 +3,8 @@ package server_test
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -10,6 +12,8 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/server"
+	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
 func TestDataProjectsEndpoint(t *testing.T) {
@@ -128,4 +132,77 @@ func TestDataRoutesRegistered(t *testing.T) {
 		assert.Contains(t, w.Header().Get("Content-Type"), "application/json",
 			"path %q must be routed to a JSON handler, not the SPA fallback", path)
 	}
+	w := te.post(t, "/api/v1/data/compact", `{}`)
+	assert.NotEqual(t, http.StatusNotFound, w.Code)
+	assert.Contains(t, w.Header().Get("Content-Type"), "application/json")
+}
+
+func TestDataCompactEndpointUsesDaemonRunner(t *testing.T) {
+	called := false
+	te := setupWithServerOpts(t, []server.Option{
+		server.WithLocalCompactRunner(func(
+			_ context.Context, options db.CompactOptions,
+		) (db.CompactResult, error) {
+			called = true
+			assert.Empty(t, options.StagingDir,
+				"the daemon must not accept a client-controlled staging path")
+			return db.CompactResult{ReclaimedBytes: 42}, nil
+		}),
+	})
+	w := te.post(t, "/api/v1/data/compact", `{}`)
+	assertStatus(t, w, http.StatusOK)
+	assert.True(t, called)
+	var result db.CompactResult
+	decodeInto(t, w, &result)
+	assert.Equal(t, int64(42), result.ReclaimedBytes)
+}
+
+func TestDataCompactEndpointRejectsClientStagingDir(t *testing.T) {
+	te := setupWithServerOpts(t, []server.Option{
+		server.WithLocalCompactRunner(func(
+			context.Context, db.CompactOptions,
+		) (db.CompactResult, error) {
+			t.Fatal("client-controlled staging path must be rejected before execution")
+			return db.CompactResult{}, nil
+		}),
+	})
+	w := te.post(t, "/api/v1/data/compact", `{"staging_dir":"/tmp/attacker"}`)
+	assertStatus(t, w, http.StatusBadRequest)
+}
+
+func TestDataCompactEndpointMapsBusyBarrierToConflict(t *testing.T) {
+	for name, busy := range map[string]error{
+		"sync in progress":    syncpkg.ErrSyncInProgress,
+		"compact in progress": db.ErrCompactInProgress,
+	} {
+		t.Run(name, func(t *testing.T) {
+			te := setupWithServerOpts(t, []server.Option{
+				server.WithLocalCompactRunner(func(
+					context.Context, db.CompactOptions,
+				) (db.CompactResult, error) {
+					return db.CompactResult{}, busy
+				}),
+			})
+			w := te.post(t, "/api/v1/data/compact", `{}`)
+			assertStatus(t, w, http.StatusConflict)
+		})
+	}
+}
+
+func TestDataCompactEndpointRejectsNonLocalhost(t *testing.T) {
+	te := setupWithServerOpts(t, []server.Option{
+		server.WithLocalCompactRunner(func(
+			context.Context, db.CompactOptions,
+		) (db.CompactResult, error) {
+			t.Fatal("non-local request must not invoke the compact runner")
+			return db.CompactResult{}, nil
+		}),
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/data/compact", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://127.0.0.1:0")
+	req.RemoteAddr = "203.0.113.10:4242"
+	w := httptest.NewRecorder()
+	te.srv.Handler().ServeHTTP(w, req)
+	assertStatus(t, w, http.StatusForbidden)
 }

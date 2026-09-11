@@ -2,7 +2,8 @@ package parser
 
 import (
 	"bufio"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -564,7 +565,7 @@ func applyPiUsage(pm *ParsedMessage, usage gjson.Result) {
 		"cache_read_input_tokens":     cacheRead,
 		"cache_creation_input_tokens": cacheCreate,
 	}
-	j, err := json.Marshal(normalized)
+	j, err := json.Marshal(normalized, json.Deterministic(true))
 	if err != nil {
 		return
 	}
@@ -665,7 +666,7 @@ func normalizePiIntent(argsRaw string) string {
 	}
 	// Unmarshal into a map, rename the intent key to "description",
 	// and re-marshal to produce valid JSON with proper escaping.
-	var m map[string]json.RawMessage
+	var m map[string]jsontext.Value
 	if err := json.Unmarshal([]byte(argsRaw), &m); err != nil {
 		return argsRaw
 	}
@@ -678,7 +679,7 @@ func normalizePiIntent(argsRaw string) string {
 	}
 	delete(m, "agent__intent")
 	delete(m, "_i")
-	out, err := json.Marshal(m)
+	out, err := json.Marshal(m, json.Deterministic(true))
 	if err != nil {
 		return argsRaw
 	}

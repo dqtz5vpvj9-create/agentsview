@@ -2,6 +2,7 @@ package parser
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -194,7 +195,7 @@ func TestAntigravityCLIProviderSourceMethods(t *testing.T) {
 
 	plan, err := provider.WatchPlan(context.Background())
 	require.NoError(t, err)
-	require.Len(t, plan.Roots, 4)
+	require.Len(t, plan.Roots, 5)
 	assert.Equal(t, filepath.Join(root, "brain"), plan.Roots[0].Path)
 	assert.True(t, plan.Roots[0].Recursive)
 	assert.Equal(t, filepath.Join(root, "conversations"), plan.Roots[1].Path)
@@ -202,8 +203,11 @@ func TestAntigravityCLIProviderSourceMethods(t *testing.T) {
 	assert.Equal(t, root, plan.Roots[2].Path)
 	assert.False(t, plan.Roots[2].Recursive)
 	assert.Equal(t, []string{"history.jsonl"}, plan.Roots[2].IncludeGlobs)
-	assert.Equal(t, filepath.Join(root, "implicit"), plan.Roots[3].Path)
+	assert.Equal(t, filepath.Join(root, "cache"), plan.Roots[3].Path)
 	assert.False(t, plan.Roots[3].Recursive)
+	assert.Equal(t, []string{"last_conversations.json"}, plan.Roots[3].IncludeGlobs)
+	assert.Equal(t, filepath.Join(root, "implicit"), plan.Roots[4].Path)
+	assert.False(t, plan.Roots[4].Recursive)
 
 	discovered, err := provider.Discover(context.Background())
 	require.NoError(t, err)
@@ -275,6 +279,167 @@ func TestAntigravityCLIProviderSourceMethods(t *testing.T) {
 		filepath.Join(root, "conversations", otherID+".db"),
 		implicitPath,
 	)
+}
+
+func TestAntigravityCLIProviderUsesLastConversationsWorkspace(t *testing.T) {
+	root := t.TempDir()
+	id := "44444444-5555-6666-7777-888888888888"
+	writeAntigravityCLIProviderFixture(t, root, id)
+	cachePath := filepath.Join(root, "cache", "last_conversations.json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(cachePath), 0o755))
+	mustWrite(t, cachePath, []byte(`{"/tmp/cache-proj":"`+id+`"}`))
+
+	provider, ok := NewProvider(AgentAntigravityCLI, ProviderConfig{
+		Roots: []string{root}, Machine: "devbox",
+	})
+	require.True(t, ok)
+	discovered, err := provider.Discover(context.Background())
+	require.NoError(t, err)
+	require.Len(t, discovered, 2)
+	conversation := discovered[0]
+	assert.Equal(t, "/tmp/cache-proj", conversation.ProjectHint)
+	assert.Equal(t, SourceCwdResolved, conversation.CwdResolution.State)
+	assert.Equal(t, "/tmp/cache-proj", conversation.CwdResolution.Path)
+	parsed, err := provider.Parse(context.Background(), ParseRequest{
+		Source: conversation, Machine: "devbox",
+	})
+	require.NoError(t, err)
+	require.Len(t, parsed.Results, 1)
+	assert.Equal(t, "cache_proj", parsed.Results[0].Result.Session.Project)
+	assert.Equal(t, "/tmp/cache-proj", parsed.Results[0].Result.Session.Cwd)
+	before, err := provider.Fingerprint(context.Background(), conversation)
+	require.NoError(t, err)
+
+	mustWrite(t, cachePath, []byte(`{"/tmp/cache-proj-2":"`+id+`"}`))
+	changed, err := provider.SourcesForChangedPath(
+		context.Background(), ChangedPathRequest{
+			Path:      cachePath,
+			EventKind: "write",
+			WatchRoot: filepath.Join(root, "cache"),
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, changed, 2)
+	conversation = changed[0]
+	assert.Equal(t, "/tmp/cache-proj-2", conversation.CwdResolution.Path)
+	after, err := provider.Fingerprint(context.Background(), conversation)
+	require.NoError(t, err)
+	assert.NotEqual(t, before.Hash, after.Hash)
+}
+
+func TestAntigravityCLIProviderMarksRemoteCwd(t *testing.T) {
+	tests := map[string]func(string) ProviderConfig{
+		"path rewriter": func(root string) ProviderConfig {
+			return ProviderConfig{
+				Roots:        []string{root},
+				Machine:      "localbox",
+				PathRewriter: func(path string) string { return "remote:" + path },
+			}
+		},
+		"foreign source machine": func(root string) ProviderConfig {
+			return ProviderConfig{
+				Roots:   []string{root},
+				Machine: "localbox",
+				SourceMachines: map[string]string{
+					root: "archivebox",
+				},
+			}
+		},
+	}
+
+	for name, config := range tests {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			id := "44444444-5555-6666-7777-888888888888"
+			writeAntigravityCLIProviderFixture(t, root, id)
+
+			provider, ok := NewProvider(AgentAntigravityCLI, config(root))
+			require.True(t, ok)
+			source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
+				RawSessionID: id,
+			})
+			require.NoError(t, err)
+			require.True(t, ok)
+			assert.Equal(t, SourceCwdRemote, source.CwdResolution.State)
+			assert.Empty(t, source.CwdResolution.Path)
+			assert.Equal(t, "/tmp/db-proj", source.ProjectHint)
+		})
+	}
+}
+
+func TestAntigravityCLIProviderForeignMachineSkipsLocalProjectDiscovery(t *testing.T) {
+	root := t.TempDir()
+	id := "44444444-5555-6666-7777-888888888888"
+	writeAntigravityCLIProviderFixture(t, root, id)
+
+	workspaceRoot := t.TempDir()
+	localRepo := filepath.Join(workspaceRoot, "conflicting-local-repo")
+	workspace := filepath.Join(localRepo, "recorded-project")
+	mustMkdir(t, filepath.Join(localRepo, ".git"))
+	mustMkdir(t, workspace)
+	cachePath := filepath.Join(root, "cache", "last_conversations.json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(cachePath), 0o755))
+	mustWrite(t, cachePath, []byte(fmt.Sprintf(`{%q:%q}`, workspace, id)))
+
+	provider, ok := NewProvider(AgentAntigravityCLI, ProviderConfig{
+		Roots:   []string{root},
+		Machine: "localbox",
+		SourceMachines: map[string]string{
+			root: "archivebox",
+		},
+	})
+	require.True(t, ok)
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
+		RawSessionID: id,
+	})
+	require.NoError(t, err)
+	require.True(t, ok)
+	parsed, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+	require.NoError(t, err)
+	require.Len(t, parsed.Results, 1)
+	assert.Equal(t, "recorded_project", parsed.Results[0].Result.Session.Project)
+}
+
+func TestAntigravityCLIProviderParseCanSkipRecordedWorkspaceDiscovery(t *testing.T) {
+	root := t.TempDir()
+	id := "44444444-5555-6666-7777-888888888888"
+	writeAntigravityCLIProviderFixture(t, root, id)
+
+	workspaceRoot := t.TempDir()
+	repository := filepath.Join(workspaceRoot, "outer-repository")
+	workspace := filepath.Join(repository, "recorded-project")
+	mustMkdir(t, filepath.Join(repository, ".git"))
+	mustMkdir(t, workspace)
+
+	cachePath := filepath.Join(root, "cache", "last_conversations.json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(cachePath), 0o755))
+	mustWrite(t, cachePath, []byte(fmt.Sprintf(`{%q:%q}`, workspace, id)))
+
+	provider, ok := NewProvider(AgentAntigravityCLI, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: id})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	ctx := WithoutFilesystemProjectDiscovery(t.Context())
+	parsed, err := provider.Parse(ctx, ParseRequest{Source: source})
+	require.NoError(t, err)
+	require.Len(t, parsed.Results, 1)
+	assert.Equal(t, "recorded_project", parsed.Results[0].Result.Session.Project)
+	assert.Equal(t, workspace, parsed.Results[0].Result.Session.Cwd)
+}
+
+func TestAntigravityCLIProviderDiscoverEachReportsHistoryReadError(t *testing.T) {
+	root := t.TempDir()
+	mustMkdir(t, filepath.Join(root, "history.jsonl"))
+
+	provider, ok := NewProvider(AgentAntigravityCLI, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	discoverer, ok := provider.(StreamingDiscoverer)
+	require.True(t, ok)
+
+	err := discoverer.DiscoverEach(t.Context(), func(SourceRef) error { return nil })
+	require.Error(t, err)
 }
 
 func TestAntigravityCLIProviderHistoryRemovalInvalidatesAllSources(t *testing.T) {

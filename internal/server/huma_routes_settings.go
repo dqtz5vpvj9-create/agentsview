@@ -16,16 +16,16 @@ import (
 func (s *Server) registerSettingsRoutes() {
 	group := newRouteGroup(s.api, "/api/v1/settings", "Settings")
 
-	get(s, group, "", "Get settings", s.humaGetSettings)
-	put(s, group, "", "Update settings", s.humaUpdateSettings)
-	get(s, group, "/worktree-mappings", "List worktree mappings", s.humaListWorktreeMappings)
-	post(s, group, "/worktree-mappings", "Create worktree mapping", s.humaCreateWorktreeMapping)
-	put(s, group, "/worktree-mappings/{id}", "Update worktree mapping", s.humaUpdateWorktreeMapping)
-	deleteRoute(s, group, "/worktree-mappings/{id}", "Delete worktree mapping", s.humaDeleteWorktreeMapping)
-	post(s, group, "/worktree-mappings/apply", "Apply worktree mappings", s.humaApplyWorktreeMappings)
-	post(s, group, "/worktree-mappings/preview",
+	s.get(group, "", "Get settings", s.humaGetSettings)
+	s.put(group, "", "Update settings", s.humaUpdateSettings)
+	s.get(group, "/worktree-mappings", "List worktree mappings", s.humaListWorktreeMappings)
+	s.post(group, "/worktree-mappings", "Create worktree mapping", s.humaCreateWorktreeMapping)
+	s.put(group, "/worktree-mappings/{id}", "Update worktree mapping", s.humaUpdateWorktreeMapping)
+	s.deleteRoute(group, "/worktree-mappings/{id}", "Delete worktree mapping", s.humaDeleteWorktreeMapping)
+	s.post(group, "/worktree-mappings/apply", "Apply worktree mappings", s.humaApplyWorktreeMappings)
+	s.post(group, "/worktree-mappings/preview",
 		"Preview worktree project reclassification", s.humaPreviewWorktreeReclassification)
-	post(s, group, "/worktree-mappings/reclassify",
+	s.post(group, "/worktree-mappings/reclassify",
 		"Apply worktree project reclassification", s.humaReclassifyWorktreeProject)
 }
 
@@ -68,15 +68,19 @@ func (s *Server) humaGetSettings(
 ) (*jsonOutput[settingsResponse], error) {
 	s.mu.RLock()
 	dirs := make(map[string][]string)
+	providers := make([]sessionProviderResponse, 0, len(parser.Registry))
 	for _, def := range parser.Registry {
 		if !def.FileBased && def.EnvVar == "" {
 			continue
 		}
-		d := s.cfg.AgentDirs[def.Type]
+		d := s.cfg.ConfiguredDirs(def.Type)
 		if d == nil {
 			d = []string{}
 		}
 		dirs[string(def.Type)] = d
+		providers = append(providers, sessionProviderResponse{
+			ID: def.Type, DisplayName: def.DisplayName, Dirs: d,
+		})
 	}
 	tc := s.cfg.Terminal
 	if tc.Mode == "" {
@@ -84,7 +88,9 @@ func (s *Server) humaGetSettings(
 	}
 	githubToken := s.cfg.GithubToken
 	resp := settingsResponse{
-		AgentDirs: dirs,
+		AgentDirs:        dirs,
+		SessionProviders: providers,
+		DisabledAgents:   append([]parser.AgentType{}, s.cfg.DisabledAgents...),
 		Terminal: terminalResponse{
 			Mode:       tc.Mode,
 			CustomBin:  tc.CustomBin,
@@ -123,6 +129,13 @@ func (s *Server) humaUpdateSettings(
 			return nil, apiError(http.StatusBadRequest, err.Error())
 		}
 		patch["chart_palette"] = palette
+	}
+	if in.Body.DisabledAgents != nil {
+		disabled, err := config.NormalizeDisabledAgents(*in.Body.DisabledAgents)
+		if err != nil {
+			return nil, apiError(http.StatusBadRequest, err.Error())
+		}
+		patch["disabled_agents"] = disabled
 	}
 	if in.Body.AuthToken != nil {
 		patch["auth_token"] = *in.Body.AuthToken

@@ -1,7 +1,8 @@
 package parser
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -172,7 +173,7 @@ func parseKimiSessionWithFallbackModel(
 		pendingThinkingText     []string
 		pendingToolCall         []ParsedToolCall
 		pendingModel            string
-		pendingTokenUsage       json.RawMessage
+		pendingTokenUsage       jsontext.Value
 		pendingContextTokens    int
 		pendingOutputTokens     int
 		pendingHasContextTokens bool
@@ -182,6 +183,7 @@ func parseKimiSessionWithFallbackModel(
 		pendingUsageMessageIndex = -1
 		hasThinking              bool
 		hasToolUse               bool
+		cwd                      string
 
 		// Track token usage from StatusUpdate.
 		totalOutputTokens    int
@@ -310,6 +312,9 @@ func parseKimiSessionWithFallbackModel(
 			case "config.update":
 				if model := root.Get("modelAlias").Str; model != "" {
 					currentModel = model
+				}
+				if value := root.Get("cwd").Str; value != "" {
+					cwd = value
 				}
 
 			case "turn.prompt", "turn.steer":
@@ -695,6 +700,7 @@ func parseKimiSessionWithFallbackModel(
 		Project:                     displayProject,
 		Machine:                     machine,
 		Agent:                       AgentKimi,
+		Cwd:                         cwd,
 		FirstMessage:                firstMessage,
 		StartedAt:                   startTime,
 		EndedAt:                     endTime,
@@ -799,7 +805,7 @@ func kimiJSONResult(value gjson.Result) gjson.Result {
 
 func kimiNativeTokenUsage(
 	usage gjson.Result,
-) (json.RawMessage, int, int, bool, bool) {
+) (jsontext.Value, int, int, bool, bool) {
 	var (
 		inputOther          int
 		output              int
@@ -839,7 +845,7 @@ func kimiNativeTokenUsage(
 		"cache_read_input_tokens":     inputCacheRead,
 		"cache_creation_input_tokens": inputCacheCreate,
 	}
-	raw, err := json.Marshal(normalized)
+	raw, err := json.Marshal(normalized, json.Deterministic(true))
 	if err != nil {
 		return nil, 0, 0, false, false
 	}

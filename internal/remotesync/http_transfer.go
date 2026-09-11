@@ -26,6 +26,24 @@ type downloadedArchive struct {
 	remove     func(string) error
 }
 
+type httpBodyReadError struct{ err error }
+
+func (e *httpBodyReadError) Error() string { return e.err.Error() }
+func (e *httpBodyReadError) Unwrap() error { return e.err }
+
+type httpBodyReader struct {
+	r   io.Reader
+	err error
+}
+
+func (r *httpBodyReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		r.err = &httpBodyReadError{err: err}
+	}
+	return n, err
+}
+
 // downloadedArchiveCleanupError retains a spool whose removal failed so the
 // process-level cleanup registry can retry it before another HTTP sync starts.
 type downloadedArchiveCleanupError struct {
@@ -131,7 +149,10 @@ func (hs HTTPSync) downloadArchive(
 	closeErr := spool.Close()
 	if copyErr != nil {
 		return nil, errors.Join(
-			fmt.Errorf("download archive: %w", copyErr), closeErr,
+			&httpBodyReadError{
+				err: fmt.Errorf("download archive: %w", copyErr),
+			},
+			closeErr,
 		)
 	}
 	if closeErr != nil {
@@ -157,6 +178,26 @@ func (r *contextReader) Read(p []byte) (int, error) {
 func (a *downloadedArchive) extract(
 	ctx context.Context,
 	dst string,
+	report syncpkg.ProgressFunc,
+	label string,
+) (err error) {
+	return a.extractWithSelection(ctx, dst, nil, report, label)
+}
+
+func (a *downloadedArchive) extractSelected(
+	ctx context.Context,
+	dst string,
+	selected map[string]struct{},
+	report syncpkg.ProgressFunc,
+	label string,
+) error {
+	return a.extractWithSelection(ctx, dst, selected, report, label)
+}
+
+func (a *downloadedArchive) extractWithSelection(
+	ctx context.Context,
+	dst string,
+	selected map[string]struct{},
 	report syncpkg.ProgressFunc,
 	label string,
 ) (err error) {
@@ -186,7 +227,7 @@ func (a *downloadedArchive) extract(
 		stream = gz
 	}
 	stream = &contextReader{ctx: ctx, r: stream}
-	if _, err := ExtractTarStream(ctx, stream, dst); err != nil {
+	if _, err := extractTarStream(ctx, stream, dst, selected); err != nil {
 		return fmt.Errorf("extract archive: %w", err)
 	}
 	return nil

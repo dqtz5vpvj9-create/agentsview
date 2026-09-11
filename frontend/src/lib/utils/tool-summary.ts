@@ -1,6 +1,7 @@
 // ABOUTME: Builds a structured one-line summary for a tool call header.
 // ABOUTME: Pure; reads input_json + result_content, conservative on counts.
 import type { ToolCall } from "../api/types.js";
+import { isAbsolutePath, pathDisplayValue } from "./tool-params.js";
 
 const MAX = 100;
 
@@ -48,6 +49,36 @@ function fileArg(p: Params): string | null {
     asString(p.filePath) ??
     asString(p.file)
   );
+}
+
+function isSpecialSummaryTool(name: string, category: string | undefined): boolean {
+  return (
+    isTaskCall(name, category) ||
+    ["TodoWrite", "TaskCreate", "TaskUpdate", "Skill", "skill", "ToolSearch"].includes(name)
+  );
+}
+
+export function summarizeToolCallPath(toolCall: ToolCall): string | null {
+  const p = parseParams(toolCall);
+  if (!p) return null;
+
+  const key = toolCall.category || toolCall.tool_name;
+  const hasPathSummary =
+    key === "Read" ||
+    key === "Edit" ||
+    key === "Write" ||
+    (!isSpecialSummaryTool(toolCall.tool_name, toolCall.category) &&
+      !["Bash", "Grep", "Glob"].includes(key) &&
+      !asString(p.command) &&
+      !asString(p.cmd) &&
+      !asString(p.pattern) &&
+      !asString(p.query));
+  if (!hasPathSummary) return null;
+
+  const path = fileArg(p);
+  return path && isAbsolutePath(path) && pathDisplayValue(path) !== path
+    ? path
+    : null;
 }
 
 function todoSummary(p: Params): string | null {
@@ -128,7 +159,7 @@ export function summarizeToolCall(toolCall: ToolCall): string | null {
       ? countLines(toolCall.result_content)
       : 0;
     const suffix = lines > 0 ? ` (${lines} lines)` : "";
-    return `${file.slice(0, MAX)}${suffix}`;
+    return `${pathDisplayValue(file)}${suffix}`;
   }
   if (key === "Edit") {
     const file = fileArg(p);
@@ -141,14 +172,14 @@ export function summarizeToolCall(toolCall: ToolCall): string | null {
       const removed = countLines(oldS);
       if (added > 0 || removed > 0) suffix = ` (+${added} -${removed})`;
     }
-    return `${file.slice(0, MAX)}${suffix}`;
+    return `${pathDisplayValue(file)}${suffix}`;
   }
   if (key === "Write") {
     const file = fileArg(p);
     if (!file) return null;
     const added = typeof p.content === "string" ? countLines(p.content) : 0;
     const suffix = added > 0 ? ` (+${added})` : "";
-    return `${file.slice(0, MAX)}${suffix}`;
+    return `${pathDisplayValue(file)}${suffix}`;
   }
   if (key === "Grep") {
     const pattern = asString(p.pattern) ?? asString(p.query);
@@ -170,7 +201,7 @@ export function summarizeToolCall(toolCall: ToolCall): string | null {
 
   // Generic structured fallback: any tool exposing a known key arg.
   const file = fileArg(p);
-  if (file) return file.slice(0, MAX);
+  if (file) return pathDisplayValue(file);
   const cmd = asString(p.command) ?? asString(p.cmd);
   if (cmd) return `$ ${firstLine(cmd)}`;
   const pattern = asString(p.pattern);

@@ -30,7 +30,7 @@ func (f zcodeProviderFactory) Definition() AgentDef {
 }
 
 func (f zcodeProviderFactory) Capabilities() Capabilities {
-	return zcodeProviderCapabilities()
+	return withDBBackedRawCapture(zcodeProviderCapabilities())
 }
 
 func (f zcodeProviderFactory) NewProvider(cfg ProviderConfig) Provider {
@@ -38,11 +38,9 @@ func (f zcodeProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg.Roots = normalizeZCodeRoots(cfg.Roots)
 	spec := zcodeProviderSpec()
 	return &dbBackedProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   spec.caps,
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    withDBBackedRawCapture(spec.caps),
+		Config:  cfg,
 		spec:    spec,
 		sources: newDBBackedSourceSet(spec, cfg.Roots),
 	}
@@ -133,30 +131,8 @@ func zcodeDBPath(dir string) string {
 	return path
 }
 
-func zcodeVirtualPathParts(path string) (string, string, bool) {
-	return ParseVirtualSourcePathForBase(path, zcodeDBName)
-}
-
 func ZCodeSQLiteVirtualPath(dbPath, sessionID string) string {
 	return VirtualSourcePath(dbPath, sessionID)
-}
-
-func ZCodeSQLiteSourceMtime(path string) (int64, error) {
-	dbPath, sessionID, ok := zcodeVirtualPathParts(path)
-	if !ok {
-		return 0, fmt.Errorf("not a zcode sqlite virtual path: %s", path)
-	}
-	db, err := openZCodeDB(dbPath)
-	if err != nil {
-		return 0, err
-	}
-	defer db.Close()
-
-	row, err := loadZCodeSessionRow(db, sessionID)
-	if err != nil {
-		return 0, err
-	}
-	return zcodeSessionFileMtime(dbPath, db, row), nil
 }
 
 func forEachZCodeSessionMeta(

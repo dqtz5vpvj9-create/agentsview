@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -113,7 +114,11 @@ func (e *Engine) missingMemberTombstoneAllowed(
 	if e.cwdFilter.empty() {
 		return true, nil
 	}
-	sess, err := e.db.GetSession(ctx, sessionID)
+	store := db.Store(e.db)
+	if e.archiveStore != nil {
+		store = e.archiveStore
+	}
+	sess, err := store.GetSession(ctx, sessionID)
 	if err != nil {
 		return false, fmt.Errorf(
 			"read archived cwd for missing member %s: %w", sessionID, err,
@@ -129,14 +134,16 @@ func (e *Engine) missingMemberTombstoneAllowed(
 // allow-list admits and the number it vetoes. With no filter
 // configured it returns the input untouched.
 func (e *Engine) splitResultsByCwdFilter(
-	results []parser.ParseResult,
+	results []parser.ParseResult, sourceCwd sourceCwdDecision,
 ) ([]parser.ParseResult, int) {
 	if e.cwdFilter.empty() || len(results) == 0 {
 		return results, 0
 	}
 	allowed := make([]parser.ParseResult, 0, len(results))
 	for _, pr := range results {
-		if e.cwdFilter.allows(pr.Session.Cwd) {
+		if e.cwdFilter.allows(sourceCwdForFilter(
+			pr.Session.Cwd, sourceCwd,
+		)) {
 			allowed = append(allowed, pr)
 		}
 	}

@@ -91,6 +91,21 @@ func TestPositronProviderParseSession(t *testing.T) {
 	assert.True(t, msgs[3].HasToolUse, "msgs[3] should have tool use")
 }
 
+func TestPositronProviderParseOversizedJSONL(t *testing.T) {
+	line := `{"kind":0,"v":{"version":3,"sessionId":"positron-jsonl","requests":[{"message":{"text":"Run a subagent"},"response":[{"value":"small response"}]}]}}` + "\n"
+	path := filepath.Join(t.TempDir(), "positron.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(line), 0644))
+
+	p := &positronProvider{}
+	sess, msgs, err := p.parseSession(path, "test-project", "test-machine")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	assert.Equal(t, AgentPositron, sess.Agent)
+	assert.Equal(t, "positron:positron-jsonl", sess.ID)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "small response", msgs[1].Content)
+}
+
 func TestPositronSourceSetDiscoverSessions(t *testing.T) {
 	tmpDir := t.TempDir()
 

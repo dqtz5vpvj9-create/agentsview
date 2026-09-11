@@ -477,7 +477,7 @@ SELECT content FROM `+s.spec.DocsTable+`
 
 type repairFillOptions struct {
 	Split       kitvec.SplitOptions
-	Batch       kitvec.BatchOptions
+	Batch       []kitvec.BatchOption
 	Concurrency int
 }
 
@@ -550,7 +550,7 @@ func fillRepairPage(
 				return
 			}
 			chunks := kitvec.Split(document.Content, o.Split)
-			vectors, err := kitvec.EncodeBatched(pageCtx, enc, chunks, o.Batch)
+			vectors, err := kitvec.EncodeBatched(pageCtx, enc, chunks, o.Batch...)
 			results <- repairEncoded{doc: document, chunks: chunks, vectors: vectors, err: err}
 		})
 	}

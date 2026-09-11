@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -39,7 +39,7 @@ func extractModelStub(t *testing.T) *httptest.Server {
 					"prompt_tokens": 5, "completion_tokens": 2,
 				},
 			}
-			_ = json.NewEncoder(w).Encode(body)
+			_ = json.MarshalWrite(w, body)
 		}))
 	t.Cleanup(server.Close)
 	return server
@@ -190,6 +190,46 @@ func TestSetupExtractReconcileOnlyWhenDisabled(t *testing.T) {
 			"the startup reconcile pass must retract the ineligible entry")
 		cancel()
 		sched.Stop()
+	})
+
+	t.Run("keeps candidate-only entries when configured", func(t *testing.T) {
+		d, err := db.Open(filepath.Join(t.TempDir(), "sessions.db"))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = d.Close() })
+		_, err = d.EnsureExtractGeneration(ctx, db.ExtractGeneration{
+			Fingerprint: "fp-a", Model: "m", Segmenter: "turns-v1",
+		})
+		require.NoError(t, err)
+		require.NoError(t, d.UpsertSession(db.Session{
+			ID: "sess-candidate", Project: "p", Machine: "m", Agent: "claude",
+		}))
+		_, err = d.InsertExtractedRecallEntries(ctx, []db.RecallEntry{{
+			ID: "e-candidate", Type: "fact", ReviewState: "unreviewed_auto",
+			Status: "accepted", Title: "t", Body: "b",
+			SourceSessionID: "sess-candidate", SourceRunID: "fp-a",
+			ProvenanceOK: true,
+		}})
+		require.NoError(t, err)
+		require.NoError(t, d.ReplaceSessionSecretFindings(
+			"sess-candidate", []db.SecretFinding{{
+				SessionID: "sess-candidate", RuleName: "high-entropy-assignment",
+				Confidence: "candidate", LocationKind: "message",
+			}}, 0, "rules-v1"))
+
+		cfg := config.Config{}
+		cfg.Recall.Extract.CandidateFindings =
+			config.RecallCandidateFindingsAllow
+		sched, err := setupRecallExtraction(cfg, d, nil)
+		require.NoError(t, err)
+		require.NotNil(t, sched)
+		started, _, err := sched.mgr.TryPass(ctx, extract.PassOptions{})
+		require.NoError(t, err)
+		require.True(t, started)
+
+		entry, err := d.GetRecallEntry(ctx, "e-candidate")
+		require.NoError(t, err)
+		assert.NotNil(t, entry,
+			"candidate-only session keeps serving when configured allow")
 	})
 }
 

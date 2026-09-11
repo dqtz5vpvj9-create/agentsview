@@ -600,7 +600,7 @@ func TestSyncSingleSessionKeepsRetryStatePerResult(t *testing.T) {
 	)
 	engine := newProcessFixtureEngine(t, root, provider)
 
-	_, err := engine.processAndWriteSessionFile(
+	_, _, err := engine.processAndWriteSessionFile(
 		context.Background(),
 		parser.DiscoveredFile{Path: sourcePath, Agent: parser.AgentCowork},
 		"cowork:current",
@@ -1563,6 +1563,7 @@ func writeProcessProviderDevinFixture(
 			model TEXT,
 			created_at INTEGER,
 			last_activity_at INTEGER,
+			main_chain_id INTEGER,
 			hidden INTEGER NOT NULL DEFAULT 0
 		);
 	`)
@@ -1720,18 +1721,16 @@ func newProcessFixtureProvider(
 	outcome parser.ParseOutcome,
 ) *processFixtureProvider {
 	return &processFixtureProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{
-				Type:        parser.AgentCowork,
-				DisplayName: "Cowork",
-				IDPrefix:    "cowork:",
-				FileBased:   true,
-			},
-			Caps: parser.Capabilities{
-				Source: parser.SourceCapabilities{
-					FindSource:           parser.CapabilitySupported,
-					CompositeFingerprint: parser.CapabilitySupported,
-				},
+		Def: parser.AgentDef{
+			Type:        parser.AgentCowork,
+			DisplayName: "Cowork",
+			IDPrefix:    "cowork:",
+			FileBased:   true,
+		},
+		Caps: parser.Capabilities{
+			Source: parser.SourceCapabilities{
+				FindSource:           parser.CapabilitySupported,
+				CompositeFingerprint: parser.CapabilitySupported,
 			},
 		},
 		source:      source,
@@ -1761,12 +1760,17 @@ type processFixtureProvider struct {
 	parser.ProviderBase
 
 	source        parser.SourceRef
+	discovered    []parser.SourceRef
 	findFound     bool
 	fingerprint   parser.SourceFingerprint
 	outcome       parser.ParseOutcome
 	calls         []string
 	findRequests  []parser.FindSourceRequest
 	parseRequests []parser.ParseRequest
+}
+
+func (p *processFixtureProvider) Discover(context.Context) ([]parser.SourceRef, error) {
+	return append([]parser.SourceRef(nil), p.discovered...), nil
 }
 
 func (p *processFixtureProvider) FindSource(

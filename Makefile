@@ -10,7 +10,7 @@ LDFLAGS := -X main.version=$(VERSION) \
 
 LDFLAGS_RELEASE := $(LDFLAGS) -s -w
 DESKTOP_DIST_DIR := dist/desktop
-GOLANGCI_LINT_VERSION ?= v2.11.4
+GOLANGCI_LINT_VERSION ?= v2.13.1
 # Isolate each checkout from stale sibling-worktree fixes and issue positions.
 GOLANGCI_LINT_CACHE ?= $(CURDIR)/.golangci-cache
 export GOLANGCI_LINT_CACHE
@@ -36,7 +36,7 @@ AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
 	elif [ -x "$(GOPATH_FIRST)/bin/air" ]; then printf "%s" "$(GOPATH_FIRST)/bin/air"; \
 	fi)
 
-.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short test-evalingest bench-backends bench-gate bench-gate-config test-postgres test-postgres-ci test-s3 postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot sqlite-vec-header dev-snapshot help
+.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short test-evalingest bench-backends bench-gate bench-gate-config bench-pg-usage test-postgres test-postgres-ci test-s3 postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot sqlite-vec-header dev-snapshot help
 
 # Ensure go:embed has at least one file (no-op if frontend is built)
 ensure-embed-dir:
@@ -274,13 +274,21 @@ desktop-linux-appimage:
 # Backward-compatible alias (macOS .app)
 desktop-app: desktop-macos-app
 
-# Run tests
+# Keep local package/test-process fan-out bounded. A plain `go test ./...`
+# otherwise defaults to GOMAXPROCS, which can launch a large number of fresh
+# test binaries at once on a developer machine. Override with `GO_TEST_P=`
+# when an operator intentionally wants the Go default.
+GO_TEST_P ?= 4
+GO_TEST_P_FLAG := $(if $(GO_TEST_P),-p $(GO_TEST_P),)
+
+# Run the cacheable unit/integration suite. The external-service lanes below
+# intentionally retain `-count=1` because they require fresh state.
 test: pricing-snapshot ensure-embed-dir
-	go test -tags "fts5" ./... -v -count=1
+	go test $(GO_TEST_P_FLAG) -tags "fts5" ./... -v
 
 # Run fast tests only
 test-short: pricing-snapshot ensure-embed-dir
-	go test -tags "fts5" ./... -short -count=1
+	go test $(GO_TEST_P_FLAG) -tags "fts5" ./... -short
 
 # Run the quarantined eval-ingest endpoint tests under their build tag.
 # Only internal/server contains evalingest-gated code; every other package is
@@ -301,23 +309,40 @@ bench-backends: pricing-snapshot ensure-embed-dir
 
 # Hot-path benchmark gate. Runs every benchmark in the gated packages
 # (sync engine warm/cold/append, message write paths, usage
-# aggregation, secret scanning). This target is the single source of
-# truth for the gate configuration: CI's bench.yml runs it on both
-# the PR head and the merge base, then compares the outputs with
-# `go run ./cmd/benchgate -old old.txt -new new.txt`. Run it before
-# and after touching a sync or DB hot path.
-BENCH_GATE_PACKAGES ?= ./internal/sync ./internal/db ./internal/secrets
+# aggregation, secret scanning, signal analysis). This target is the
+# single source of truth for the gate configuration: CI's bench.yml
+# runs it on both the PR head and the merge base, then compares the
+# outputs with `go run ./cmd/benchgate -old old.txt -new new.txt`.
+# Run it before and after touching a gated hot path.
+BENCH_GATE_PACKAGES ?= ./internal/sync ./internal/db ./internal/secrets \
+	./internal/signals
 # Count must stay >= 5: benchgate's time gate needs at least 5
-# candidate samples for its significance test.
-BENCH_GATE_COUNT ?= 6
+# candidate samples for its significance test. Every -count run
+# rebuilds each benchmark's fixture, so this is also the multiplier
+# on the 100k-row seeds below.
+BENCH_GATE_COUNT ?= 5
 # Fixed iterations, not a duration: some gated benchmarks grow their
 # fixture as they iterate, so baseline and candidate must run the
 # same iteration count to measure identical workloads.
 BENCH_GATE_TIME ?= 20x
+# Benchmarks whose single iteration costs hundreds of milliseconds to
+# seconds (100k-row usage and activity-report fixtures, cold-archive
+# ingest) run in a second pass with fewer iterations. Their per-op
+# ratios are stable at that scale, and at BENCH_GATE_TIME these few
+# benchmarks were most of the gate's wall clock. The regex is matched
+# against top-level benchmark names, so sub-benchmarks follow their
+# parent; the cheap benchmarks keep the full iteration count because
+# their millisecond-scale samples are what needs the averaging.
+BENCH_GATE_HEAVY ?= GetDailyUsage|UsageRollup|SQLiteActivityReport|SyncAllColdArchive|ResyncBulk
+BENCH_GATE_HEAVY_TIME ?= 5x
 bench-gate: pricing-snapshot ensure-embed-dir
 	CGO_ENABLED=1 go test -tags "fts5" -run '^$$' \
-		-bench . -benchmem \
+		-bench . -skip '$(BENCH_GATE_HEAVY)' -benchmem \
 		-count $(BENCH_GATE_COUNT) -benchtime $(BENCH_GATE_TIME) \
+		-timeout 25m $(BENCH_GATE_PACKAGES)
+	CGO_ENABLED=1 go test -tags "fts5" -run '^$$' \
+		-bench '$(BENCH_GATE_HEAVY)' -benchmem \
+		-count $(BENCH_GATE_COUNT) -benchtime $(BENCH_GATE_HEAVY_TIME) \
 		-timeout 25m $(BENCH_GATE_PACKAGES)
 
 # Prints the gate's sample/iteration configuration in shell-evalable
@@ -327,10 +352,18 @@ bench-gate: pricing-snapshot ensure-embed-dir
 # package list intentionally stays per-side).
 bench-gate-config:
 	@echo "BENCH_GATE_COUNT=$(BENCH_GATE_COUNT) BENCH_GATE_TIME=$(BENCH_GATE_TIME)"
+	@echo "BENCH_GATE_HEAVY='$(BENCH_GATE_HEAVY)' BENCH_GATE_HEAVY_TIME=$(BENCH_GATE_HEAVY_TIME)"
 
 # Start test PostgreSQL container
 postgres-up:
 	docker compose -f docker-compose.test.yml up -d --wait
+
+# Run opt-in PostgreSQL usage benchmarks against the pinned PG16 service.
+bench-pg-usage: pricing-snapshot
+	docker compose -f docker-compose.test.yml up -d --wait postgres
+	TEST_PG_URL="postgres://agentsview_test:agentsview_test_password@localhost:5433/agentsview_test?sslmode=disable" \
+	CGO_ENABLED=1 go test -tags "fts5,pgtest" ./internal/postgres \
+		-run '^$$' -bench 'BenchmarkPGUsage(Read|Refresh)' -benchmem -count=5
 
 # Stop test PostgreSQL container
 postgres-down:
@@ -519,6 +552,9 @@ docs-build:
 docs-serve:
 	cd docs && bash assets/hydrate-assets.sh && uv run bash ./zensical-docs.sh serve
 
+docs-preview:
+	python3 -m http.server 8000 --directory docs/site
+
 docs-check:
 	bash scripts/check-docs.sh
 
@@ -596,6 +632,7 @@ help:
 	@echo "  test           - Run all tests"
 	@echo "  test-short     - Run fast tests only"
 	@echo "  bench-backends - Benchmark SQLite, DuckDB, and PostgreSQL stores"
+	@echo "  bench-pg-usage - Run opt-in PostgreSQL usage benchmarks against PG16"
 	@echo "  bench-gate     - Run the hot-path benchmarks CI gates PRs on"
 	@echo "  test-postgres  - Run PostgreSQL integration tests"
 	@echo "  test-s3        - Run S3 discovery integration tests (Docker)"

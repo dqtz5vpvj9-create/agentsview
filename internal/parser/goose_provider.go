@@ -32,7 +32,7 @@ func (f *gooseProviderFactory) Definition() AgentDef {
 }
 
 func (f *gooseProviderFactory) Capabilities() Capabilities {
-	return gooseProviderCapabilities()
+	return withDBBackedRawCapture(gooseProviderCapabilities())
 }
 
 func (f *gooseProviderFactory) NewProvider(cfg ProviderConfig) Provider {
@@ -40,11 +40,9 @@ func (f *gooseProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg.Roots = normalizeGooseRoots(cfg.Roots)
 	spec := gooseProviderSpec()
 	base := &dbBackedProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   spec.caps,
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    withDBBackedRawCapture(spec.caps),
+		Config:  cfg,
 		spec:    spec,
 		sources: newDBBackedSourceSet(spec, cfg.Roots),
 	}

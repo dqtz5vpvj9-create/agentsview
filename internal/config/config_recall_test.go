@@ -43,6 +43,13 @@ func TestRecallExtractConfigValidate(t *testing.T) {
 			mutate: func(c *RecallExtractConfig) { *c = RecallExtractConfig{} },
 		},
 		{
+			name: "disabled rejects unknown candidate_findings",
+			mutate: func(c *RecallExtractConfig) {
+				*c = RecallExtractConfig{CandidateFindings: "maybe"}
+			},
+			wantErr: "candidate_findings must be",
+		},
+		{
 			name:    "enabled missing model",
 			mutate:  func(c *RecallExtractConfig) { c.Model = "" },
 			wantErr: "model is required",
@@ -197,6 +204,25 @@ func TestRecallExtractConfigValidate(t *testing.T) {
 				s.Endpoint = "http://[::1]:30000/v1"
 				c.Servers["local"] = s
 			},
+		},
+		{
+			name: "candidate_findings allow",
+			mutate: func(c *RecallExtractConfig) {
+				c.CandidateFindings = RecallCandidateFindingsAllow
+			},
+		},
+		{
+			name: "candidate_findings block",
+			mutate: func(c *RecallExtractConfig) {
+				c.CandidateFindings = RecallCandidateFindingsBlock
+			},
+		},
+		{
+			name: "candidate_findings unknown value",
+			mutate: func(c *RecallExtractConfig) {
+				c.CandidateFindings = "maybe"
+			},
+			wantErr: "candidate_findings must be",
 		},
 	}
 	for _, tc := range tests {
@@ -446,4 +472,13 @@ func TestRecallExtractConfigTOMLLoadInvalid(t *testing.T) {
 		},
 	})
 	require.Error(t, err, "enabled without servers must fail at load")
+}
+
+func TestRecallExtractConfigAllowCandidateFindings(t *testing.T) {
+	cfg := validRecallExtractConfig()
+	assert.False(t, cfg.AllowCandidateFindings(), "default blocks every recorded finding")
+	cfg.CandidateFindings = RecallCandidateFindingsBlock
+	assert.False(t, cfg.AllowCandidateFindings())
+	cfg.CandidateFindings = RecallCandidateFindingsAllow
+	assert.True(t, cfg.AllowCandidateFindings())
 }

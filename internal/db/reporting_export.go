@@ -184,14 +184,16 @@ func (db *DB) reportingHoursFromSnapshot(
 	for i := range hours {
 		hourStart := date.Add(time.Duration(i) * time.Hour)
 		hourEnd := hourStart.Add(time.Hour)
-		report, aggregateErr := activity.Aggregate(activity.Params{
+		gapCap := time.Duration(query.GapCapSeconds) * time.Second
+		candidates := activity.PairActivityEvents(events, hourStart, hourEnd, gapCap)
+		report, aggregateErr := activity.AggregateCandidates(ctx, activity.Params{
 			RangeStart:    hourStart,
 			RangeEnd:      hourEnd,
 			Loc:           time.UTC,
 			EffectiveEnd:  hourEnd,
 			GapCapSeconds: query.GapCapSeconds,
 			Bucket:        activity.BucketSpec{Unit: activity.BucketMinute, NominalSeconds: 300},
-		}, append([]activity.SessionMeta(nil), sessions...), events, activityUsage)
+		}, append([]activity.SessionMeta(nil), sessions...), candidates, activityUsage)
 		if aggregateErr != nil {
 			return nil, fmt.Errorf(
 				"aggregate reporting hour %s: %w",
@@ -591,11 +593,12 @@ func allocateReportingUsageCosts(
 			continue
 		}
 		key := usageCostAllocationKey{
-			date:    localDate(row.Timestamp, time.UTC),
-			project: row.Project,
-			agent:   row.Agent,
-			machine: row.Machine,
-			model:   row.Model,
+			date:       localDate(row.Timestamp, time.UTC),
+			project:    row.Project,
+			agent:      row.Agent,
+			machine:    row.Machine,
+			model:      row.Model,
+			providerID: row.ProviderID,
 		}
 		selected.indices[key] = append(selected.indices[key], i)
 	}

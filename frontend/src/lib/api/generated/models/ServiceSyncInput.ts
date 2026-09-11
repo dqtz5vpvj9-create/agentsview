@@ -5,5 +5,6 @@
 export type ServiceSyncInput = {
   id?: string;
   path?: string;
+  subagents?: boolean;
 };
 

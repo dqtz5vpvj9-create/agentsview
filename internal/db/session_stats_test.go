@@ -2,7 +2,8 @@ package db
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"os/exec"
@@ -283,7 +284,7 @@ func seedModelMessages(
 		// usageMessageEligibility) requires token_usage != ''. Stamp a
 		// minimal JSON blob so these fixtures qualify; the contents
 		// don't matter to model_mix, which sums output_tokens.
-		m.TokenUsage = json.RawMessage(
+		m.TokenUsage = jsontext.Value(
 			`{"output_tokens":` + itoa(p.tokens) + `}`,
 		)
 		msgs = append(msgs, m)
@@ -1499,10 +1500,11 @@ func seedCacheEconomicsMessage(
 		b.input, b.output, b.cacheCreation, b.cacheRead,
 	)
 	m := asstMsg(sessionID, ordinal, "reply")
+	m.Timestamp = ""
 	m.Model = model
 	m.OutputTokens = b.output
 	m.HasOutputTokens = true
-	m.TokenUsage = json.RawMessage(payload)
+	m.TokenUsage = jsontext.Value(payload)
 	require.NoError(t, d.InsertMessages([]Message{m}),
 		"seedCacheEconomicsMessage %s ord=%d", sessionID, ordinal)
 }
@@ -1629,6 +1631,49 @@ func TestGetSessionStats_CacheEconomics(t *testing.T) {
 	wantSavings := money.MustSub(wantWithoutCache, wantSpent)
 	assert.Equal(t, wantSavings, ce.DollarsSavedVsUncached,
 		"DollarsSavedVsUncached")
+}
+
+func TestGetSessionStats_CacheEconomicsUsesHistoricalRates(t *testing.T) {
+	d := testDB(t)
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
+		ModelPattern:         "gpt-5.6-luna",
+		InputPerMTok:         money.MustParseDollars("9"),
+		OutputPerMTok:        money.MustParseDollars("9"),
+		CacheCreationPerMTok: money.MustParseDollars("9"),
+		CacheReadPerMTok:     money.MustParseDollars("9"),
+	}}), "UpsertModelPricing")
+
+	for i, fixture := range []struct {
+		id        string
+		timestamp string
+	}{
+		{id: "luna-before", timestamp: "2026-07-29T23:59:59Z"},
+		{id: "luna-after", timestamp: "2026-07-30T00:00:00Z"},
+	} {
+		insertSessionFixture(t, d, sessionFixture{
+			id: fixture.id, agent: "claude", userMsgs: 3,
+			startedAt: hoursAgo(2 + i),
+		})
+		seedCacheEconomicsMessage(
+			t, d, fixture.id, 1, "gpt-5.6-luna", cacheTokenBreakdown{
+				input: 50_000, output: 50_000,
+				cacheCreation: 50_000, cacheRead: 50_000,
+			},
+		)
+		_, err := d.getWriter().Exec(
+			`UPDATE messages SET timestamp = ? WHERE session_id = ?`,
+			fixture.timestamp, fixture.id,
+		)
+		require.NoError(t, err, "set historical message timestamp")
+	}
+
+	stats, err := d.GetSessionStats(t.Context(), StatsFilter{Since: "28d"})
+	require.NoError(t, err)
+	require.NotNil(t, stats.CacheEconomics)
+	assert.Equal(t, money.MustParseDollars("0.501"),
+		stats.CacheEconomics.DollarsSpent)
+	assert.Equal(t, money.MustParseDollars("0.039"),
+		stats.CacheEconomics.DollarsSavedVsUncached)
 }
 
 func TestGetSessionStats_CacheEconomicsClampsRawTokenUsage(t *testing.T) {

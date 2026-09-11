@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +12,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/postgres"
+	"go.kenn.io/agentsview/internal/server"
+	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
 func TestParseDaemonPushSSE(t *testing.T) {
@@ -59,6 +63,21 @@ func TestParseDaemonPushSSE(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "missing done event")
 	})
+
+	t.Run("terminal report can exceed ten mebibytes", func(t *testing.T) {
+		type largeReport struct {
+			ProjectMetadata string `json:"project_metadata"`
+		}
+		metadata := strings.Repeat("x", 10*1024*1024+1)
+		reportEvent := "event: report\ndata: {\"project_metadata\":\"" +
+			metadata + "\"}\n\n"
+
+		result, err := parseDaemonPushSSE[largeReport, struct{}](
+			strings.NewReader(reportEvent), nil,
+		)
+		require.NoError(t, err)
+		assert.Equal(t, metadata, result.ProjectMetadata)
+	})
 }
 
 // TestPostDaemonPushConsumesSSE pins the daemon-delegated push end to end
@@ -104,4 +123,68 @@ func TestPostDaemonPushJSONFallback(t *testing.T) {
 	)
 	require.NoError(t, err)
 	assert.Equal(t, 7, result.SessionsPushed)
+}
+
+func TestDaemonPushWatchTransportRetriesWithoutScopeForOlderSchema(t *testing.T) {
+	attempts := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		var body map[string]jsontext.Value
+		require.NoError(t, json.UnmarshalRead(r.Body, &body))
+		if attempts == 1 {
+			assert.Contains(t, body, "watch_batch")
+			assert.Contains(t, body, "watch_recovery")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(
+				`{"errors":[{"location":"body.watch_batch","message":"unexpected property"}]}`,
+			))
+			return
+		}
+		assert.NotContains(t, body, "watch_batch")
+		assert.NotContains(t, body, "watch_recovery")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"SessionsPushed":1}`))
+	}))
+	t.Cleanup(ts.Close)
+
+	batch := syncpkg.WatchBatch{Paths: []string{"/sessions/changed.jsonl"}}
+	recovery := syncpkg.WatchRecoveryScope{
+		AvailableRoots: []string{"/sessions"},
+		DeferredRoots:  []string{"/offline"},
+	}
+	result, err := postDaemonPush[postgres.PushResult, postgres.PushProgress](
+		t.Context(), transport{URL: ts.URL}, "", "/api/v1/push/pg",
+		daemonPushRequest{WatchBatch: &batch, WatchRecovery: &recovery}, nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.SessionsPushed)
+	assert.Equal(t, 2, attempts)
+}
+
+func TestDaemonPushWatchTransportOmitsScopeForKnownOlderDaemon(t *testing.T) {
+	attempts := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		var body map[string]jsontext.Value
+		require.NoError(t, json.UnmarshalRead(r.Body, &body))
+		assert.NotContains(t, body, "watch_batch")
+		assert.NotContains(t, body, "watch_recovery")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"SessionsPushed":1}`))
+	}))
+	t.Cleanup(ts.Close)
+
+	batch := syncpkg.WatchBatch{Paths: []string{"/sessions/changed.jsonl"}}
+	result, err := postDaemonPush[postgres.PushResult, postgres.PushProgress](
+		t.Context(), transport{
+			URL: ts.URL,
+			Runtime: &DaemonRuntime{
+				API: server.ScopedWatchPushAPIVersion - 1,
+			},
+		}, "", "/api/v1/push/pg",
+		daemonPushRequest{WatchBatch: &batch}, nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.SessionsPushed)
+	assert.Equal(t, 1, attempts)
 }

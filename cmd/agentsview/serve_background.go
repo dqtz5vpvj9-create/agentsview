@@ -996,25 +996,33 @@ func waitForBackgroundServeReadyWithPolicy(
 	policy backgroundServeReadyWaitPolicy,
 ) (*DaemonRuntime, error) {
 	startedAt := time.Now()
+	var timer *time.Timer
 	var timeoutC <-chan time.Time
 	if !policy.Attached {
-		timer := time.NewTimer(timeout)
+		timer = time.NewTimer(timeout)
 		defer timer.Stop()
 		timeoutC = timer.C
 	}
 	ticker := time.NewTicker(startProbeTick())
 	defer ticker.Stop()
+	var lastStartupUpdate time.Time
 
 	for {
-		if rt := FindDaemonRuntime(dataDir, authToken); rt != nil &&
-			!rt.ReadOnly {
+		if rt := FindWritableDaemonRuntime(dataDir, authToken); rt != nil {
 			return rt, nil
 		}
-		if policy.Observe != nil {
-			var snapshot *startupState
+		var snapshot *startupState
+		if policy.Observe != nil || timer != nil {
 			if IsDaemonStarting(dataDir) {
 				snapshot = readStartupState(dataDir)
 			}
+		}
+		if timer != nil && snapshot != nil &&
+			snapshot.UpdatedAt.After(lastStartupUpdate) {
+			lastStartupUpdate = snapshot.UpdatedAt
+			resetTimer(timer, timeout)
+		}
+		if policy.Observe != nil {
 			policy.Observe(snapshot, startupSnapshotElapsed(snapshot, startedAt, time.Now()))
 		}
 
@@ -1028,6 +1036,18 @@ func waitForBackgroundServeReadyWithPolicy(
 			return nil, ctx.Err()
 		case <-ticker.C:
 		case <-timeoutC:
+			if rt := FindWritableDaemonRuntime(dataDir, authToken); rt != nil {
+				return rt, nil
+			}
+			var latest *startupState
+			if IsDaemonStarting(dataDir) {
+				latest = readStartupState(dataDir)
+			}
+			if latest != nil && latest.UpdatedAt.After(lastStartupUpdate) {
+				lastStartupUpdate = latest.UpdatedAt
+				resetTimer(timer, timeout)
+				continue
+			}
 			return nil, nil
 		}
 	}

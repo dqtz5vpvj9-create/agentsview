@@ -18,6 +18,95 @@ import (
 	"go.kenn.io/agentsview/internal/money"
 )
 
+func TestPushPreservesLegacyOffsetTimestamps(t *testing.T) {
+	pgURL := testPGURL(t)
+	const schema = "agentsview_push_legacy_time_test"
+	cleanNamedPGSchema(t, pgURL, schema)
+	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+
+	ctx := t.Context()
+	pg, err := Open(pgURL, schema, true)
+	require.NoError(t, err)
+	defer pg.Close()
+	require.NoError(t, EnsureSchema(ctx, pg, schema))
+
+	local, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err)
+	defer local.Close()
+
+	const sessionID = "legacy-offset-time"
+	started := "2026-03-09 22:48:29.937+00"
+	ended := "2026-03-14 00:32:16.577+00"
+	created := "2026-04-14 04:09:28.922+00"
+	require.NoError(t, local.UpsertSession(db.Session{
+		ID: sessionID, Project: "project", Machine: "machine", Agent: "claude",
+		StartedAt: &started, EndedAt: &ended, MessageCount: 1,
+		UserMessageCount: 1,
+	}))
+	require.NoError(t, local.InsertMessages([]db.Message{{
+		SessionID: sessionID, Ordinal: 0, Role: "user", Content: "message",
+		ContentLength: len("message"), Timestamp: started,
+	}}))
+	raw, err := sql.Open("sqlite3", local.Path())
+	require.NoError(t, err)
+	_, err = raw.ExecContext(ctx,
+		`UPDATE sessions SET created_at = ? WHERE id = ?`, created, sessionID)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+
+	syncer := &Sync{
+		pg: pg, local: local, machine: "machine", schema: schema, schemaDone: true,
+	}
+	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, err)
+
+	var gotCreated, gotStarted, gotEnded, gotMessage time.Time
+	require.NoError(t, pg.QueryRowContext(ctx, `
+		SELECT created_at, started_at, ended_at
+		FROM sessions WHERE id = $1`, sessionID,
+	).Scan(&gotCreated, &gotStarted, &gotEnded))
+	require.NoError(t, pg.QueryRowContext(ctx, `
+		SELECT timestamp FROM messages
+		WHERE session_id = $1 AND ordinal = 0`, sessionID,
+	).Scan(&gotMessage))
+
+	assert.Equal(t, "2026-04-14T04:09:28.922Z", FormatISO8601(gotCreated))
+	assert.Equal(t, "2026-03-09T22:48:29.937Z", FormatISO8601(gotStarted))
+	assert.Equal(t, "2026-03-14T00:32:16.577Z", FormatISO8601(gotEnded))
+	assert.Equal(t, "2026-03-09T22:48:29.937Z", FormatISO8601(gotMessage))
+
+	_, err = pg.ExecContext(ctx, `
+		UPDATE sessions
+		SET created_at = '0001-01-01T00:00:00Z',
+			started_at = NULL,
+			ended_at = NULL
+		WHERE id = $1`, sessionID)
+	require.NoError(t, err)
+	_, err = pg.ExecContext(ctx,
+		`UPDATE messages SET timestamp = NULL WHERE session_id = $1`, sessionID)
+	require.NoError(t, err)
+	require.NoError(t, local.SetSyncState(timestampNormalizationBackfillStateKey, ""))
+
+	result, err := syncer.Push(ctx, false, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.SessionsPushed)
+	require.NoError(t, pg.QueryRowContext(ctx, `
+		SELECT created_at, started_at, ended_at
+		FROM sessions WHERE id = $1`, sessionID,
+	).Scan(&gotCreated, &gotStarted, &gotEnded))
+	require.NoError(t, pg.QueryRowContext(ctx, `
+		SELECT timestamp FROM messages
+		WHERE session_id = $1 AND ordinal = 0`, sessionID,
+	).Scan(&gotMessage))
+	assert.Equal(t, "2026-04-14T04:09:28.922Z", FormatISO8601(gotCreated))
+	assert.Equal(t, "2026-03-09T22:48:29.937Z", FormatISO8601(gotStarted))
+	assert.Equal(t, "2026-03-14T00:32:16.577Z", FormatISO8601(gotEnded))
+	assert.Equal(t, "2026-03-09T22:48:29.937Z", FormatISO8601(gotMessage))
+	marker, err := local.GetSyncState(timestampNormalizationBackfillStateKey)
+	require.NoError(t, err)
+	assert.Equal(t, "1", marker)
+}
+
 func TestPGUsageEventFingerprintsPreserveExactMicrodollars(t *testing.T) {
 	pgURL := testPGURL(t)
 	const schema = "agentsview_usage_fingerprint_money_test"
@@ -113,6 +202,13 @@ func TestPushMirrorsSessionProjectIdentitySnapshotsByArchiveGeneration(
 		pg: pg, local: local, machine: "laptop", schema: schema, schemaDone: true,
 	}
 	require.NoError(t, syncer.syncProjectIdentityObservations(ctx, false, nil))
+	var identityGeneration int64
+	require.NoError(t, pg.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM sync_metadata
+		WHERE key = 'activity_report_project_identity_generation'
+	`).Scan(&identityGeneration))
+	assert.Equal(t, int64(1), identityGeneration,
+		"identity publication must advance the target report generation")
 
 	var gotArchive, gotGeneration, gotSession, gotRemote string
 	var gotRelationship export.WorktreeRelationship
@@ -1254,7 +1350,7 @@ func TestPushPreservesPGServeLocalCurationFields(t *testing.T) {
 		"source-owned fields should still update")
 }
 
-func TestPushPreservesRecoverableWatcherTombstonesAcrossPG(t *testing.T) {
+func TestPushKeepsSourceAvailabilityLocalAndPreservesPGUserTrash(t *testing.T) {
 	pgURL := testPGURL(t)
 	const schema = "agentsview_push_source_missing_test"
 	pg, err := Open(pgURL, schema, true)
@@ -1305,7 +1401,7 @@ func TestPushPreservesRecoverableWatcherTombstonesAcrossPG(t *testing.T) {
 		t.Context(), "test-machine", sources,
 	))
 	for id, path := range paths {
-		changed, tombstoneErr := local.SoftDeleteSessionSourceOwnership(
+		changed, tombstoneErr := local.MarkSessionSourceMissing(
 			t.Context(), "test-machine", "claude", id, path,
 		)
 		require.NoError(t, tombstoneErr)
@@ -1317,16 +1413,15 @@ func TestPushPreservesRecoverableWatcherTombstonesAcrossPG(t *testing.T) {
 	for _, id := range []string{"source-revive", "source-protected"} {
 		active, getErr := store.GetSession(t.Context(), id)
 		require.NoError(t, getErr)
-		assert.Nil(t, active, "%s must remain hidden while its source is missing", id)
+		require.NotNil(t, active, "%s must remain browsable", id)
 		var deleted bool
 		var cause sql.NullString
 		require.NoError(t, pg.QueryRow(`
 			SELECT deleted_at IS NOT NULL, deletion_cause
 			FROM sessions WHERE id = $1`, id,
 		).Scan(&deleted, &cause))
-		assert.True(t, deleted)
-		require.True(t, cause.Valid)
-		assert.Equal(t, "source_missing", cause.String)
+		assert.False(t, deleted)
+		assert.False(t, cause.Valid)
 	}
 	trashed, err := store.ListTrashedSessions(t.Context())
 	require.NoError(t, err)
@@ -1338,10 +1433,10 @@ func TestPushPreservesRecoverableWatcherTombstonesAcrossPG(t *testing.T) {
 
 	restored, err := store.RestoreSession("source-protected")
 	require.NoError(t, err)
-	assert.Zero(t, restored, "PG restore must refuse watcher tombstones")
+	assert.Zero(t, restored, "a visible session is not in user trash")
 	deleted, err := store.DeleteSessionIfTrashed("source-protected")
 	require.NoError(t, err)
-	assert.Zero(t, deleted, "PG permanent delete must refuse watcher tombstones")
+	assert.Zero(t, deleted, "a visible session cannot be emptied from trash")
 	deleted, err = store.DeleteSessionIfTrashed("user-delete")
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, deleted, "ordinary PG user trash remains deletable")
@@ -1379,7 +1474,7 @@ func TestPushPreservesRecoverableWatcherTombstonesAcrossPG(t *testing.T) {
 	protected, err := store.GetSessionFull(t.Context(), "source-protected")
 	require.NoError(t, err)
 	assert.NotNil(t, protected,
-		"EmptyTrash must not purge a still-missing recoverable source")
+		"EmptyTrash must not purge a visible session with a missing local source")
 }
 
 func TestPushPreservesPGServePermanentDeletes(t *testing.T) {

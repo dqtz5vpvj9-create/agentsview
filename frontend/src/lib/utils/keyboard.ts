@@ -3,6 +3,7 @@ import { sessions } from "../stores/sessions.svelte.js";
 import { starred } from "../stores/starred.svelte.js";
 import { sync } from "../stores/sync.svelte.js";
 import { router } from "../stores/router.svelte.js";
+import { ignoreShortcut } from "../search/find-input.js";
 import { inSessionSearch } from "../stores/inSessionSearch.svelte.js";
 import { messages } from "../stores/messages.svelte.js";
 import { getExportUrl } from "../api/client.js";
@@ -11,6 +12,18 @@ import { configureGeneratedClient } from "../api/runtime.js";
 import { supportsResume, buildResumeCommand, formatResumeResponseCommand } from "./resume.js";
 import { copyToClipboard } from "./clipboard.js";
 import { toggleSidebarWithFocus } from "./sidebar-toggle.js";
+import {
+  getSessionListElement,
+  navigateRegisteredSessionList,
+  resolveArrowTarget,
+  type ArrowInteractionTarget,
+} from "./arrow-target.js";
+
+function starredSessionFilter(): ((s: { id: string }) => boolean) | undefined {
+  return starred.filterOnly
+    ? (s: { id: string }) => starred.isStarred(s.id)
+    : undefined;
+}
 
 function isInputFocused(): boolean {
   const el = document.activeElement;
@@ -26,7 +39,7 @@ function isInputFocused(): boolean {
 
 function isFindInput(): boolean {
   const el = document.activeElement;
-  return el instanceof HTMLInputElement && el.getAttribute("aria-label") === "Search query";
+  return el instanceof HTMLInputElement && el.closest(".kit-find-bar") !== null;
 }
 
 interface ShortcutOptions {
@@ -35,12 +48,12 @@ interface ShortcutOptions {
 }
 
 function handleEscape(): void {
-  if (inSessionSearch.isOpen) {
-    inSessionSearch.close();
-    return;
-  }
   if (ui.activeModal !== null) {
     ui.activeModal = null;
+    return;
+  }
+  if (inSessionSearch.isOpen) {
+    inSessionSearch.close();
     return;
   }
   if (sessions.activeSessionId && !isInputFocused()) {
@@ -57,7 +70,24 @@ function activeResumeModel(sessionId: string): string {
  * Returns a cleanup function to remove the listener.
  */
 export function registerShortcuts(opts: ShortcutOptions): () => void {
+  let lastArrowInteraction: ArrowInteractionTarget | null = null;
+
+  function rememberArrowInteraction(e: PointerEvent | FocusEvent) {
+    if (!(e.target instanceof Element)) return;
+    const sessionList = getSessionListElement();
+    const sessionSidebar = sessionList?.closest("#session-sidebar");
+    if (
+      sessionList?.contains(e.target) ||
+      sessionSidebar?.contains(e.target)
+    ) {
+      lastArrowInteraction = "sessionList";
+    } else if (e.target.closest(".message-list-scroll")) {
+      lastArrowInteraction = "message";
+    }
+  }
+
   function handler(e: KeyboardEvent) {
+    if (ignoreShortcut(e)) return;
     const meta = e.metaKey || e.ctrlKey;
 
     // Cmd+K — always works
@@ -73,7 +103,7 @@ export function registerShortcuts(opts: ShortcutOptions): () => void {
     // typeahead) where native find should work normally.
     if (
       meta &&
-      e.key === "f" &&
+      e.key.toLowerCase() === "f" &&
       router.route === "sessions" &&
       sessions.activeSessionId &&
       ui.activeModal === null &&
@@ -84,13 +114,14 @@ export function registerShortcuts(opts: ShortcutOptions): () => void {
       return;
     }
 
-    // Cmd+G / Cmd+Shift+G — next/prev match while find is
+    // Cmd+G / Cmd+Shift+G and F3 / Shift+F3 — next/prev while find is
     // open on the session view. Skip when a modal is open or
     // an unrelated input has focus.
     if (
-      meta &&
-      e.key === "g" &&
+      ((meta && e.key.toLowerCase() === "g") ||
+        (!meta && !e.altKey && e.key === "F3")) &&
       router.route === "sessions" &&
+      sessions.activeSessionId &&
       inSessionSearch.isOpen &&
       ui.activeModal === null &&
       (!isInputFocused() || isFindInput())
@@ -144,20 +175,36 @@ export function registerShortcuts(opts: ShortcutOptions): () => void {
 
     const keyActions: Record<string, () => void> = {
       j: () => opts.navigateMessage(1),
-      ArrowDown: () => opts.navigateMessage(1),
+      ArrowDown: () => {
+        const target = resolveArrowTarget(
+          document.activeElement,
+          getSessionListElement(),
+          lastArrowInteraction,
+        );
+        if (target === "sessionList") {
+          navigateRegisteredSessionList(1);
+        } else if (target === "message") {
+          opts.navigateMessage(1);
+        }
+      },
       k: () => opts.navigateMessage(-1),
-      ArrowUp: () => opts.navigateMessage(-1),
+      ArrowUp: () => {
+        const target = resolveArrowTarget(
+          document.activeElement,
+          getSessionListElement(),
+          lastArrowInteraction,
+        );
+        if (target === "sessionList") {
+          navigateRegisteredSessionList(-1);
+        } else if (target === "message") {
+          opts.navigateMessage(-1);
+        }
+      },
       "]": () => {
-        const filter = starred.filterOnly
-          ? (s: { id: string }) => starred.isStarred(s.id)
-          : undefined;
-        sessions.navigateSession(1, filter);
+        sessions.navigateSession(1, starredSessionFilter());
       },
       "[": () => {
-        const filter = starred.filterOnly
-          ? (s: { id: string }) => starred.isStarred(s.id)
-          : undefined;
-        sessions.navigateSession(-1, filter);
+        sessions.navigateSession(-1, starredSessionFilter());
       },
       o: () => ui.toggleSort(),
       l: () => ui.cycleLayout(),
@@ -245,6 +292,12 @@ export function registerShortcuts(opts: ShortcutOptions): () => void {
     }
   }
 
+  document.addEventListener("pointerdown", rememberArrowInteraction, true);
+  document.addEventListener("focusin", rememberArrowInteraction, true);
   document.addEventListener("keydown", handler);
-  return () => document.removeEventListener("keydown", handler);
+  return () => {
+    document.removeEventListener("pointerdown", rememberArrowInteraction, true);
+    document.removeEventListener("focusin", rememberArrowInteraction, true);
+    document.removeEventListener("keydown", handler);
+  };
 }

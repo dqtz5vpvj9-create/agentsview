@@ -1,19 +1,31 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
 // newTestLoop wires a pushLoop with caller-controlled timers.
 func newTestLoop(push func(context.Context, pushReason) error) (
 	*pushLoop, chan time.Time, chan time.Time,
 ) {
+	return newBatchTestLoop(func(ctx context.Context, reason pushReason, _ *syncpkg.WatchBatch) error {
+		return push(ctx, reason)
+	})
+}
+
+func newBatchTestLoop(
+	push func(context.Context, pushReason, *syncpkg.WatchBatch) error,
+) (*pushLoop, chan time.Time, chan time.Time) {
 	fire := make(chan time.Time, 1)
 	floor := make(chan time.Time, 1)
 	l := &pushLoop{
@@ -24,6 +36,249 @@ func newTestLoop(push func(context.Context, pushReason) error) (
 		push:     push,
 	}
 	return l, fire, floor
+}
+
+func receivePushLoopValue[T any](t *testing.T, values <-chan T) T {
+	t.Helper()
+	select {
+	case value := <-values:
+		return value
+	case <-time.After(time.Second):
+		require.FailNow(t, "timed out waiting for push loop value")
+		var zero T
+		return zero
+	}
+}
+
+func TestPushLoopBatchCoalescesUnion(t *testing.T) {
+	pushed := make(chan *syncpkg.WatchBatch, 1)
+	loop, fire, _ := newBatchTestLoop(func(
+		_ context.Context, _ pushReason, batch *syncpkg.WatchBatch,
+	) error {
+		pushed <- batch
+		return nil
+	})
+	go loop.Run(t.Context())
+
+	loop.NotifyBatch(syncpkg.WatchBatch{Paths: []string{"/sessions/b", "/sessions/a"}})
+	loop.NotifyBatch(syncpkg.WatchBatch{Paths: []string{"/sessions/a", "/sessions/c"}})
+	fire <- time.Now()
+
+	batch := receivePushLoopValue(t, pushed)
+	require.NotNil(t, batch)
+	assert.Equal(t, []string{"/sessions/a", "/sessions/b", "/sessions/c"}, batch.Paths)
+}
+
+func TestPushLoopUnscopedDirtySupersedesPendingBatch(t *testing.T) {
+	pushed := make(chan *syncpkg.WatchBatch, 1)
+	loop, fire, _ := newBatchTestLoop(func(
+		_ context.Context, _ pushReason, batch *syncpkg.WatchBatch,
+	) error {
+		pushed <- batch
+		return nil
+	})
+	go loop.Run(t.Context())
+
+	loop.NotifyBatch(syncpkg.WatchBatch{Paths: []string{"/sessions/changed"}})
+	loop.NotifyDirty()
+	fire <- time.Now()
+
+	assert.Nil(t, receivePushLoopValue(t, pushed))
+}
+
+func TestPushLoopIntervalTaskSupersedesPendingBatchAndLeavesLaterBatchQueued(t *testing.T) {
+	type attempt struct {
+		reason pushReason
+		batch  *syncpkg.WatchBatch
+	}
+	attempts := make(chan attempt, 2)
+	intervalStarted := make(chan struct{})
+	releaseInterval := make(chan struct{})
+	loop, fire, floor := newBatchTestLoop(func(
+		_ context.Context, reason pushReason, batch *syncpkg.WatchBatch,
+	) error {
+		attempts <- attempt{reason: reason, batch: batch}
+		if reason == reasonInterval {
+			close(intervalStarted)
+			<-releaseInterval
+		}
+		return nil
+	})
+	go loop.Run(t.Context())
+
+	covered := loop.NotifyBatchWithAck(syncpkg.WatchBatch{
+		Paths: []string{"/sessions/before-interval"},
+	})
+	floor <- time.Now()
+
+	interval := receivePushLoopValue(t, attempts)
+	assert.Equal(t, reasonInterval, interval.reason)
+	assert.Nil(t, interval.batch)
+	<-intervalStarted
+
+	later := loop.NotifyBatchWithAck(syncpkg.WatchBatch{
+		Paths: []string{"/sessions/after-interval"},
+	})
+	close(releaseInterval)
+	require.NoError(t, receivePushLoopValue(t, covered))
+
+	fire <- time.Now()
+	change := receivePushLoopValue(t, attempts)
+	assert.Equal(t, reasonChange, change.reason)
+	require.NotNil(t, change.batch)
+	assert.Equal(t, []string{"/sessions/after-interval"}, change.batch.Paths)
+	require.NoError(t, receivePushLoopValue(t, later))
+}
+
+func TestPushLoopFailedIntervalTaskRetriesUnscopedBeforeLaterBatch(t *testing.T) {
+	type attempt struct {
+		reason pushReason
+		batch  *syncpkg.WatchBatch
+	}
+	attempts := make(chan attempt, 3)
+	pushCount := 0
+	loop, fire, floor := newBatchTestLoop(func(
+		_ context.Context, reason pushReason, batch *syncpkg.WatchBatch,
+	) error {
+		pushCount++
+		attempts <- attempt{reason: reason, batch: batch}
+		if pushCount == 1 {
+			return errors.New("target unavailable")
+		}
+		return nil
+	})
+	go loop.Run(t.Context())
+
+	covered := loop.NotifyBatchWithAck(syncpkg.WatchBatch{
+		Paths: []string{"/sessions/before-interval"},
+	})
+	floor <- time.Now()
+	first := receivePushLoopValue(t, attempts)
+	assert.Equal(t, reasonInterval, first.reason)
+	assert.Nil(t, first.batch)
+
+	later := loop.NotifyBatchWithAck(syncpkg.WatchBatch{
+		Paths: []string{"/sessions/after-interval"},
+	})
+	fire <- time.Now()
+	retry := receivePushLoopValue(t, attempts)
+	assert.Equal(t, reasonInterval, retry.reason)
+	assert.Nil(t, retry.batch)
+	require.NoError(t, receivePushLoopValue(t, covered))
+
+	fire <- time.Now()
+	change := receivePushLoopValue(t, attempts)
+	assert.Equal(t, reasonChange, change.reason)
+	require.NotNil(t, change.batch)
+	assert.Equal(t, []string{"/sessions/after-interval"}, change.batch.Paths)
+	require.NoError(t, receivePushLoopValue(t, later))
+}
+
+func TestPushLoopFailedBatchRestoresAndMergesConcurrentArrival(t *testing.T) {
+	attempts := make(chan *syncpkg.WatchBatch, 2)
+	releaseFirst := make(chan struct{})
+	call := 0
+	loop, fire, _ := newBatchTestLoop(func(
+		_ context.Context, _ pushReason, batch *syncpkg.WatchBatch,
+	) error {
+		call++
+		attempts <- batch
+		if call == 1 {
+			<-releaseFirst
+			return errors.New("target unavailable")
+		}
+		return nil
+	})
+	go loop.Run(t.Context())
+
+	loop.NotifyBatch(syncpkg.WatchBatch{Paths: []string{"/sessions/first"}})
+	fire <- time.Now()
+	first := receivePushLoopValue(t, attempts)
+	require.NotNil(t, first)
+	assert.Equal(t, []string{"/sessions/first"}, first.Paths)
+	loop.NotifyBatch(syncpkg.WatchBatch{Paths: []string{"/sessions/second"}})
+	close(releaseFirst)
+	fire <- time.Now()
+
+	second := receivePushLoopValue(t, attempts)
+	require.NotNil(t, second)
+	assert.Equal(t, []string{"/sessions/first", "/sessions/second"}, second.Paths)
+}
+
+func TestPushLoopOverflowBatchSurvivesRetry(t *testing.T) {
+	attempts := make(chan *syncpkg.WatchBatch, 2)
+	call := 0
+	loop, fire, _ := newBatchTestLoop(func(
+		_ context.Context, _ pushReason, batch *syncpkg.WatchBatch,
+	) error {
+		call++
+		attempts <- batch
+		if call == 1 {
+			return errors.New("target unavailable")
+		}
+		return nil
+	})
+	go loop.Run(t.Context())
+
+	loop.NotifyBatch(syncpkg.WatchBatch{Paths: []string{
+		"/sessions/" + strings.Repeat("x", 2<<20),
+	}})
+	fire <- time.Now()
+	first := receivePushLoopValue(t, attempts)
+	assert.Equal(t, &syncpkg.WatchBatch{FullSync: true, LostEvents: true}, first)
+	fire <- time.Now()
+	second := receivePushLoopValue(t, attempts)
+	assert.Equal(t, &syncpkg.WatchBatch{FullSync: true, LostEvents: true}, second)
+}
+
+func TestPushLoopShutdownFlushClaimsPendingBatch(t *testing.T) {
+	type attempt struct {
+		reason pushReason
+		batch  *syncpkg.WatchBatch
+	}
+	pushed := make(chan attempt, 1)
+	loop, _, _ := newBatchTestLoop(func(
+		_ context.Context, reason pushReason, batch *syncpkg.WatchBatch,
+	) error {
+		pushed <- attempt{reason: reason, batch: batch}
+		return nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	go loop.Run(ctx)
+	loop.NotifyBatch(syncpkg.WatchBatch{Paths: []string{"/sessions/final"}})
+	cancel()
+
+	got := receivePushLoopValue(t, pushed)
+	assert.Equal(t, reasonShutdown, got.reason)
+	require.NotNil(t, got.batch)
+	assert.Equal(t, []string{"/sessions/final"}, got.batch.Paths)
+}
+
+func TestPushLoopBatchPromotionLogContainsOnlyAggregateReason(t *testing.T) {
+	var output bytes.Buffer
+	originalWriter := log.Writer()
+	originalFlags := log.Flags()
+	originalPrefix := log.Prefix()
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(originalWriter)
+		log.SetFlags(originalFlags)
+		log.SetPrefix(originalPrefix)
+	})
+
+	loop, _, _ := newBatchTestLoop(func(
+		context.Context, pushReason, *syncpkg.WatchBatch,
+	) error {
+		return nil
+	})
+	secretPath := "/sessions/private-name-" + strings.Repeat("x", 2<<20)
+	loop.NotifyBatch(syncpkg.WatchBatch{Paths: []string{secretPath}})
+
+	assert.Contains(t, output.String(), "reason=byte_limit")
+	assert.Contains(t, output.String(), "promotion_count=1")
+	assert.NotContains(t, output.String(), "private-name")
 }
 
 func TestPushLoop_DirtyTriggersOnePush(t *testing.T) {
@@ -176,9 +431,7 @@ func TestPushWatchFallbackCoverageMarksLoopDirty(t *testing.T) {
 	require.NoError(t,
 		loop.NotifyCoverageDegraded([]string{"/root-a", "/root-a", "/root-b"}))
 	pending, waiters := func() (bool, int) {
-		loop.pendingMu.Lock()
-		defer loop.pendingMu.Unlock()
-		return loop.pending, len(loop.waiters)
+		return pushLoopPendingState(loop)
 	}()
 	assert.True(t, pending,
 		"coverage degradation must mark the loop dirty for the next push")

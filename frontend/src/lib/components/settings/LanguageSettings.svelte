@@ -35,6 +35,10 @@
       name: "fr",
       label: m.settings_language_french(),
     },
+    {
+      name: "ja",
+      label: m.settings_language_japanese(),
+    },
   ]);
 
   function handleLocaleSelect(value: string) {

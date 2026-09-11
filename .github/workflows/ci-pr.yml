@@ -1,8 +1,8 @@
 name: CI
 
-# The PR dispatcher always calls the main-pinned workflow. That workflow
-# independently routes same-repository Linux jobs to the managed public fleet
-# and fork jobs to GitHub-hosted runners.
+# Keep the upstream dispatcher pinned to its managed workflow. Forks use their
+# local copy, whose runner expressions fall back to GitHub-hosted machines;
+# upstream-only Namespace labels cannot service a fork's jobs.
 on:
   pull_request:
 
@@ -10,4 +10,9 @@ permissions: read-all
 
 jobs:
   run:
+    if: github.repository == 'kenn-io/agentsview'
     uses: kenn-io/agentsview/.github/workflows/ci.yml@main
+
+  fork:
+    if: github.repository != 'kenn-io/agentsview'
+    uses: ./.github/workflows/ci.yml

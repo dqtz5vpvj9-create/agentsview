@@ -1,6 +1,10 @@
 package sync
 
-import gosync "sync"
+import (
+	"slices"
+	gosync "sync"
+	"time"
+)
 
 // Phase describes the current sync phase.
 type Phase string
@@ -10,6 +14,7 @@ const (
 	PhaseDiscovering      Phase = "discovering"
 	PhasePreparingResync  Phase = "preparing_resync"
 	PhaseSyncing          Phase = "syncing"
+	PhaseFinalizing       Phase = "finalizing"
 	PhaseCopyingMetadata  Phase = "copying_metadata"
 	PhaseCopyingOrphans   Phase = "copying_orphans"
 	PhaseReclassifying    Phase = "reclassifying"
@@ -18,20 +23,27 @@ const (
 	PhaseDone             Phase = "done"
 )
 
+const defaultProgressStallAfter = 5 * time.Minute
+
 // Progress reports sync progress to listeners.
 type Progress struct {
-	Phase           Phase  `json:"phase"`
-	Detail          string `json:"detail,omitempty"`
-	Hint            string `json:"hint,omitempty"`
-	Resync          bool   `json:"resync,omitempty"`
-	CurrentProject  string `json:"current_project,omitempty"`
-	ProjectsTotal   int    `json:"projects_total"`
-	ProjectsDone    int    `json:"projects_done"`
-	SessionsTotal   int    `json:"sessions_total"`
-	SessionsDone    int    `json:"sessions_done"`
-	MessagesIndexed int    `json:"messages_indexed"`
-	BytesDone       int64  `json:"bytes_done,omitempty"`
-	BytesTotal      int64  `json:"bytes_total,omitempty"`
+	Phase             Phase     `json:"phase"`
+	Detail            string    `json:"detail,omitempty"`
+	Hint              string    `json:"hint,omitempty"`
+	Resync            bool      `json:"resync,omitempty"`
+	StartedAt         time.Time `json:"started_at,omitzero"`
+	UpdatedAt         time.Time `json:"updated_at,omitzero"`
+	Stalled           bool      `json:"stalled,omitempty"`
+	CurrentProject    string    `json:"current_project,omitempty"`
+	ProjectsTotal     int       `json:"projects_total"`
+	ProjectsDone      int       `json:"projects_done"`
+	SessionsTotal     int       `json:"sessions_total"`
+	SessionsDone      int       `json:"sessions_done"`
+	MessagesIndexed   int       `json:"messages_indexed"`
+	BytesDone         int64     `json:"bytes_done,omitempty"`
+	BytesTotal        int64     `json:"bytes_total,omitempty"`
+	FallbackProviders int       `json:"fallback_providers,omitempty"`
+	FallbackSources   int       `json:"fallback_sources,omitempty"`
 }
 
 // SyncResult describes the outcome of syncing a single session.
@@ -51,14 +63,27 @@ type SyncResult struct {
 // produced at least one session — used by ResyncAll to compare
 // against Failed on the same unit.
 type SyncStats struct {
-	TotalSessions  int                 `json:"total_sessions"`
-	Synced         int                 `json:"synced"`
-	Skipped        int                 `json:"skipped"`
-	Failed         int                 `json:"failed"`
+	TotalSessions int `json:"total_sessions"`
+	Synced        int `json:"synced"`
+	Skipped       int `json:"skipped"`
+	Failed        int `json:"failed"`
+	// Deferred counts provider results retained for a later retry. It is
+	// run-local completion state, not a durable or API field.
+	Deferred       int                 `json:"-"`
 	OrphanedCopied int                 `json:"orphaned_copied,omitempty"`
 	Warnings       []string            `json:"warnings,omitempty"`
 	Aborted        bool                `json:"aborted,omitempty"`
 	RebuildPhases  []RebuildPhaseStats `json:"rebuild_phases,omitempty"`
+	// Tombstoned is the legacy protocol name for committed source-missing state
+	// changes that are not ordinary sync writes. It remains meaningful on a
+	// partially failed or aborted pass: a later retry will skip an already-marked
+	// row, so this first transition is the one that must notify clients.
+	Tombstoned int `json:"tombstoned,omitempty"`
+	// CwdUpdated counts durable source workspace (Cwd) reconciliations that
+	// changed rows without an ordinary session write. It is exported and
+	// serialized because worker-process passes marshal SyncStats back to the
+	// daemon, which must still emit "sessions" for cwd-only changes.
+	CwdUpdated int `json:"cwd_updated,omitempty"`
 
 	// Anomalies aggregates per-run parser/sanitizer anomaly signals
 	// surfaced in the CLI sync summary. These are live per-run counters
@@ -67,12 +92,12 @@ type SyncStats struct {
 	Anomalies AnomalyStats `json:"anomalies,omitzero"`
 
 	filesOK int // unexported: file-level success counter
-	// sourceMissingTombstoned counts stored virtual members tombstoned
-	// during this run because their member source vanished from a
-	// still-existing shared container. Changed-path syncs use it to emit
-	// a sessions event even when nothing else was written.
-	sourceMissingTombstoned int
-	filesDiscovered         int // file-based total, excludes DB-backed agents
+	// sourceMissingArchiveMembers carries members discovered in the original
+	// archive while a full resync writes into its replacement. Orphan copy must
+	// materialize them before the rebuild can apply the same guarded source-state
+	// transition used by an in-place sync.
+	sourceMissingArchiveMembers []sourceMissingMember
+	filesDiscovered             int // file-based total, excludes DB-backed agents
 	// nonContainerDiscovered counts discovered files that are not part of
 	// a self-preserving container store (OpenCode-format storage and its
 	// SQLite virtual paths). The resync empty-discovery guard uses it so a
@@ -83,6 +108,8 @@ type SyncStats struct {
 	parserExcludedFiles    int // file-level intentional parser exclusions
 	parserExcludedIDs      []string
 	providerFailures       int // authoritative discoveries that did not complete
+	deferredRetryPaths     []string
+	deferredRetryOverflow  bool
 	// ArchiveRebuilt records a completed full-resync database swap. A rebuild
 	// can preserve/copy durable corpus rows while syncing zero session files,
 	// so downstream refresh consumers cannot infer it from Synced. It is not
@@ -102,7 +129,12 @@ type SyncStats struct {
 }
 
 func (s SyncStats) shouldEmitSync() bool {
-	return !s.Aborted && (s.Synced > 0 || s.ArchiveRebuilt)
+	return s.Tombstoned > 0 ||
+		(!s.Aborted && (s.Synced > 0 || s.CwdUpdated > 0 || s.ArchiveRebuilt))
+}
+
+func (s SyncStats) hasSessionChanges() bool {
+	return s.Synced > 0 || s.CwdUpdated > 0 || s.Tombstoned > 0
 }
 
 // AnomalyStats aggregates parser-output anomaly signals observed during a
@@ -375,9 +407,36 @@ func (s *SyncStats) RecordSynced(n int) {
 	s.Synced += n
 }
 
+// RecordCwdUpdated records a durable source workspace reconciliation.
+func (s *SyncStats) RecordCwdUpdated(n int) {
+	s.CwdUpdated += n
+}
+
 // RecordFailed increments the hard-failure counter.
 func (s *SyncStats) RecordFailed() {
 	s.Failed++
+}
+
+func (s *SyncStats) recordDeferred(path string) {
+	s.Deferred++
+	s.retainDeferredRetryPath(path)
+}
+
+func (s *SyncStats) retainDeferredRetryPath(path string) {
+	if s.deferredRetryOverflow || path == "" {
+		return
+	}
+	if slices.Contains(s.deferredRetryPaths, path) {
+		return
+	}
+	if len(s.deferredRetryPaths) >= reconciliationRetryPathLimit ||
+		reconciliationRetryPathBytes(s.deferredRetryPaths)+len(path) >
+			reconciliationRetryPathByteLimit {
+		s.deferredRetryOverflow = true
+		s.deferredRetryPaths = nil
+		return
+	}
+	s.deferredRetryPaths = append(s.deferredRetryPaths, path)
 }
 
 // Percent returns the sync progress as a percentage (0–100).

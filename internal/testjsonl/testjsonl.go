@@ -4,7 +4,8 @@
 package testjsonl
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"strings"
 )
 
@@ -541,6 +542,42 @@ func (b *SessionBuilder) AddClaudeAssistant(
 	return b
 }
 
+// ClaudeAssistantUsage carries the token-usage identity fields for
+// AddClaudeAssistantUsage.
+type ClaudeAssistantUsage struct {
+	MessageID    string
+	RequestID    string
+	Model        string
+	InputTokens  int
+	OutputTokens int
+}
+
+// AddClaudeAssistantUsage appends a Claude assistant message line
+// carrying model, message/request identity, and token usage, the
+// shape billed API turns take in real Claude Code transcripts.
+func (b *SessionBuilder) AddClaudeAssistantUsage(
+	timestamp, text string, usage ClaudeAssistantUsage,
+) *SessionBuilder {
+	m := map[string]any{
+		"type":      "assistant",
+		"timestamp": timestamp,
+		"requestId": usage.RequestID,
+		"message": map[string]any{
+			"id":    usage.MessageID,
+			"model": usage.Model,
+			"content": []map[string]string{
+				{"type": "text", "text": text},
+			},
+			"usage": map[string]any{
+				"input_tokens":  usage.InputTokens,
+				"output_tokens": usage.OutputTokens,
+			},
+		},
+	}
+	b.lines = append(b.lines, mustMarshal(m))
+	return b
+}
+
 // AddCodexMeta appends a Codex session_meta line.
 func (b *SessionBuilder) AddCodexMeta(
 	timestamp, id, cwd, originator string,
@@ -557,17 +594,6 @@ func (b *SessionBuilder) AddCodexMessage(
 	timestamp, role, text string,
 ) *SessionBuilder {
 	b.lines = append(b.lines, CodexMsgJSON(role, text, timestamp))
-	return b
-}
-
-// AddCodexFunctionCall appends a Codex function_call line.
-func (b *SessionBuilder) AddCodexFunctionCall(
-	timestamp, name, summary string,
-) *SessionBuilder {
-	b.lines = append(
-		b.lines,
-		CodexFunctionCallJSON(name, summary, timestamp),
-	)
 	return b
 }
 
@@ -685,18 +711,6 @@ func GeminiAssistantMsg(
 	return m
 }
 
-// GeminiInfoMsg builds a Gemini info/system message object.
-func GeminiInfoMsg(
-	id, timestamp, content, msgType string,
-) map[string]any {
-	return map[string]any{
-		"id":        id,
-		"timestamp": timestamp,
-		"type":      msgType,
-		"content":   content,
-	}
-}
-
 // GeminiSessionJSON builds a complete Gemini session JSON
 // string from the given parameters.
 func GeminiSessionJSON(
@@ -711,7 +725,7 @@ func GeminiSessionJSON(
 		"lastUpdated": lastUpdated,
 		"messages":    messages,
 	}
-	b, err := json.MarshalIndent(session, "", "  ")
+	b, err := json.Marshal(session, jsontext.WithIndent("  "))
 	if err != nil {
 		panic(err)
 	}

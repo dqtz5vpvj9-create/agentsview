@@ -4,7 +4,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"net/http"
@@ -133,6 +134,8 @@ func buildExtractManager(
 		Identity:       dist.Identity,
 		QuietPeriod:    dist.Quiet,
 		FailureBackoff: dist.Backoff,
+
+		AllowCandidateFindings: cfg.AllowCandidateFindings(),
 	})
 }
 
@@ -143,6 +146,8 @@ func setupRecallExtraction(
 	cfg config.Config, database *db.DB, idle *server.IdleTracker,
 ) (*extractScheduler, error) {
 	if !cfg.Recall.Extract.Enabled {
+		database.SetExtractCandidateFindingsAllowed(
+			cfg.Recall.Extract.AllowCandidateFindings())
 		return setupExtractReconcileOnly(database, idle)
 	}
 	dist, err := resolveExtractDistillation(cfg.Recall.Extract)
@@ -321,7 +326,7 @@ func newRecallExtractRunCommand() *cobra.Command {
 				return err
 			}
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()),
 					extractRunResult{
 						Sessions:  result.Sessions,
 						Failed:    result.Failed,
@@ -329,6 +334,7 @@ func newRecallExtractRunCommand() *cobra.Command {
 						Entries:   result.Entries,
 						Activated: result.Activated,
 					})
+
 			}
 			fmt.Fprintf(cmd.OutOrStdout(),
 				"Sessions: %d done, %d failed\nUnits: %d\nEntries: %d new\n",
@@ -382,7 +388,7 @@ func newRecallExtractStatusCommand() *cobra.Command {
 				return err
 			}
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(status)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), status)
 			}
 			printExtractStatusHuman(cmd.OutOrStdout(), status)
 			return nil
@@ -528,6 +534,11 @@ func newRecallExtractDoctorCommand() *cobra.Command {
 			fmt.Fprintf(out, "Profile: %s\n", dist.Profile)
 			fmt.Fprintf(out, "Segmenter: %s (max_window_chars=%d)\n",
 				dist.Segmenter.Name(), dist.Segmenter.MaxWindowChars)
+			candidateGate := config.RecallCandidateFindingsBlock
+			if cfg.Recall.Extract.AllowCandidateFindings() {
+				candidateGate = config.RecallCandidateFindingsAllow
+			}
+			fmt.Fprintf(out, "Candidate findings: %s\n", candidateGate)
 			fmt.Fprintf(out, "Fingerprint: %s\n", fingerprint)
 
 			ctx, cancel := context.WithTimeout(cmd.Context(),
@@ -600,7 +611,7 @@ func runRecallExtractPreview(
 		Chunks:        chunks,
 	}
 	if outputFormat(cmd) == "json" {
-		return json.NewEncoder(cmd.OutOrStdout()).Encode(result)
+		return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), result)
 	}
 	return printRecallExtractDryRunHuman(cmd.OutOrStdout(), result)
 }

@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"time"
 )
 
@@ -36,7 +37,7 @@ import (
 //     blanked. Empty-string handling is preserved as-is so downstream
 //     localTime treats a blanked timestamp as invalid.
 //
-// Message.TokenUsage (json.RawMessage) and transient
+// Message.TokenUsage (jsontext.Value) and transient
 // ToolResults.ContentRaw are intentionally not run through this pass. They are
 // raw provider payloads, not persisted display text. Persisted result content
 // (tool_calls.result_content and tool_result_events.content) follows the same
@@ -119,17 +120,38 @@ func (s *ValidationStats) add(o ValidationStats) {
 func ValidateAndSanitize(
 	s *Session, msgs []Message, events []UsageEvent,
 ) ValidationStats {
+	stats, _ := ValidateAndSanitizeContext(
+		context.Background(), s, msgs, events,
+	)
+	return stats
+}
+
+// ValidateAndSanitizeContext applies the central validation contract while
+// allowing bounded callers to stop between rows.
+func ValidateAndSanitizeContext(
+	ctx context.Context,
+	s *Session, msgs []Message, events []UsageEvent,
+) (ValidationStats, error) {
 	var stats ValidationStats
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 	if s != nil {
 		stats.add(SanitizeSession(s))
 	}
 	for i := range msgs {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
 		stats.add(SanitizeMessage(&msgs[i]))
 	}
 	for i := range events {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
 		stats.add(SanitizeUsageEvent(&events[i]))
 	}
-	return stats
+	return stats, ctx.Err()
 }
 
 // SanitizeMessage applies the contract to a single message row.
@@ -321,6 +343,25 @@ func SanitizeSession(s *Session) ValidationStats {
 	if next, blanked := BlankImplausibleTimestampPtr(s.EndedAt); blanked {
 		s.EndedAt = next
 		stats.TimestampsBlanked++
+	}
+
+	// A session cannot be its own parent. A parser or an imported artifact
+	// that reports one (corrupt or crafted source data) must not store it:
+	// the hierarchy queries would treat the row as a non-root and hide it,
+	// and linking ignores self-referential spawn edges, so nothing would
+	// later correct it. The claim falls back to the parser-derived parent
+	// when that names another session, and is dropped otherwise;
+	// relationship_type stays intact so a real spawn edge can still link
+	// the row. This mirrors clearSelfParentedSessionsSQL.
+	if s.ParserParentSessionID != nil && *s.ParserParentSessionID == s.ID {
+		s.ParserParentSessionID = nil
+	}
+	if s.ParentSessionID != nil && *s.ParentSessionID == s.ID {
+		s.ParentSessionID = nil
+		if s.ParserParentSessionID != nil {
+			restored := *s.ParserParentSessionID
+			s.ParentSessionID = &restored
+		}
 	}
 
 	return stats

@@ -7,7 +7,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -48,9 +49,14 @@ type EncoderConfig struct {
 	RequestDimensions bool
 	// Timeout bounds each individual HTTP request.
 	Timeout time.Duration
-	// MaxRetries is the maximum total attempts on 429/5xx/network errors
-	// (4xx fails fast); values <= 0 mean one attempt.
+	// MaxRetries is the maximum total attempts on retryable errors; values
+	// <= 0 mean one attempt. A 429 does not consume this budget when
+	// RetryRateLimits is enabled.
 	MaxRetries int
+	// RetryRateLimits keeps retrying HTTP 429 responses until the request
+	// succeeds or ctx is canceled. Long-running document builds enable this;
+	// latency-sensitive query encoders leave it disabled and use MaxRetries.
+	RetryRateLimits bool
 	// InputPrefix is prepended verbatim to every input text before it is
 	// sent. Callers use distinct encoder instances when query and document
 	// inputs require different task instructions. Empty means no prefix.
@@ -177,7 +183,7 @@ type embeddingsRequestBody struct {
 	// length (Matryoshka truncation plus renormalization, server-side). Zero
 	// omits the field so native-dimension configurations and endpoints
 	// without dimension selection keep working.
-	Dimensions int `json:"dimensions,omitempty"`
+	Dimensions int `json:"dimensions,omitzero"`
 }
 
 // embeddingsResponseBody is the OpenAI-compatible embeddings response.
@@ -192,7 +198,7 @@ type ollamaEmbedRequest struct {
 	Model      string             `json:"model"`
 	Input      []string           `json:"input"`
 	Truncate   bool               `json:"truncate"`
-	Dimensions int                `json:"dimensions,omitempty"`
+	Dimensions int                `json:"dimensions,omitzero"`
 	Options    ollamaEmbedOptions `json:"options"`
 	KeepAlive  string             `json:"keep_alive"`
 }
@@ -232,7 +238,7 @@ func (v *embeddingVector) UnmarshalJSON(b []byte) error {
 		*v = out
 		return nil
 	}
-	var elements []json.RawMessage
+	var elements []jsontext.Value
 	if err := json.Unmarshal(b, &elements); err != nil {
 		return err
 	}
@@ -447,13 +453,15 @@ func (ec *encoderClient) encode(ctx context.Context, texts []string) ([][]float3
 		return nil, err
 	}
 
-	attempts := ec.cfg.MaxRetries
-	if attempts <= 0 {
-		attempts = 1
+	maxAttempts := ec.cfg.MaxRetries
+	if maxAttempts <= 0 {
+		maxAttempts = 1
 	}
 
 	var lastErr error
-	for attempt := 1; attempt <= attempts; attempt++ {
+	nonRateLimitAttempts := 0
+	rateLimitAttempts := 0
+	for {
 		vectors, retryable, err := ec.attemptEncode(ctx, reqBody, texts)
 		if err == nil {
 			return vectors, nil
@@ -478,9 +486,21 @@ func (ec *encoderClient) encode(ctx context.Context, texts []string) ([][]float3
 				ec.cfg.Model, err)
 		}
 		lastErr = err
-		if attempt == attempts && ec.cfg.OllamaCPUFallback {
-			var invalidErr *InvalidEmbeddingError
-			if errors.As(err, &invalidErr) {
+		if ec.cfg.RetryRateLimits && isRateLimitError(err) {
+			// A 429 is the one error class the provider tells us exactly how
+			// to handle: it clears with time and doesn't indicate the request
+			// itself is broken. Retry it forever (until ctx is canceled)
+			// rather than spending the limited MaxRetries budget on it, so a
+			// large build doesn't abort permanently on a transient quota.
+			rateLimitAttempts++
+			if err := sleepBackoff(ctx, rateLimitAttempts, err); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		nonRateLimitAttempts++
+		if nonRateLimitAttempts == maxAttempts && ec.cfg.OllamaCPUFallback {
+			if _, ok := errors.AsType[*InvalidEmbeddingError](err); ok {
 				merged, fallbackErr := ec.ollamaCPUFallback(ctx, texts, vectors)
 				if fallbackErr == nil {
 					return merged, nil
@@ -491,14 +511,22 @@ func (ec *encoderClient) encode(ctx context.Context, texts []string) ([][]float3
 				)
 			}
 		}
-		if !retryable || attempt == attempts {
+		if !retryable || nonRateLimitAttempts == maxAttempts {
 			return nil, lastErr
 		}
-		if err := sleepBackoff(ctx, attempt, err); err != nil {
+		if err := sleepBackoff(ctx, nonRateLimitAttempts, err); err != nil {
 			return nil, err
 		}
 	}
-	return nil, lastErr
+}
+
+// isRateLimitError reports whether err is an HTTP 429 (Too Many Requests)
+// response from the embeddings endpoint.
+func isRateLimitError(err error) bool {
+	if statusErr, ok := errors.AsType[*HTTPStatusError](err); ok {
+		return statusErr.Status == http.StatusTooManyRequests
+	}
+	return false
 }
 
 func (ec *encoderClient) ollamaCPUFallback(
@@ -564,7 +592,7 @@ func (ec *encoderClient) ollamaCPUFallback(
 	}
 
 	var decoded ollamaEmbedResponse
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &decoded); err != nil {
 		return nil, fmt.Errorf("decode Ollama CPU response: %w", err)
 	}
 	if len(decoded.Embeddings) != len(invalidIndices) {
@@ -664,7 +692,7 @@ func (ec *encoderClient) attemptEncode(
 	}
 
 	var decoded embeddingsResponseBody
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &decoded); err != nil {
 		// A decode failure almost always means the connection died
 		// mid-stream (truncated body), not that the endpoint sent a
 		// deliberately malformed response; treat it as transient so the

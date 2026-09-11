@@ -103,6 +103,59 @@ func TestManagerBuildUsingSelectsNamedEncoder(t *testing.T) {
 	assert.Positive(t, localCalls.Load(), "a build without Using must encode on the default server")
 }
 
+// TestManagerCapsBuildBatchesByWorstCaseTokenBudget covers the Voyage repro:
+// four inputs can each be truncated to the 32,000-token model context, making
+// a 128,000-token request that exceeds the provider's 120,000-token cap. The
+// encoder is the provider boundary, so its recorded arguments prove the
+// oversized request is split before submission.
+func TestManagerCapsBuildBatchesByWorstCaseTokenBudget(t *testing.T) {
+	const (
+		configuredBatchSize = 4
+		modelContextTokens  = 32000
+		maxBatchTokens      = 120000
+	)
+
+	ix := openTestIndex(t)
+	rows := make([]fakeUnit, configuredBatchSize)
+	for i := range rows {
+		rows[i] = fakeUnit{
+			unit:    userDoc("s1", fmt.Sprintf("u%d", i), i, fmt.Sprintf("doc-%d", i)),
+			endedAt: fmt.Sprintf("2024-01-01T00:00:0%dZ", i),
+		}
+	}
+	src := &fakeUnitSource{rows: rows}
+
+	var submittedBatchSizes []int
+	enc := func(_ context.Context, texts []string) ([][]float32, error) {
+		submittedBatchSizes = append(submittedBatchSizes, len(texts))
+		out := make([][]float32, len(texts))
+		for i := range texts {
+			out[i] = []float32{1, 0, 0}
+		}
+		return out, nil
+	}
+	encoders := EncoderSet{Default: "voyage", ByName: map[string]ManagedEncoder{
+		"voyage": {
+			Encode: enc,
+			Settings: EncodeSettings{
+				BatchSize:          configuredBatchSize,
+				ModelContextTokens: modelContextTokens,
+				MaxBatchTokens:     maxBatchTokens,
+				Concurrency:        1,
+			},
+		},
+	}}
+	m := NewManager(ix, src, encoders, fakeGeneration("fake-model"))
+
+	started, err := m.TryBuild(context.Background(), BuildRequest{})
+	require.NoError(t, err)
+	require.True(t, started)
+	assert.Equal(t, []int{3, 1}, submittedBatchSizes)
+	for _, size := range submittedBatchSizes {
+		assert.LessOrEqual(t, size*modelContextTokens, maxBatchTokens)
+	}
+}
+
 func TestManagerResolvesBuildTargetForEveryPass(t *testing.T) {
 	ix := openTestIndex(t)
 	oldGeneration := kitvec.Generation{
@@ -229,6 +282,37 @@ func TestManagerWaitBlocksUntilAsyncBuildCompletes(t *testing.T) {
 	case <-time.After(time.Second):
 		require.Fail(t, "Wait did not return after the asynchronous build completed")
 	}
+}
+
+func TestManagerShutdownCancelsDetachedStartBuild(t *testing.T) {
+	// Models a document build stuck retrying HTTP 429 responses forever
+	// (EncoderConfig.RetryRateLimits): the encoder returns only once its
+	// context is canceled. Shutdown must cancel the detached build so daemon
+	// shutdown does not hang on Wait.
+	ix := openTestIndex(t)
+	stuckEncoder := func(ctx context.Context, _ []string) ([][]float32, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	m := NewManager(
+		ix, twoDocSource(), soloEncoders(stuckEncoder), fakeGeneration("fake-model"),
+	)
+	require.NoError(t, m.StartBuild(BuildRequest{}))
+	waitFor(t, func() bool { return m.Status().Running }, "build never reported running")
+
+	done := make(chan struct{})
+	go func() {
+		m.Shutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "Shutdown did not cancel the detached build")
+	}
+	status := m.Status()
+	assert.False(t, status.Running)
+	assert.Contains(t, status.LastError, context.Canceled.Error())
 }
 
 func TestManagerTryBuildReturnsFalseWhileRunning(t *testing.T) {

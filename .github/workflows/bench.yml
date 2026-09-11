@@ -1,19 +1,20 @@
 name: Bench Gate
 
 # Compares hot-path benchmarks between the PR head and its merge
-# base, so performance regressions in the sync engine and DB write
-# paths fail the PR instead of shipping. The gated regression classes
-# have all shipped before:
+# base, so performance regressions in sync, DB access, secret scanning,
+# and signal analysis fail the PR instead of shipping. The gated
+# regression classes have all shipped before:
 #
 #   - discovery/skip work scaling with archive size instead of new
 #     data (#912, the providerSourceUnchangedInDB gap)
 #   - O(session history) work per incremental append (#954)
 #   - bulk ingest throughput (#411)
 #   - per-row query-shape regressions in usage aggregation (#309)
+#   - repeated token-set construction during duplicate-prompt analysis
 #
 # Both sides run `make bench-gate` — the Makefile is the single
 # source of truth for the gated package list, sample count, and
-# iteration count — and cmd/benchgate compares the outputs. It gates
+# per-tier iteration counts — and cmd/benchgate compares the outputs. It gates
 # on allocs/op and B/op (deterministic on a given machine, tight
 # thresholds) and on ns/op with a loose 2x threshold that only
 # catches algorithmic blowups; both sides run on the same runner
@@ -39,17 +40,20 @@ permissions:
 jobs:
   bench-gate:
     name: Benchmark Gate
-    runs-on: ${{ github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'kenn-linux-x64-public' || 'ubuntu-latest' }}
+    # Always GitHub-hosted, unlike the rest of CI: both sides of the
+    # comparison run on the same runner within one job, so absolute
+    # speed is what matters, and ubuntu-latest runs this I/O-heavy
+    # workload 2-4x faster than the managed fleet.
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: go.mod
-          cache: ${{ github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'false' || 'true' }}
 
       - name: Run benchmarks (PR head)
         run: |
@@ -66,11 +70,13 @@ jobs:
         # exists on both sides. The warning makes the degraded run
         # visible instead of a silently green vacuous pass.
         #
-        # The sample count and fixed iteration count are evaluated
-        # from the PR head's Makefile and passed into the base run:
-        # two benchmarks grow their fixture per iteration, so a PR
-        # that changes BENCH_GATE_COUNT/TIME must not compare against
-        # a baseline measured with the old values. The package list
+        # The sample count, fixed iteration counts, and heavy-tier
+        # regex are evaluated from the PR head's Makefile and passed
+        # into the base run: two benchmarks grow their fixture per
+        # iteration, so a PR that changes BENCH_GATE_COUNT/TIME or
+        # moves a benchmark between tiers must not compare against a
+        # baseline measured with the old values. A base Makefile that
+        # predates a variable simply ignores it. The package list
         # intentionally stays per-side, so growing the gate cannot
         # break the base run.
         run: |
@@ -80,7 +86,9 @@ jobs:
           git worktree add /tmp/bench-base "$base"
           if ! make -s -C /tmp/bench-base bench-gate \
               BENCH_GATE_COUNT="$BENCH_GATE_COUNT" \
-              BENCH_GATE_TIME="$BENCH_GATE_TIME" > /tmp/bench-old.txt; then
+              BENCH_GATE_TIME="$BENCH_GATE_TIME" \
+              BENCH_GATE_HEAVY="$BENCH_GATE_HEAVY" \
+              BENCH_GATE_HEAVY_TIME="$BENCH_GATE_HEAVY_TIME" > /tmp/bench-old.txt; then
             echo "::warning title=Bench Gate::merge-base benchmark run exited non-zero; gating against its partial output"
           fi
 

@@ -5,7 +5,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,7 +38,7 @@ func newSessionSyncCommand() *cobra.Command {
 				return err
 			}
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(detail)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), detail)
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "synced: %s\n",
 				sanitizeTerminal(detail.ID))
@@ -75,6 +76,7 @@ func syncService(
 	engine := sync.NewEngine(d, sync.EngineConfig{
 		AgentDirs:          cfg.AgentDirs,
 		SourceMachines:     cfg.SourceMachines,
+		DisabledAgents:     cfg.DisabledAgents,
 		IncludeCwdPrefixes: cfg.SyncIncludeCwdPrefixes,
 		ScanProtectedPaths: cfg.ScanProtectedPaths,
 		Machine:            cfg.LocalMachineName,

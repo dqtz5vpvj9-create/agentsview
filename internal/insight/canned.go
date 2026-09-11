@@ -1,13 +1,11 @@
 package insight
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -286,6 +284,7 @@ func CannedCacheKey(
 	dateFrom, dateTo, project, requestedAgent, focus, aggregateHash string,
 	automatedScope string,
 	filters CannedSessionFilters,
+	generation GenerateOptions,
 ) (string, error) {
 	t, ok := CannedTemplate(kind)
 	if !ok {
@@ -297,18 +296,37 @@ func CannedCacheKey(
 		return "", err
 	}
 	filterSum := sha256.Sum256(filterData)
+	generationBackend := requestedAgent
+	generationModel := ""
+	generationEndpointHash := ""
+	if generation.Endpoint != nil &&
+		strings.TrimSpace(generation.Endpoint.Endpoint) != "" &&
+		strings.TrimSpace(generation.Endpoint.Model) != "" {
+		generationBackend = "openai"
+		generationModel = strings.TrimSpace(generation.Endpoint.Model)
+		endpointSum := sha256.Sum256(
+			[]byte(strings.TrimSpace(generation.Endpoint.Endpoint)),
+		)
+		generationEndpointHash = hex.EncodeToString(endpointSum[:])
+		requestedAgent = ""
+	} else if requestedAgent == "gemini" {
+		generationModel = geminiInsightModel
+	}
 	input := map[string]string{
-		"kind":             string(kind),
-		"date_from":        dateFrom,
-		"date_to":          dateTo,
-		"project":          project,
-		"requested_agent":  requestedAgent,
-		"template_version": t.Version,
-		"schema_version":   CannedSchemaVersion,
-		"aggregate_hash":   aggregateHash,
-		"focus_hash":       hex.EncodeToString(focusSum[:]),
-		"automated_scope":  automatedScope,
-		"filter_hash":      hex.EncodeToString(filterSum[:]),
+		"kind":                     string(kind),
+		"date_from":                dateFrom,
+		"date_to":                  dateTo,
+		"project":                  project,
+		"requested_agent":          requestedAgent,
+		"template_version":         t.Version,
+		"schema_version":           CannedSchemaVersion,
+		"aggregate_hash":           aggregateHash,
+		"focus_hash":               hex.EncodeToString(focusSum[:]),
+		"automated_scope":          automatedScope,
+		"filter_hash":              hex.EncodeToString(filterSum[:]),
+		"generation_backend":       generationBackend,
+		"generation_model":         generationModel,
+		"generation_endpoint_hash": generationEndpointHash,
 	}
 	data, err := canonicalJSON(input)
 	if err != nil {
@@ -411,16 +429,10 @@ func ParseCannedEnvelope(raw string) (CannedRecommendationEnvelope, error) {
 	clean = strings.TrimSpace(clean)
 
 	var out CannedRecommendationEnvelope
-	dec := json.NewDecoder(strings.NewReader(clean))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&out); err != nil {
+	if err := json.Unmarshal(
+		[]byte(clean), &out, json.RejectUnknownMembers(true),
+	); err != nil {
 		return out, fmt.Errorf("parsing canned insight JSON: %w", err)
-	}
-	var extra struct{}
-	if err := dec.Decode(&extra); err == nil {
-		return out, errors.New("canned insight JSON contains trailing values")
-	} else if !errors.Is(err, io.EOF) {
-		return out, fmt.Errorf("canned insight JSON has trailing data: %w", err)
 	}
 	return out, nil
 }
@@ -547,15 +559,7 @@ func NewCannedProvenance(
 }
 
 func canonicalJSON(v any) ([]byte, error) {
-	data, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-	var buf bytes.Buffer
-	if err := json.Compact(&buf, data); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return json.Marshal(v, json.Deterministic(true))
 }
 
 func validConfidence(v string) bool {

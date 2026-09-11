@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +12,8 @@ import (
 	"strings"
 
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/server"
+	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
 type daemonPushRequest struct {
@@ -21,23 +23,25 @@ type daemonPushRequest struct {
 	PG                     *config.PGConfig     `json:"pg,omitempty"`
 	DuckDB                 *config.DuckDBConfig `json:"duckdb,omitempty"`
 	SyncStateTarget        string               `json:"sync_state_target,omitempty"`
-	MigrateLegacySyncState bool                 `json:"migrate_legacy_sync_state,omitempty"`
+	MigrateLegacySyncState bool                 `json:"migrate_legacy_sync_state,omitzero"`
 	// NoVectors mirrors the CLI --no-vectors flag into the daemon: it has no
 	// per-invocation flag of its own, so the gate must travel in the request.
-	NoVectors bool `json:"no_vectors,omitempty"`
+	NoVectors bool `json:"no_vectors,omitzero"`
 	// ScopeVectorsToChangedSessions is set by change-triggered watch
 	// pushes so the daemon's vector phase reads state only for the
 	// changed relational sessions (see postgres.PushOptions).
-	ScopeVectorsToChangedSessions bool `json:"scope_vectors_to_changed_sessions,omitempty"`
+	ScopeVectorsToChangedSessions bool `json:"scope_vectors_to_changed_sessions,omitzero"`
 	// LastReconciledVectorGeneration travels with a scoped push so the
 	// daemon's fresh Sync can promote to generation-wide when the active
 	// generation id has changed (see postgres.PushOptions).
-	LastReconciledVectorGeneration int64 `json:"last_reconciled_vector_generation,omitempty"`
+	LastReconciledVectorGeneration int64 `json:"last_reconciled_vector_generation,omitzero"`
 	// Automatic is set by the watch-mode DuckDB pushes so the daemon
 	// defers instead of rebuilding when a live serve process holds the
 	// mirror and skips archive-scale diagnostics (see
 	// duckdbsync.SyncOptions.Automatic).
-	Automatic bool `json:"automatic,omitempty"`
+	Automatic     bool                        `json:"automatic,omitzero"`
+	WatchBatch    *syncpkg.WatchBatch         `json:"watch_batch,omitempty"`
+	WatchRecovery *syncpkg.WatchRecoveryScope `json:"watch_recovery,omitempty"`
 }
 
 // postDaemonPush delegates a push to the local daemon. It negotiates an SSE
@@ -54,42 +58,80 @@ func postDaemonPush[T, P any](
 	onProgress func(P),
 ) (T, error) {
 	var zero T
-	data, err := json.Marshal(body)
-	if err != nil {
-		return zero, err
+	body = daemonPushRequestForCapabilities(tr, body)
+	fallbackAttempted := false
+	for {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return zero, err
+		}
+		req, err := http.NewRequestWithContext(
+			ctx, http.MethodPost, strings.TrimSuffix(tr.URL, "/")+path,
+			bytes.NewReader(data),
+		)
+		if err != nil {
+			return zero, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Origin", tr.URL)
+		if authToken != "" {
+			req.Header.Set("Authorization", "Bearer "+authToken)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return zero, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			msg, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if !fallbackAttempted && body.WatchBatch != nil &&
+				daemonRejectsWatchScope(resp.StatusCode, msg) {
+				body.WatchBatch = nil
+				body.WatchRecovery = nil
+				fallbackAttempted = true
+				continue
+			}
+			return zero, daemonPushError(resp.StatusCode, msg)
+		}
+		defer resp.Body.Close()
+		if strings.HasPrefix(
+			resp.Header.Get("Content-Type"), "text/event-stream",
+		) {
+			return parseDaemonPushSSE[T](resp.Body, onProgress)
+		}
+		var out T
+		if err := json.UnmarshalRead(resp.Body, &out); err != nil {
+			return zero, err
+		}
+		return out, nil
 	}
-	req, err := http.NewRequestWithContext(
-		ctx, http.MethodPost, strings.TrimSuffix(tr.URL, "/")+path,
-		bytes.NewReader(data),
-	)
-	if err != nil {
-		return zero, err
+}
+
+func daemonPushRequestForCapabilities(
+	tr transport, body daemonPushRequest,
+) daemonPushRequest {
+	if body.WatchBatch != nil && tr.Runtime != nil && tr.Runtime.API > 0 &&
+		tr.Runtime.API < server.ScopedWatchPushAPIVersion {
+		body.WatchBatch = nil
+		body.WatchRecovery = nil
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Origin", tr.URL)
-	if authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+authToken)
+	return body
+}
+
+func daemonRejectsWatchScope(status int, body []byte) bool {
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+		return false
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return zero, err
+	message := strings.ToLower(string(body))
+	if !strings.Contains(message, "watch_batch") &&
+		!strings.Contains(message, "watch_recovery") {
+		return false
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		msg, _ := io.ReadAll(resp.Body)
-		return zero, daemonPushError(resp.StatusCode, msg)
-	}
-	if strings.HasPrefix(
-		resp.Header.Get("Content-Type"), "text/event-stream",
-	) {
-		return parseDaemonPushSSE[T](resp.Body, onProgress)
-	}
-	var out T
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return zero, err
-	}
-	return out, nil
+	return strings.Contains(message, "unexpected") ||
+		strings.Contains(message, "unknown") ||
+		strings.Contains(message, "additional") ||
+		strings.Contains(message, "not allowed")
 }
 
 // daemonPushError renders a non-200 daemon response, preferring the API's
@@ -112,8 +154,7 @@ func parseDaemonPushSSE[T, P any](
 	r io.Reader, onProgress func(P),
 ) (T, error) {
 	var zero T
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	reader := bufio.NewReaderSize(r, 64*1024)
 	var event string
 	var data strings.Builder
 	var done bool
@@ -124,7 +165,7 @@ func parseDaemonPushSSE[T, P any](
 			return nil
 		}
 		switch event {
-		case "done":
+		case "done", "report":
 			if err := json.Unmarshal([]byte(data.String()), &result); err != nil {
 				return fmt.Errorf("decoding daemon push result: %w", err)
 			}
@@ -152,29 +193,30 @@ func parseDaemonPushSSE[T, P any](
 		}
 		return nil
 	}
-	for scanner.Scan() {
-		line := scanner.Text()
+	for {
+		line, readErr := reader.ReadString('\n')
+		line = strings.TrimSuffix(line, "\n")
+		line = strings.TrimSuffix(line, "\r")
 		if line == "" {
 			if err := dispatch(); err != nil {
 				return zero, err
 			}
 			event = ""
 			data.Reset()
-			continue
-		}
-		if value, ok := strings.CutPrefix(line, "event: "); ok {
+		} else if value, ok := strings.CutPrefix(line, "event: "); ok {
 			event = value
-			continue
-		}
-		if value, ok := strings.CutPrefix(line, "data: "); ok {
+		} else if value, ok := strings.CutPrefix(line, "data: "); ok {
 			if data.Len() > 0 {
 				data.WriteByte('\n')
 			}
 			data.WriteString(value)
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		return zero, err
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				return zero, readErr
+			}
+			break
+		}
 	}
 	if err := dispatch(); err != nil {
 		return zero, err
