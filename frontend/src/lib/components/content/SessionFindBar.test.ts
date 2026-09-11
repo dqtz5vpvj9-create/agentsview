@@ -16,6 +16,7 @@ beforeEach(() => {
   messages.sessionId = "s1";
   messages.loading = false;
   messages.hasOlder = false;
+  messages.historyComplete = true;
 });
 afterEach(async () => {
   for (const component of components.splice(0)) await unmount(component);

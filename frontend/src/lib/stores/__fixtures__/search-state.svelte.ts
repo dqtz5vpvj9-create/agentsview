@@ -1,8 +1,15 @@
 /** Reactive dependencies used by the local search store tests. */
 import type { SearchMessageSource, SearchView } from "../inSessionSearch.svelte.js";
 
-export function reactiveSource(initial: SearchMessageSource): SearchMessageSource {
-  const source = $state(initial);
+type SourceFixture = Omit<SearchMessageSource, "historyComplete" | "ensureHistoryLoaded"> &
+  Partial<Pick<SearchMessageSource, "historyComplete" | "ensureHistoryLoaded">>;
+
+export function reactiveSource(initial: SourceFixture): SearchMessageSource {
+  const source: SearchMessageSource = $state({
+    ...initial,
+    historyComplete: initial.historyComplete ?? true,
+    ensureHistoryLoaded: initial.ensureHistoryLoaded ?? (() => source.ensureOrdinalLoaded(0)),
+  });
   return source;
 }
 
