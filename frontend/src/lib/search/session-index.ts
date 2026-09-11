@@ -1,7 +1,19 @@
 /** Occurrence-level search over message data, independent of mounted DOM. */
 import type { Message } from "../api/types.js";
-import { collectSearchBlocks } from "./block-text.js";
-import { findOccurrences } from "./dom-text.js";
+import { collectSearchBlocks, type SearchBlock } from "./block-text.js";
+import { createOccurrenceMatcher, prepareSearchText, type PreparedSearchText } from "./dom-text.js";
+
+// Weak ownership releases folded text when a message version is discarded.
+// Retain the source too so accidental in-place block updates cannot use stale text.
+const preparedBlocks = new WeakMap<SearchBlock, { source: string; text: PreparedSearchText }>();
+
+function preparedText(block: SearchBlock): PreparedSearchText {
+  const cached = preparedBlocks.get(block);
+  if (cached?.source === block.text) return cached.text;
+  const text = prepareSearchText(block.text);
+  preparedBlocks.set(block, { source: block.text, text });
+  return text;
+}
 
 export interface Match {
   ordinal: number;
@@ -34,6 +46,7 @@ export function buildSessionIndex(
     total: 0,
   };
   if (!query.trim()) return index;
+  const matchText = createOccurrenceMatcher(query);
 
   // The message store is normally ordered already. Keep that path linear.
   const ordered = messages.every((message, i) =>
@@ -42,7 +55,7 @@ export function buildSessionIndex(
 
   for (const message of ordered) {
     for (const block of collectSearchBlocks(message)) {
-      const occurrences = findOccurrences(block.text, query);
+      const occurrences = matchText(preparedText(block));
       if (!occurrences.length) continue;
       index.byBlock.set(block.key, occurrences.length);
       index.byOrdinal.set(
