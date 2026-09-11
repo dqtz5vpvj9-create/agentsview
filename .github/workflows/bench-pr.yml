@@ -1,7 +1,7 @@
 name: Bench Gate
 
-# The PR dispatcher always calls the main-pinned workflow, which runs
-# on GitHub-hosted runners for every PR.
+# Use the workflow version shipped with the PR. The upstream main branch no
+# longer contains bench.yml, while this branch still carries its benchmark gate.
 on:
   pull_request:
     # Docs/frontend-only PRs cannot change the gated Go paths. If
@@ -18,4 +18,4 @@ permissions: read-all
 
 jobs:
   run:
-    uses: kenn-io/agentsview/.github/workflows/bench.yml@main
+    uses: ./.github/workflows/bench.yml

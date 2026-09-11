@@ -1,8 +1,7 @@
 name: Desktop Artifacts
 
-# The PR dispatcher always calls the main-pinned workflow. That workflow
-# independently routes same-repository Linux jobs to the managed public fleet
-# and fork jobs to GitHub-hosted runners.
+# Upstream uses its main-pinned managed workflow. Forks use their local runner
+# routing so desktop builds do not wait for an upstream-only Namespace fleet.
 on:
   pull_request:
     branches: [main]
@@ -18,4 +17,9 @@ permissions: read-all
 
 jobs:
   run:
+    if: github.repository == 'kenn-io/agentsview'
     uses: kenn-io/agentsview/.github/workflows/desktop-artifacts.yml@main
+
+  fork:
+    if: github.repository != 'kenn-io/agentsview'
+    uses: ./.github/workflows/desktop-artifacts.yml
