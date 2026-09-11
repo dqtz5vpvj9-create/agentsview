@@ -3,7 +3,8 @@
 Find searches the selected session's message text, thinking, skills, code,
 tool inputs, outputs, and result history. Inline subagent transcripts remain
 scoped to their own sessions. Counts come from message data, independently of
-virtualized rows and disclosure state.
+virtualized rows and disclosure state. Thinking within grouped tool messages
+uses the same indexed text and stable keys as standalone thinking blocks.
 
 ## Navigation
 
@@ -27,16 +28,43 @@ changing saved preferences. Only the current matching disclosure is opened
 automatically. Native CSS highlights do not rewrite transcript text. Precise
 reveal handles nested scrolling and the application's text-size/zoom settings.
 
-Historical messages are loaded when find opens. If history remains incomplete
-after a load attempt, the bar reports partial results and offers an explicit
-retry. Failed loads do not cause an automatic request loop. Late results from a
-previous session cannot change the current session's loading state.
+Native Markdown details elements also open for the current match. Search
+restores only its own temporary changes on navigation or close, preserving
+previously open elements and explicit user choices. Matching a visible summary
+does not expand its body. Reselecting the only match starts a new reveal after
+a manual close. Reveal success checks reject closed disclosures and CSS-hidden
+boundaries.
+
+Historical messages are loaded when find opens. Completeness is independent of
+pagination direction: a failed forward page is partial even when there are no
+older messages. Recovery appends the missing tail without replacing existing
+rows, deduplicates concurrent updates, and coalesces repeated requests. The bar
+reports partial results and offers explicit retry after a failed attempt.
+Failed loads do not cause an automatic request loop. Session and request
+identity checks prevent old responses from changing a new session.
+
+## Matching cost
+
+Each stable content block weakly owns prepared lowercase text. Queries compile
+once per scan, so subsequent queries do not refold every character. ASCII runs
+use native string conversion; non-ASCII code points retain independent casing
+semantics. Only length-changing folds need packed expansion boundaries, rather
+than dense offset arrays for the whole block. Offsets remain original UTF-16
+positions and matches stay non-overlapping. Replacement blocks invalidate the
+cache, and an in-place text change cannot reuse a stale prepared value.
+
+Indexing remains synchronous. Initial content parsing and rendering still have
+a cost; cached matching does not replace pagination, virtual rendering, or the
+existing query debounce. No results are omitted or capped for performance.
 
 ## Regression coverage
 
 `navigation.test.ts` covers ordering, stable tuples, opening anchors, and wrap
 behavior. `find-input.test.ts` covers composition and event ownership.
-`scroll-zoom.test.ts` covers viewport-to-layout coordinate conversion.
-`inSessionSearch-regression.test.ts` covers store integration, pending queries,
-implicit cursors, and history recovery. Existing session-find browser coverage
-is in `frontend/e2e/session-find.spec.ts`.
+`details-reveal.test.ts` covers native disclosures, manual overrides, cleanup,
+and named groups. `matcher-equivalence.test.ts` and `session-index-cache.test.ts`
+cover Unicode offsets and prepared-text invalidation. Store recovery coverage
+is in `messages-history.test.ts` and `inSessionSearch-history.test.ts`.
+`ToolCallGroup-thinking.test.ts` covers grouped thinking and display ordering.
+Application browser cases are in `frontend/e2e/session-find.spec.ts` and
+`frontend/e2e/session-find-regressions.spec.ts`.
