@@ -43,6 +43,7 @@ export function buildSessionIndex(
   query: string,
   allowsBlock?: (message: Message, block: SearchBlock) => boolean,
   renderOptions: MarkdownRenderOptions = {},
+  wholeWord = false,
 ): SessionIndex {
   const index: SessionIndex = {
     matches: [],
@@ -51,7 +52,7 @@ export function buildSessionIndex(
     total: 0,
   };
   if (!query.trim()) return index;
-  const matchText = createOccurrenceMatcher(query);
+  const matchText = createOccurrenceMatcher(query, wholeWord);
 
   // The message store is normally ordered already. Keep that path linear.
   const ordered = messages.every(

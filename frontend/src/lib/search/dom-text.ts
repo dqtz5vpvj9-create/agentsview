@@ -46,14 +46,23 @@ function isCodePointBoundary(value: string, index: number): boolean {
   return !(previous >= 0xd800 && previous <= 0xdbff && current >= 0xdc00 && current <= 0xdfff);
 }
 
-function findFoldedOffsets(text: string, query: string): TextOccurrence[] {
+const WORD_END = /[\p{L}\p{M}\p{N}\p{Pc}]$/u;
+const WORD_START = /^[\p{L}\p{M}\p{N}\p{Pc}]/u;
+
+function findFoldedOffsets(text: string, query: string, wholeWord: boolean): TextOccurrence[] {
   const occurrences: TextOccurrence[] = [];
   let cursor = 0;
   while (cursor <= text.length - query.length) {
     const start = text.indexOf(query, cursor);
     if (start < 0) break;
     const end = start + query.length;
-    if (isCodePointBoundary(text, start) && isCodePointBoundary(text, end)) {
+    if (
+      isCodePointBoundary(text, start) &&
+      isCodePointBoundary(text, end) &&
+      (!wholeWord ||
+        (!WORD_END.test(text.slice(Math.max(0, start - 2), start)) &&
+          !WORD_START.test(text.slice(end, end + 2))))
+    ) {
       occurrences.push({ start, end });
       cursor = end;
     } else {
@@ -119,11 +128,12 @@ function originalPosition(position: number, end: boolean, expansions: Uint32Arra
 /** Compile the query once for a scan across many independently cached blocks. */
 export function createOccurrenceMatcher(
   query: string,
+  wholeWord = false,
 ): (text: PreparedSearchText) => TextOccurrence[] {
   const foldedQuery = query.trim() ? prepareSearchText(query).value : "";
   return (text) => {
     if (!foldedQuery) return [];
-    const matches = findFoldedOffsets(text.value, foldedQuery);
+    const matches = findFoldedOffsets(text.value, foldedQuery, wholeWord);
     if (!text.expansions) return matches;
     const occurrences: TextOccurrence[] = [];
     let previousEnd = -1;
@@ -144,7 +154,7 @@ export function createOccurrenceMatcher(
  * Matching lowercases each Unicode code point. Returned offsets always refer
  * to the original UTF-16 string and never divide a surrogate pair.
  */
-export function findOccurrences(text: string, query: string): TextOccurrence[] {
+export function findOccurrences(text: string, query: string, wholeWord = false): TextOccurrence[] {
   if (!query.trim()) return [];
-  return createOccurrenceMatcher(query)(prepareSearchText(text));
+  return createOccurrenceMatcher(query, wholeWord)(prepareSearchText(text));
 }

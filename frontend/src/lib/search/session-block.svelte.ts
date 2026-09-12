@@ -13,6 +13,7 @@ export function searchBlock(key: string | undefined) {
     if (current) void inSessionSearch.navigationRevision;
     return {
       query: inSessionSearch.isActive ? inSessionSearch.debouncedQuery : "",
+      wholeWord: inSessionSearch.wholeWord,
       count,
       current,
       occurrence,

@@ -7,6 +7,7 @@ import "./search.css";
 
 export interface SearchBlockState {
   query: string;
+  wholeWord?: boolean;
   count: number;
   current: boolean;
   occurrence: number;
@@ -119,7 +120,7 @@ export function searchBlock(
         disclosures.update();
         return;
       }
-      const occurrences = findOccurrences(domText(element), state.query);
+      const occurrences = findOccurrences(domText(element), state.query, state.wholeWord);
       const boundaries = mapOccurrences(element, occurrences);
       const ranges = boundaries.map((boundary) =>
         typeof StaticRange === "function"

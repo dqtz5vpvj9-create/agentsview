@@ -1,4 +1,5 @@
 {
+  "session_find_whole_word": "Match whole word",
   "session_find_loading_history": "Loading older messages…",
   "session_find_announce_match": "Match {current} of {total}",
   "session_find_block_count": [

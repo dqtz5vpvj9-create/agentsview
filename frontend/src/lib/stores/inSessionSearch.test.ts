@@ -306,3 +306,23 @@ describe("local in-session search", () => {
     expect(store.currentOrdinal).toBe(1);
   });
 });
+
+it("reindexes and navigates whole words without changing the query", async () => {
+  const { store } = setup([message(0, "needles needle"), message(2, "NEEDLE")]);
+  await search(store);
+  expect(store.total).toBe(3);
+  store.toggleWholeWord();
+  await tick();
+  expect(store.total).toBe(2);
+  expect(store.resolvedCurrent).toMatchObject({ ordinal: 0, start: 8, end: 14 });
+  store.next();
+  expect(store.currentOrdinal).toBe(2);
+  store.close();
+  await search(store);
+  expect(store.wholeWord).toBe(true);
+  expect(store.total).toBe(2);
+  store.toggleWholeWord();
+  await tick();
+  expect(store.total).toBe(3);
+  expect(store.query).toBe("needle");
+});

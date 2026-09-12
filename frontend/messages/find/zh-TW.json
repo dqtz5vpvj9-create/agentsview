@@ -1,4 +1,5 @@
 {
+  "session_find_whole_word": "全字匹配",
   "session_find_loading_history": "正在載入歷史訊息…",
   "session_find_announce_match": "第 {current} 個符合項目，共 {total} 個",
   "session_find_block_count": [

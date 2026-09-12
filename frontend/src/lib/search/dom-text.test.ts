@@ -59,3 +59,27 @@ describe("findOccurrences", () => {
     expect(findOccurrences("anything", " \n\t ")).toEqual([]);
   });
 });
+
+describe("whole-word occurrences", () => {
+  it.each([
+    ["cat scatter", "cat", [{ start: 0, end: 3 }]],
+    ["bobcat cat", "cat", [{ start: 7, end: 10 }]],
+    ["cat_ cat2 _cat", "cat", []],
+    [
+      "(CAT)-cat",
+      "cat",
+      [
+        { start: 1, end: 4 },
+        { start: 6, end: 9 },
+      ],
+    ],
+    ["café décafé", "café", [{ start: 0, end: 4 }]],
+    ["é e", "e", [{ start: 3, end: 4 }]],
+    ["𐐀cat cat𐐀 cat", "cat", [{ start: 12, end: 15 }]],
+    ["猫咪 猫", "猫", [{ start: 3, end: 4 }]],
+    ["afoo foo foo", "foo foo", [{ start: 5, end: 12 }]],
+    ["İ İx", "i̇", [{ start: 0, end: 1 }]],
+  ])("matches complete words in %s", (text, query, expected) => {
+    expect(findOccurrences(text, query, true)).toEqual(expected);
+  });
+});

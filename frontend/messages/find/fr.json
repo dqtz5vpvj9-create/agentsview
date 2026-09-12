@@ -1,4 +1,5 @@
 {
+  "session_find_whole_word": "Mot entier",
   "session_find_loading_history": "Chargement des messages précédents…",
   "session_find_announce_match": "Résultat {current} sur {total}",
   "session_find_block_count": [
