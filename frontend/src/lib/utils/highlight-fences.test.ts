@@ -91,6 +91,14 @@ describe("highlightCodeFences", () => {
     );
     expect(root.querySelector("mark")).toBeNull();
   });
+  it("preserves the selected match across adjacent text nodes", async () => {
+    const root = fixture("<p>find target here</p>");
+    (root.querySelector("p")!.firstChild as Text).splitText(7);
+    attach(root, "target");
+    color(root);
+    await vi.waitFor(() => expect(currentRangeForBlock(root)?.toString()).toBe("target"));
+    expect(root.textContent).toBe("find target here");
+  });
   it("does not make syntax highlighting responsible for search", async () => {
     const root = fixture('<pre><code class="language-ts">const foo = 1;</code></pre>');
     color(root);

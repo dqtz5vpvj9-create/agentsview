@@ -32,6 +32,9 @@ export function highlightCodeFences(node: HTMLElement, _params: HighlightCodeFen
   }
   function run() {
     cancelAll();
+    // HTML parsing splits large text into adjacent nodes. Merging them avoids
+    // slow WebKit line wrapping for large tool-image fallback payloads.
+    node.normalize();
     node.querySelectorAll<HTMLElement>("pre > code[class*='language-']").forEach((codeEl) => {
       const lang = /\blanguage-(\S+)/.exec(codeEl.className)?.[1];
       if (lang) highlightNode(codeEl, lang);
