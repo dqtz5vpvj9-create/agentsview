@@ -698,7 +698,7 @@
   }
 
   $effect(() => {
-    const request = inSessionSearch.revealSeq;
+    const request = inSessionSearch.navigationRevision;
     const key = searchRevealKey;
     const sessionId = messages.sessionId;
     const count = displayItemsAsc.length;

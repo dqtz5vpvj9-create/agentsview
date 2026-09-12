@@ -94,6 +94,36 @@ describe("search block integration", () => {
     expect(document.querySelectorAll("mark")).toHaveLength(0);
   });
 
+  it("preserves a manual native disclosure choice across incoming messages until navigation", async () => {
+    const source = message("<details><summary>Details</summary>needle</details>");
+    messages.historyComplete = true;
+    await search(source);
+    components.push(
+      mount(MessageContent, {
+        target: document.body,
+        props: { message: source, searchOrdinal: 7 },
+      }),
+    );
+    await tick();
+    const details = document.querySelector("details")!;
+    expect(details.open).toBe(true);
+    details.querySelector("summary")!.click();
+    await tick();
+    expect(details.open).toBe(false);
+
+    messages.messages = [...messages.messages, message("unrelated", { ordinal: 8 })];
+    await tick();
+    expect(document.querySelector("details")).toBe(details);
+    expect(details.open).toBe(false);
+
+    inSessionSearch.next();
+    await tick();
+    expect(details.open).toBe(true);
+    inSessionSearch.close();
+    await tick();
+    expect(details.open).toBe(false);
+  });
+
   it("reveals truncated input, output and history independently", async () => {
     const command = Array.from({ length: 30 }, (_, index) =>
       index === 29 ? "needle" : `echo ${index}`,

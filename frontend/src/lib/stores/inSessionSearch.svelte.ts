@@ -54,8 +54,7 @@ export class InSessionSearchStore {
   debouncedQuery = $state("");
   composing = $state(false);
   current: SearchCursor | null = $state.raw(null);
-  currentSeq = $state(0);
-  revealSeq = $state(0);
+  navigationRevision = $state(0);
   anchorOrdinal: number | null = $state(null);
   focusRequest = $state(0);
   resultsOpen = $state(false);
@@ -138,8 +137,7 @@ export class InSessionSearchStore {
           this.composing = false;
           this.historyRequest = null;
           this.historyFailed = false;
-          this.currentSeq++;
-          this.revealSeq++;
+          this.navigationRevision++;
           if (!sessionId) this.close();
         });
       });
@@ -192,8 +190,7 @@ export class InSessionSearchStore {
           // Pin the first implicit match too. Loading older pages must not
           // silently move it, even before the first explicit next/previous.
           this.current = cursorFor(match);
-          this.currentSeq++;
-          this.revealSeq++;
+          this.navigationRevision++;
           this.selectCurrent();
         });
       });
@@ -204,8 +201,7 @@ export class InSessionSearchStore {
     if (query === this.debouncedQuery) return;
     this.debouncedQuery = query;
     this.current = null;
-    this.currentSeq++;
-    this.revealSeq++;
+    this.navigationRevision++;
     this.selectCurrent();
   }
 
@@ -276,8 +272,7 @@ export class InSessionSearchStore {
     if (!this.isOpen) {
       this.anchorOrdinal = this.view.selectedOrdinal;
       this.current = null;
-      this.currentSeq++;
-      this.revealSeq++;
+      this.navigationRevision++;
       this.isOpen = true;
     }
     this.focusRequest++;
@@ -291,8 +286,7 @@ export class InSessionSearchStore {
     this.debouncedQuery = "";
     this.current = null;
     this.resultsOpen = false;
-    this.currentSeq++;
-    this.revealSeq++;
+    this.navigationRevision++;
   }
 
   clearQuery(): void {
@@ -312,8 +306,7 @@ export class InSessionSearchStore {
     const match = this.matches.find((candidate) => sameCursor(candidate, cursor));
     if (!match) return;
     this.current = cursorFor(match);
-    this.currentSeq++;
-    this.revealSeq++;
+    this.navigationRevision++;
     this.selectCurrent();
   }
 
@@ -333,9 +326,6 @@ export class InSessionSearchStore {
     this.step(-1);
   }
 
-  get currentMatchIndex(): number {
-    return this.currentIndex;
-  }
   get currentOrdinal(): number | null {
     return this.resolvedCurrent?.ordinal ?? null;
   }

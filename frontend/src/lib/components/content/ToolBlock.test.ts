@@ -19,7 +19,7 @@ vi.mock("../../stores/inSessionSearch.svelte.js", () => ({
     get debouncedQuery() {
       return searchState.query;
     },
-    currentSeq: 1,
+    navigationRevision: 1,
     isCurrentBlock: (key: string | undefined) => !!key && key === searchState.current,
     countForBlock: (key: string | undefined) => (key && key === searchState.current ? 1 : 0),
     currentOccurrence: () => 0,

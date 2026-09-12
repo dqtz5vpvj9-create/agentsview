@@ -1,12 +1,24 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { findSearchBlock, revealMatch, type RevealOptions } from "./reveal.js";
+import { currentRangeForBlock, searchBlock } from "./search-block.svelte.js";
+
+const cleanups: (() => void)[] = [];
 
 function setup(mounted = true) {
   const root = document.createElement("div");
   document.body.append(root);
   const block = document.createElement("pre");
-  block.dataset.searchBlock = "7:tool-output:0";
+  block.textContent = "needle";
+  const cleanup = searchBlock("7:tool-output:0", () => ({
+    query: "needle",
+    count: 1,
+    current: true,
+    occurrence: 0,
+  }))(block)!;
+  cleanups.push(cleanup);
+  const readRect = vi.fn(() => new DOMRect(80, 150, 100, 20));
+  Object.defineProperty(currentRangeForBlock(block)!, "getBoundingClientRect", { value: readRect });
   if (mounted) root.append(block);
   Object.defineProperties(root, {
     clientHeight: { value: 300 },
@@ -26,7 +38,7 @@ function setup(mounted = true) {
   });
   const options: RevealOptions = {
     ordinal: 7,
-    blockKey: block.dataset.searchBlock,
+    blockKey: "7:tool-output:0",
     getContainer: () => root,
     isCurrent: () => true,
     ensureLoaded: vi.fn().mockResolvedValue(undefined),
@@ -39,12 +51,12 @@ function setup(mounted = true) {
     }),
     afterUpdate: vi.fn().mockResolvedValue(undefined),
     nextFrame: vi.fn().mockResolvedValue(undefined),
-    readTargetRect: () => ({ top: 150, bottom: 170, left: 80, right: 180 }),
   };
-  return { root, block, options };
+  return { root, block, options, readRect, cleanup };
 }
 
 afterEach(() => {
+  cleanups.splice(0).forEach((cleanup) => cleanup());
   document.body.innerHTML = "";
   vi.restoreAllMocks();
 });
@@ -94,17 +106,14 @@ describe("revealMatch", () => {
   });
 
   it("rechecks outer geometry while the expanded row keeps measuring", async () => {
-    const { root, options } = setup();
+    const { root, options, readRect } = setup();
     let frame = 0;
     options.nextFrame = vi.fn(async () => {
       frame++;
     });
-    options.readTargetRect = () => ({
-      top: (frame > 1 ? 1200 : 800) - root.scrollTop,
-      bottom: (frame > 1 ? 1220 : 820) - root.scrollTop,
-      left: 80,
-      right: 180,
-    });
+    readRect.mockImplementation(
+      () => new DOMRect(80, (frame > 1 ? 1200 : 800) - root.scrollTop, 100, 20),
+    );
     expect(await revealMatch(options)).toBe(true);
     expect(root.scrollTop).toBe(960);
     expect(options.scrollToOffset).toHaveBeenNthCalledWith(1, 560);
@@ -113,7 +122,7 @@ describe("revealMatch", () => {
   });
 
   it("corrects an offset change that lands after the second pass", async () => {
-    const { root, options } = setup();
+    const { root, options, readRect } = setup();
     let frame = 0;
     // The virtualizer adjusts the offset two frames after the passes settle,
     // which moves the occurrence out of view until it is revealed again.
@@ -121,24 +130,19 @@ describe("revealMatch", () => {
       frame++;
       if (frame === 3) root.scrollTop += 500;
     });
-    options.readTargetRect = () => ({
-      top: 150 - root.scrollTop,
-      bottom: 170 - root.scrollTop,
-      left: 80,
-      right: 180,
-    });
+    readRect.mockImplementation(() => new DOMRect(80, 150 - root.scrollTop, 100, 20));
     expect(await revealMatch(options)).toBe(true);
     expect(root.scrollTop).toBe(0);
   });
 
   it("stops correcting after the bounded settle budget expires", async () => {
-    const { options } = setup();
+    const { options, readRect } = setup();
     let frame = 0;
     options.nextFrame = vi.fn(async () => {
       frame++;
     });
     // The occurrence never enters the container viewport.
-    options.readTargetRect = () => ({ top: 900, bottom: 920, left: 80, right: 180 });
+    readRect.mockReturnValue(new DOMRect(80, 900, 100, 20));
     expect(await revealMatch(options)).toBe(false);
     // Mount settling, one recheck, then three settle windows of two frames.
     expect(frame).toBe(8);
@@ -153,6 +157,20 @@ describe("revealMatch", () => {
     });
     expect(await revealMatch(options)).toBe(false);
     expect(replacement.scrollTop).toBe(0);
+  });
+
+  it("rejects a hidden occurrence even when its geometry intersects the viewport", async () => {
+    const { block, options } = setup();
+    block.style.display = "none";
+    expect(await revealMatch(options)).toBe(false);
+  });
+
+  it("rejects a block without a selected range", async () => {
+    const { block, options, cleanup } = setup();
+    cleanup();
+    block.dataset.searchBlock = options.blockKey;
+    vi.spyOn(block, "getBoundingClientRect").mockReturnValue(new DOMRect(80, 150, 100, 20));
+    expect(await revealMatch(options)).toBe(false);
   });
 
   it("scopes exact key lookup to the owning transcript", () => {

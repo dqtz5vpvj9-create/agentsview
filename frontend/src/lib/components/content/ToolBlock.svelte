@@ -125,13 +125,13 @@
   let historyCount = $derived(historyKeys.reduce((count, key) => count + inSessionSearch.countForBlock(key), 0));
   let matchCount = $derived(inSessionSearch.countForBlock(inputKey) + inSessionSearch.countForBlock(outputKey) + historyCount);
   let collapsed = $derived(searchCollapsed(userCollapsed,
-    currentInput || currentOutput || currentHistory, inSessionSearch.currentSeq, overrideSeq));
+    currentInput || currentOutput || currentHistory, inSessionSearch.navigationRevision, overrideSeq));
   let outputCollapsed = $derived(searchCollapsed(userOutputCollapsed,
-    currentOutput, inSessionSearch.currentSeq, outputOverrideSeq));
+    currentOutput, inSessionSearch.navigationRevision, outputOverrideSeq));
   let historyCollapsed = $derived(searchCollapsed(userHistoryCollapsed,
-    currentHistory, inSessionSearch.currentSeq, historyOverrideSeq));
+    currentHistory, inSessionSearch.navigationRevision, historyOverrideSeq));
   let contentFullyExpanded = $derived(
-    contentOverrideSeq === inSessionSearch.currentSeq ? userContentFullyExpanded
+    contentOverrideSeq === inSessionSearch.navigationRevision ? userContentFullyExpanded
       : currentInput || userContentFullyExpanded,
   );
 
@@ -245,10 +245,10 @@
       const sel = window.getSelection();
       if (sel && sel.toString().length > 0) return;
       userCollapsed = !collapsed;
-      overrideSeq = inSessionSearch.currentSeq;
+      overrideSeq = inSessionSearch.navigationRevision;
       if (userCollapsed) {
         userContentFullyExpanded = false;
-        contentOverrideSeq = inSessionSearch.currentSeq;
+        contentOverrideSeq = inSessionSearch.navigationRevision;
       }
     }}>
       <span class="tool-chevron" class:open={!collapsed}><ChevronRightIcon size="10" strokeWidth="2.4" aria-hidden="true" /></span>
@@ -288,7 +288,7 @@
         <button class="show-more-btn" onclick={(e) => {
           e.stopPropagation();
           userContentFullyExpanded = !contentFullyExpanded;
-          contentOverrideSeq = inSessionSearch.currentSeq;
+          contentOverrideSeq = inSessionSearch.navigationRevision;
         }}>{contentFullyExpanded ? m.tool_block_show_less() : showAllLinesLabel}</button>
       {/if}
     {/if}
@@ -299,7 +299,7 @@
           const sel = window.getSelection();
           if (sel && sel.toString().length > 0) return;
           userOutputCollapsed = !outputCollapsed;
-          outputOverrideSeq = inSessionSearch.currentSeq;
+          outputOverrideSeq = inSessionSearch.navigationRevision;
         }}>
           <span class="tool-chevron" class:open={!outputCollapsed}><ChevronRightIcon size="10" strokeWidth="2.4" aria-hidden="true" /></span>
           <span class="output-label">{m.tool_block_output()}</span>
@@ -333,7 +333,7 @@
         const sel = window.getSelection();
         if (sel && sel.toString().length > 0) return;
         userHistoryCollapsed = !historyCollapsed;
-        historyOverrideSeq = inSessionSearch.currentSeq;
+        historyOverrideSeq = inSessionSearch.navigationRevision;
       }}>
         <span class="tool-chevron" class:open={!historyCollapsed}><ChevronRightIcon size="10" strokeWidth="2.4" aria-hidden="true" /></span>
         <span class="output-label">{m.tool_block_history()}</span>

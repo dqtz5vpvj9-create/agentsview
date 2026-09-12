@@ -55,7 +55,7 @@ describe("find overview model", () => {
       { y: 38, height: 4 },
     ]);
   });
-  it("keeps edge ticks inside short canvases", () => {
+  it("keeps edge ticks inside short rails", () => {
     const locations = [
       { offset: 0, match: match(1) },
       { offset: 100, match: match(2) },
