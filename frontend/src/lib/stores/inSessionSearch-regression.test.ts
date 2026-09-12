@@ -112,10 +112,10 @@ describe("session find interaction regressions", () => {
     const { store } = setup();
     await search(store);
     const old = store.matches[1]!;
-    const sequence = store.revealSeq;
+    const sequence = store.navigationRevision;
     store.query = "target";
     store.goTo(old);
-    expect(store.revealSeq).toBe(sequence);
+    expect(store.navigationRevision).toBe(sequence);
     expect(store.currentOccurrence("5:text:0")).toBe(0);
   });
 

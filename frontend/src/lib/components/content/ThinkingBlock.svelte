@@ -16,7 +16,7 @@
   let overrideSeq = $state(-1);
   let collapsed = $derived(searchCollapsed(
     userCollapsed, inSessionSearch.isCurrentBlock(searchKey),
-    inSessionSearch.currentSeq, overrideSeq,
+    inSessionSearch.navigationRevision, overrideSeq,
   ));
 </script>
 
@@ -26,7 +26,7 @@
     aria-expanded={!collapsed}
     onclick={() => {
       userCollapsed = !collapsed;
-      overrideSeq = inSessionSearch.currentSeq;
+      overrideSeq = inSessionSearch.navigationRevision;
     }}
   >
     <span class="thinking-chevron" class:open={!collapsed}>

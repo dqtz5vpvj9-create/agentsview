@@ -18,8 +18,8 @@ export function toolSearchKey(
 export function searchCollapsed(
   userCollapsed: boolean,
   current: boolean,
-  currentSeq: number,
+  navigationRevision: number,
   overrideSeq: number,
 ): boolean {
-  return overrideSeq === currentSeq ? userCollapsed : current ? false : userCollapsed;
+  return overrideSeq === navigationRevision ? userCollapsed : current ? false : userCollapsed;
 }

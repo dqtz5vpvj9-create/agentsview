@@ -20,7 +20,7 @@
   let overrideSeq = $state(-1);
   let collapsed = $derived(searchCollapsed(
     userCollapsed, inSessionSearch.isCurrentBlock(searchKey),
-    inSessionSearch.currentSeq, overrideSeq,
+    inSessionSearch.navigationRevision, overrideSeq,
   ));
 
   let previewLine = $derived(
@@ -36,7 +36,7 @@
       const sel = window.getSelection();
       if (sel && sel.toString().length > 0) return;
       userCollapsed = !collapsed;
-      overrideSeq = inSessionSearch.currentSeq;
+      overrideSeq = inSessionSearch.navigationRevision;
     }}
   >
     <span class="skill-chevron" class:open={!collapsed}>

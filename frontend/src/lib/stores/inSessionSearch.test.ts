@@ -282,12 +282,12 @@ describe("local in-session search", () => {
   it("rejects stale result clicks without changing the current position", async () => {
     const { store } = setup();
     await search(store);
-    const seq = store.revealSeq;
+    const seq = store.navigationRevision;
     store.goTo({ ordinal: 123, blockKey: "123:text:0", occurrence: 0 });
-    expect(store.revealSeq).toBe(seq);
+    expect(store.navigationRevision).toBe(seq);
     expect(store.currentOrdinal).toBe(0);
     store.goTo(store.matches[1]!);
-    expect(store.revealSeq).toBe(seq + 1);
+    expect(store.navigationRevision).toBe(seq + 1);
     expect(store.currentOccurrence("0:text:0")).toBe(1);
   });
 

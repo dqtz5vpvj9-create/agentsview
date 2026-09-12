@@ -1,4 +1,4 @@
-/** Height-aware canvas overview geometry; independent of browser rendering. */
+/** Height-aware overview geometry; independent of browser rendering. */
 import type { SearchBlock } from "./block-text.js";
 import type { Match } from "./session-index.js";
 

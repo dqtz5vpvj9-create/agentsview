@@ -11,14 +11,13 @@ import {
 export interface RevealOptions {
   ordinal: number;
   blockKey: string;
-  getContainer(): HTMLElement | undefined;
-  isCurrent(): boolean;
-  ensureLoaded(ordinal: number): Promise<void>;
-  mountMessage(): Promise<boolean>;
-  scrollToOffset(offset: number): void;
-  afterUpdate(): Promise<void>;
-  nextFrame(): Promise<void>;
-  readTargetRect?(block: HTMLElement): SearchRect;
+  getContainer: () => HTMLElement | undefined;
+  isCurrent: () => boolean;
+  ensureLoaded: (ordinal: number) => Promise<void>;
+  mountMessage: () => Promise<boolean>;
+  scrollToOffset: (offset: number) => void;
+  afterUpdate: () => Promise<void>;
+  nextFrame: () => Promise<void>;
 }
 
 /** Exact data equality avoids CSS escaping and cross-session document queries. */
@@ -68,15 +67,14 @@ export async function revealMatch(options: RevealOptions): Promise<boolean> {
   }
   if (!root || !block) return false;
 
-  const readRect = options.readTargetRect ?? targetRect;
   const settle = (target: HTMLElement): void => {
     scrollNestedContainers(
       target,
       root!,
-      () => readRect(target),
+      () => targetRect(target),
       currentRangeForBlock(target)?.startContainer,
     );
-    revealInContainer(root!, () => readRect(target), true, false, options.scrollToOffset);
+    revealInContainer(root!, () => targetRect(target), true, false, options.scrollToOffset);
   };
 
   settle(block);
@@ -99,16 +97,14 @@ export async function revealMatch(options: RevealOptions): Promise<boolean> {
     if (!options.isCurrent() || options.getContainer() !== root) return false;
     block = findSearchBlock(root, options.blockKey);
     if (!block) return false;
-    if (isRectVisibleIn(root, readRect(block))) {
+    if (isRectVisibleIn(root, targetRect(block))) {
       visible = true;
       break;
     }
     settle(block);
   }
   if (!options.isCurrent()) return false;
-  if (!options.readTargetRect) {
-    const range = currentRangeForBlock(block);
-    if (!range || !rangeIsDisclosed(block, range)) return false;
-  }
+  const range = currentRangeForBlock(block);
+  if (!range || !rangeIsDisclosed(block, range)) return false;
   return visible;
 }
