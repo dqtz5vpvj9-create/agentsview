@@ -1,4 +1,5 @@
 {
+  "session_find_whole_word": "단어 단위로 일치",
   "session_find_loading_history": "이전 메시지를 불러오는 중…",
   "session_find_announce_match": "검색 결과 {total}개 중 {current}번째",
   "session_find_block_count": [

@@ -53,6 +53,7 @@ export class InSessionSearchStore {
   query = $state("");
   debouncedQuery = $state("");
   composing = $state(false);
+  wholeWord = $state(false);
   current: SearchCursor | null = $state.raw(null);
   navigationRevision = $state(0);
   anchorOrdinal: number | null = $state(null);
@@ -96,6 +97,7 @@ export class InSessionSearchStore {
       this.debouncedQuery,
       (message, block) => scope.allowsBlock(message, block.kind),
       { renderUnknownXmlBlocksAsPreformatted: this.view.renderUnknownXmlBlocksAsPreformatted },
+      this.wholeWord,
     );
   });
   matches: Match[] = $derived(this.index?.matches ?? EMPTY_MATCHES);
@@ -287,6 +289,13 @@ export class InSessionSearchStore {
     this.current = null;
     this.resultsOpen = false;
     this.navigationRevision++;
+  }
+
+  toggleWholeWord(): void {
+    this.wholeWord = !this.wholeWord;
+    this.current = null;
+    this.navigationRevision++;
+    this.selectCurrent();
   }
 
   clearQuery(): void {

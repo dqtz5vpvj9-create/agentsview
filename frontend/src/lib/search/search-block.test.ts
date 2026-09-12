@@ -187,3 +187,18 @@ describe("search block attachment", () => {
     expect(element.dataset.searchCurrent).toBeUndefined();
   });
 });
+
+it("highlights only whole words across inline markup", () => {
+  const element = attach("<p>scatter <b>cat</b> catapult</p>", {
+    query: "cat",
+    wholeWord: true,
+    count: 1,
+    current: true,
+    occurrence: 0,
+  });
+  expect(highlights.get(FIND_HIGHLIGHT)?.size).toBe(1);
+  expect(currentRangeForBlock(element)?.toString()).toBe("cat");
+  expect(element.querySelector("b")!.contains(currentRangeForBlock(element)!.startContainer)).toBe(
+    true,
+  );
+});

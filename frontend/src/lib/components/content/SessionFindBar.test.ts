@@ -11,6 +11,7 @@ import SessionFindBar from "./SessionFindBar.svelte";
 const components: ReturnType<typeof mount>[] = [];
 beforeEach(() => {
   vi.useFakeTimers();
+  inSessionSearch.wholeWord = false;
   ui.selectedOrdinal = null;
   ui.sortNewestFirst = false;
   messages.sessionId = "s1";
@@ -75,7 +76,7 @@ describe("SessionFindBar", () => {
   });
 
   it("announces occurrence counts and advances within one message", async () => {
-    const content = "needle needle";
+    const content = "needles needle";
     messages.messages = [
       {
         id: 170000,
@@ -106,6 +107,21 @@ describe("SessionFindBar", () => {
       "Match 2 of 2",
     );
     await Promise.resolve();
+    const wholeWord = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Match whole word"]',
+    )!;
+    expect(wholeWord.getAttribute("aria-pressed")).toBe("false");
+    wholeWord.click();
+    await tick();
+    expect(wholeWord.getAttribute("aria-pressed")).toBe("true");
+    expect(document.querySelector(".search-announcement")?.textContent?.trim()).toBe(
+      "Match 1 of 1",
+    );
+    wholeWord.click();
+    await tick();
+    expect(document.querySelector(".search-announcement")?.textContent?.trim()).toBe(
+      "Match 1 of 2",
+    );
     expect(document.querySelectorAll('[aria-live="polite"]')).toHaveLength(1);
     expect(document.querySelector(".kit-find-bar__counter")?.getAttribute("aria-live")).toBe("off");
   });

@@ -2,6 +2,7 @@
   import { Button, FindBar, IconButton } from "@kenn-io/kit-ui";
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
   import { protectFindInput } from "../../search/find-input.js";
+  import { WholeWordIcon } from "../../icons.js";
   import { m } from "../../i18n/index.js";
 
   let root: HTMLDivElement | undefined = $state(undefined);
@@ -48,6 +49,10 @@
           ariaLabel={m.session_find_find_in_session()} inputAriaLabel={m.session_find_search_query()}
           previousLabel={m.session_find_previous_match()} nextLabel={m.session_find_next_match()} closeLabel={m.session_find_close()} />
       </div>
+      <IconButton ariaLabel={m.session_find_whole_word()}
+        ariaPressed={inSessionSearch.wholeWord} onclick={() => inSessionSearch.toggleWholeWord()}>
+        <WholeWordIcon size={16} aria-hidden="true" />
+      </IconButton>
       <IconButton ariaLabel={inSessionSearch.resultsOpen ? m.session_find_hide_results() : m.session_find_toggle_results()}
         ariaExpanded={inSessionSearch.resultsOpen} ariaControls="session-find-results"
         ariaPressed={inSessionSearch.resultsOpen} onclick={() => { inSessionSearch.resultsOpen = !inSessionSearch.resultsOpen; }}>

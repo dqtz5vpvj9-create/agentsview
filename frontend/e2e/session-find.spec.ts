@@ -102,7 +102,7 @@ async function installFixture(page: Page, options: FixtureOptions = {}) {
       : messages.slice(from, from + limit);
     await route.fulfill({ json: { messages: selected, count: selected.length } });
   });
-  return { requests, releaseHistory };
+  return { requests, releaseHistory, messages };
 }
 
 async function openSession(page: Page) {
@@ -230,6 +230,27 @@ async function stepOccurrences(page: Page, total: number, direction: "F3" | "Shi
 
 test.describe("In-session find", () => {
   test.setTimeout(60_000);
+
+  test("filters whole words and restores substring results", async ({ page }) => {
+    const fixture = await installFixture(page);
+    fixture.messages[5]!.content = "needlework need**le** needle_";
+    fixture.messages[5]!.content_length = fixture.messages[5]!.content.length;
+    fixture.releaseHistory();
+    await openSession(page);
+    await openFind(page);
+    await expectCompleteIndex(page, 8);
+    const wholeWord = page.getByRole("button", { name: "Match whole word", exact: true });
+    await wholeWord.click();
+    await expect(wholeWord).toHaveAttribute("aria-pressed", "true");
+    await expectCompleteIndex(page, 6);
+    await openResults(page);
+    const steps = await stepOccurrences(page, 6, "F3");
+    expect(steps.every((step) => step.visible)).toBe(true);
+    expect(steps.filter((step) => step.key === "5:text:0")).toHaveLength(1);
+    await wholeWord.click();
+    await expect(wholeWord).toHaveAttribute("aria-pressed", "false");
+    await expectCompleteIndex(page, 8);
+  });
 
   test("reveals every occurrence through nested scrolling and restores state on close", async ({
     page,
