@@ -707,8 +707,8 @@ toggles visibility of six content categories:
 Turning off **Code** collapses each fenced block into an inline placeholder
 showing its language and an **Expand** button. Expand or collapse individual
 blocks without changing the global filter. Messages containing only code keep
-their placeholder, and in-session search reveals code directly so matches stay
-readable.
+their placeholder. Filtered code stays out of in-session search; turn **Code**
+back on to include it.
 
 System boundary cards are the compact rows that mark a session continuation or
 resume, an interrupted request, a task notification, or stop hook feedback.
@@ -746,6 +746,17 @@ current position are shown in the search bar.
 Use the arrow buttons or `Enter` / `Shift+Enter` to jump between matches. The
 matching message scrolls into view and the search term is highlighted. Press
 `Esc` to close the search bar.
+
+Search follows the transcript's active scope. Block-type filters (see
+[Block-Type Filtering](#block-type-filtering)) and Focused mode both narrow what
+search can find: a hidden category contributes no matches, counts, badges, or
+highlights, and re-showing a category or returning to Normal mode makes that
+content searchable again without retyping the query. Folded content is still
+searched — collapsed tool output, thinking blocks, `<details>` sections, and
+rows that are not currently scrolled into view all match; only the current
+occurrence expands and scrolls into view. The match count, result list, and
+overview rail read the same filtered index, so they update immediately when a
+filter toggles during an active query.
 
 ### Token Usage
 
