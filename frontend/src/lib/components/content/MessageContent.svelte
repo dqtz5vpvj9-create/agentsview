@@ -29,7 +29,7 @@
   import CodeBlock from "./CodeBlock.svelte";
   import MermaidBlock from "./MermaidBlock.svelte";
   import SkillBlock from "./SkillBlock.svelte";
-  import { CopyButton } from "@kenn-io/kit-ui";
+  import { Button, CopyButton } from "@kenn-io/kit-ui";
   import { ui } from "../../stores/ui.svelte.js";
   import { pins } from "../../stores/pins.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
@@ -38,7 +38,12 @@
   import { highlightCodeFences } from "../../utils/highlight-fences.js";
   import { renderMarkdown } from "../../utils/markdown.js";
   import { displayToolName } from "../../utils/toolDisplay.js";
-  import { CirclePlayIcon, PinIcon } from "../../icons.js";
+  import {
+    ChevronDownIcon,
+    ChevronRightIcon,
+    CirclePlayIcon,
+    PinIcon,
+  } from "../../icons.js";
   import type { Session } from "../../api/types.js";
   import { m } from "../../i18n/index.js";
 
@@ -185,6 +190,30 @@
   });
 
   let hasSearchQuery = $derived(highlightQuery.trim() !== "");
+
+  /** Code fences expanded from their filtered placeholder, keyed by segment index. */
+  let expandedCodeBlocks = $state(new Set<number>());
+
+  function toggleCodeBlock(segmentIndex: number) {
+    const next = new Set(expandedCodeBlocks);
+    if (next.has(segmentIndex)) {
+      next.delete(segmentIndex);
+    } else {
+      next.add(segmentIndex);
+    }
+    expandedCodeBlocks = next;
+  }
+
+  function codeFenceToggleLabel(language: string, expanded: boolean): string {
+    if (expanded) {
+      return language
+        ? m.message_content_code_expanded_with_language({ language })
+        : m.message_content_code_expanded();
+    }
+    return language
+      ? m.message_content_code_collapsed_with_language({ language })
+      : m.message_content_code_collapsed();
+  }
 
   /** Whether the text (prose) segments for this role should render. */
   let showText = $derived(
@@ -454,7 +483,7 @@
   </div>
 
   <div class="message-body">
-    {#each segments as segment}
+    {#each segments as segment, segmentIndex}
       {#if segment.type === "thinking"}
         {#if hasSearchQuery || ui.isBlockVisible("thinking")}
           <ThinkingBlock
@@ -468,8 +497,9 @@
              tool_calls can be grouped into a single ParallelGroup
              (v1 simplification: text first, then all tools). -->
       {:else if segment.type === "code"}
+        {@const codeLabel = segment.label?.trim().toLowerCase()}
+        {@const language = segment.label?.trim() ?? ""}
         {#if hasSearchQuery || ui.isBlockVisible("code")}
-          {@const codeLabel = segment.label?.trim().toLowerCase()}
           {#if codeLabel === "mermaid"}
             {#if hasSearchQuery}
               <CodeBlock
@@ -489,6 +519,40 @@
               isCurrentHighlight={isCurrentHighlight}
             />
           {/if}
+        {:else}
+          {@const expanded = expandedCodeBlocks.has(segmentIndex)}
+          {@const toggleLabel = codeFenceToggleLabel(language, expanded)}
+          <div class="code-fence-block">
+            <Button
+              class="code-fence-toggle"
+              size="sm"
+              surface="soft"
+              ariaExpanded={expanded}
+              label={toggleLabel}
+              title={toggleLabel}
+              onclick={() => toggleCodeBlock(segmentIndex)}
+            >
+              {#snippet trailing()}
+                {#if expanded}
+                  <ChevronDownIcon size="14" strokeWidth="2" aria-hidden="true" />
+                {:else}
+                  <ChevronRightIcon size="14" strokeWidth="2" aria-hidden="true" />
+                {/if}
+              {/snippet}
+            </Button>
+            {#if expanded}
+              {#if codeLabel === "mermaid"}
+                <MermaidBlock content={segment.content} />
+              {:else}
+                <CodeBlock
+                  content={segment.content}
+                  language={segment.label}
+                  highlightQuery={highlightQuery}
+                  isCurrentHighlight={isCurrentHighlight}
+                />
+              {/if}
+            {/if}
+          </div>
         {/if}
       {:else if segment.type === "skill"}
         {#if showText}
@@ -723,6 +787,17 @@
     line-height: 1.7;
     color: var(--text-primary);
     word-wrap: break-word;
+  }
+
+  .code-fence-block {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  :global(.code-fence-toggle) {
+    align-self: flex-start;
+    max-width: 100%;
   }
 
   .message-body {

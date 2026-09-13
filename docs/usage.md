@@ -704,6 +704,12 @@ toggles visibility of six content categories:
 | Code      | Code blocks               |
 | System    | System boundary cards     |
 
+Turning off **Code** collapses each fenced block into an inline placeholder
+showing its language and an **Expand** button. Expand or collapse individual
+blocks without changing the global filter. Messages containing only code keep
+their placeholder, and in-session search reveals code directly so matches stay
+readable.
+
 System boundary cards are the compact rows that mark a session continuation or
 resume, an interrupted request, a task notification, or stop hook feedback.
 Hiding the category removes all of them; the rest of the transcript is

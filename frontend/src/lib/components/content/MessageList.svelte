@@ -4,7 +4,7 @@
   // kit-ui-check-ignore: MessageList uses the local TanStack wrapper for pinned-message scroll reconciliation and per-session measurement cache resets; kit-ui VirtualList does not expose those controls yet.
   import type { Virtualizer } from "@tanstack/virtual-core";
   import { messages } from "../../stores/messages.svelte.js";
-  import { ui } from "../../stores/ui.svelte.js";
+  import { ui, type BlockType } from "../../stores/ui.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { settings } from "../../stores/settings.svelte.js";
   import { readProgress } from "../../stores/read-progress.svelte.js";
@@ -66,13 +66,17 @@
     }),
   );
 
+  /** Code fences keep a collapsed placeholder when Code is filtered off,
+   *  so the code segment must still keep its message in the transcript. */
+  function isTranscriptBlockVisible(type: BlockType): boolean {
+    return type === "code" || ui.isBlockVisible(type);
+  }
+
   function isItemVisible(item: DisplayItem): boolean {
     if (item.kind === "tool-group") {
       return true;
     }
-    return hasVisibleSegments(item.message, (type) =>
-      ui.isBlockVisible(type),
-    );
+    return hasVisibleSegments(item.message, isTranscriptBlockVisible);
   }
 
   let normalDisplayItemsAsc = $derived.by(() => {
@@ -105,9 +109,7 @@
       {
         keepAnswerBeforeTrailingTools,
         isMessageVisible: (message) =>
-          hasVisibleSegments(message, (type) =>
-            ui.isBlockVisible(type),
-          ),
+          hasVisibleSegments(message, isTranscriptBlockVisible),
       },
     ).filter(isItemVisible);
   });

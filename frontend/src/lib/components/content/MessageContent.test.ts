@@ -30,10 +30,18 @@ vi.mock("../../stores/messages.svelte.js", () => ({
   },
 }));
 
+const uiState = vi.hoisted(() => {
+  const hidden = new Set<string>();
+  return {
+    hidden,
+    isBlockVisible: (type: string) => !hidden.has(type),
+    hideBlock: (type: string) => hidden.add(type),
+    showAllBlocks: () => hidden.clear(),
+  };
+});
+
 vi.mock("../../stores/ui.svelte.js", () => ({
-  ui: {
-    isBlockVisible: () => true,
-  },
+  ui: uiState,
 }));
 
 vi.mock("../../stores/pins.svelte.js", () => ({
@@ -155,10 +163,12 @@ afterEach(() => {
   sessionsState.activeSession = null;
   syncState.readOnly = false;
   runtimeState.isRemote = false;
+  uiState.showAllBlocks();
 });
 
 beforeEach(() => {
   forkSessionMock.mockReset();
+  uiState.showAllBlocks();
 });
 
 describe("MessageContent", () => {
@@ -763,6 +773,7 @@ Batch D (browser/picker/tabs/media-monitor) is done...
   });
 
   it("renders mermaid source as a code block when search is active", async () => {
+    uiState.hideBlock("code");
     const content = [
       "Mermaid diagram:",
       "",
@@ -789,6 +800,213 @@ Batch D (browser/picker/tabs/media-monitor) is done...
     expect(initMermaidRenderingMock).not.toHaveBeenCalled();
     expect(document.querySelector(".code-content")?.textContent).toContain("A-->SearchTarget");
     expect(document.querySelector(".code-lang")?.textContent).toBe("mermaid");
+
+    unmount(component);
+  });
+});
+
+describe("MessageContent filtered code fences", () => {
+  function renderFilteredMessage(content: string, props: Record<string, unknown> = {}) {
+    return mount(MessageContent, {
+      target: document.body,
+      props: {
+        message: makeMessage({
+          id: 9400,
+          content,
+          content_length: content.length,
+        }),
+        ...props,
+      },
+    });
+  }
+
+  function normalizedText(node: Element | null | undefined): string {
+    return node?.textContent?.replace(/\s+/g, " ").trim() ?? "";
+  }
+
+  it("renders an inline collapsed placeholder and preserves prose order", async () => {
+    uiState.hideBlock("code");
+    const content = [
+      "Before the fence.",
+      "",
+      "```latex",
+      "\\subsection{Deployment Considerations}",
+      "\\label{subsec:deployment}",
+      "```",
+      "",
+      "After the fence.",
+    ].join("\n");
+
+    const component = renderFilteredMessage(content);
+    await tick();
+
+    const block = document.querySelector<HTMLElement>(".code-fence-block");
+    const toggle = block?.querySelector<HTMLButtonElement>(".code-fence-toggle");
+    expect(block).not.toBeNull();
+    expect(toggle).not.toBeNull();
+    expect(toggle!.getAttribute("aria-expanded")).toBe("false");
+    expect(normalizedText(toggle)).toBe("Code block collapsed · latex · Expand");
+    expect(block!.querySelector(".code-content")).toBeNull();
+
+    const sequence = Array.from(
+      document.querySelectorAll<HTMLElement>(
+        ".message-body > .text-content, .message-body > .code-fence-block",
+      ),
+    ).map((node) =>
+      node.classList.contains("code-fence-block") ? "code" : (node.textContent?.trim() ?? ""),
+    );
+    expect(sequence).toEqual(["Before the fence.", "code", "After the fence."]);
+
+    unmount(component);
+  });
+
+  it("omits the language from the placeholder when the fence has none", async () => {
+    uiState.hideBlock("code");
+    const content = ["```", "plain text", "```"].join("\n");
+
+    const component = renderFilteredMessage(content);
+    await tick();
+
+    const toggle = document.querySelector<HTMLButtonElement>(".code-fence-toggle");
+    expect(normalizedText(toggle)).toBe("Code block collapsed · Expand");
+    expect(normalizedText(toggle)).not.toContain("undefined");
+
+    unmount(component);
+  });
+
+  it("expands and collapses only the clicked fence", async () => {
+    uiState.hideBlock("code");
+    const content = [
+      "First:",
+      "",
+      "```latex",
+      "\\alpha",
+      "```",
+      "",
+      "Middle",
+      "",
+      "```python",
+      "print('x')",
+      "```",
+      "",
+      "Last",
+    ].join("\n");
+
+    const component = renderFilteredMessage(content);
+    await tick();
+
+    let blocks = document.querySelectorAll<HTMLElement>(".code-fence-block");
+    expect(blocks).toHaveLength(2);
+
+    blocks[0]!.querySelector<HTMLButtonElement>(".code-fence-toggle")!.click();
+    await tick();
+
+    blocks = document.querySelectorAll<HTMLElement>(".code-fence-block");
+    expect(blocks[0]!.querySelector(".code-content")?.textContent).toContain("\\alpha");
+    expect(normalizedText(blocks[0]!.querySelector(".code-fence-toggle"))).toContain("Collapse");
+    expect(blocks[0]!.querySelector(".code-fence-toggle")?.getAttribute("aria-expanded")).toBe(
+      "true",
+    );
+    expect(blocks[1]!.querySelector(".code-content")).toBeNull();
+
+    blocks[1]!.querySelector<HTMLButtonElement>(".code-fence-toggle")!.click();
+    await tick();
+
+    blocks = document.querySelectorAll<HTMLElement>(".code-fence-block");
+    expect(blocks[1]!.querySelector(".code-content")?.textContent).toContain("print('x')");
+    expect(blocks[0]!.querySelector(".code-content")?.textContent).toContain("\\alpha");
+
+    blocks[0]!.querySelector<HTMLButtonElement>(".code-fence-toggle")!.click();
+    await tick();
+
+    blocks = document.querySelectorAll<HTMLElement>(".code-fence-block");
+    expect(blocks[0]!.querySelector(".code-content")).toBeNull();
+    expect(blocks[1]!.querySelector(".code-content")?.textContent).toContain("print('x')");
+
+    unmount(component);
+  });
+
+  it("localizes the collapsed placeholder in Simplified Chinese", async () => {
+    setLocale("zh-CN");
+    uiState.hideBlock("code");
+    const content = ["```latex", "\\subsection{Deployment Considerations}", "```"].join("\n");
+
+    const component = renderFilteredMessage(content);
+    await tick();
+
+    const toggle = document.querySelector<HTMLButtonElement>(".code-fence-toggle");
+    expect(normalizedText(toggle)).toBe("代码块已折叠 · latex · 展开");
+
+    unmount(component);
+  });
+
+  it("reveals a filtered fence directly during in-session search", async () => {
+    uiState.hideBlock("code");
+    const content = [
+      "Before the fence.",
+      "",
+      "```latex",
+      "\\subsection{Deployment Considerations}",
+      "```",
+      "",
+      "After the fence.",
+    ].join("\n");
+
+    const component = renderFilteredMessage(content, {
+      highlightQuery: "Deployment",
+      isCurrentHighlight: true,
+    });
+    await tick();
+
+    expect(document.querySelector(".code-fence-toggle")).toBeNull();
+    expect(document.querySelector(".code-content")?.textContent).toContain(
+      "\\subsection{Deployment Considerations}",
+    );
+
+    unmount(component);
+  });
+
+  it("routes an expanded filtered mermaid fence through MermaidBlock", async () => {
+    uiState.hideBlock("code");
+    const content = ["Mermaid diagram:", "", "```mermaid", "graph TD", "A-->B", "```"].join("\n");
+
+    const component = renderFilteredMessage(content);
+    await tick();
+
+    const toggle = document.querySelector<HTMLButtonElement>(".code-fence-toggle");
+    expect(normalizedText(toggle)).toBe("Code block collapsed · mermaid · Expand");
+
+    toggle!.click();
+    await tick();
+    await tick();
+
+    expect(initMermaidRenderingMock).toHaveBeenCalledTimes(1);
+    expect(document.querySelector(".mermaid-block pre.mermaid")?.textContent).toContain("graph TD");
+    expect(document.querySelector(".code-content")).toBeNull();
+
+    unmount(component);
+  });
+
+  it("copies the raw fence source after expanding it from the placeholder", async () => {
+    uiState.hideBlock("code");
+    const code = "const answer = 42;\n";
+    const content = ["```ts", code.trimEnd(), "```"].join("\n");
+
+    const component = renderFilteredMessage(content);
+    await tick();
+
+    document.querySelector<HTMLButtonElement>(".code-fence-toggle")!.click();
+    await tick();
+
+    const copyButton = document.querySelector<HTMLButtonElement>(
+      'button.kit-copy-btn[aria-label="Copy code block"]',
+    );
+    expect(copyButton).not.toBeNull();
+    copyButton!.click();
+    await Promise.resolve();
+    await tick();
+
+    expect(copyToClipboardMock).toHaveBeenCalledWith(code);
 
     unmount(component);
   });
