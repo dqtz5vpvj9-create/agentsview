@@ -21,6 +21,7 @@
   let locations = $derived.by(() => {
     const ordered = newestFirst ? [...items].reverse() : items;
     const matches = inSessionSearch.matches;
+    const scope = inSessionSearch.scope;
     const total = totalSize;
     const renderUnknownXmlBlocksAsPreformatted = ui.renderUnknownXmlBlocksAsPreformatted;
     return untrack(() => overviewLocations(ordered.map((item, index) => {
@@ -28,7 +29,9 @@
       const end = index + 1 < ordered.length ? rowOffset(index + 1) : total;
       const messages = item.kind === "message" ? [item.message]
         : newestFirst ? [...item.messages].reverse() : item.messages;
-      return { offset, size: Math.max(1, end - offset), blocks: messages.flatMap((message) => collectSearchBlocks(message, { renderUnknownXmlBlocksAsPreformatted })) };
+      return { offset, size: Math.max(1, end - offset), blocks: messages.flatMap((message) =>
+        collectSearchBlocks(message, { renderUnknownXmlBlocksAsPreformatted })
+          .filter((block) => scope?.allowsBlock(message, block.kind))) };
     }), matches));
   });
 
