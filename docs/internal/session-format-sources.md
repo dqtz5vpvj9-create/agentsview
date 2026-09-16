@@ -1900,21 +1900,30 @@ schemas keep their existing ordering behavior.
 
 ## DeepSeek Harness (`deepseek-harness`)
 
-- **Format:** Agentsview reads version `0` session JSONL under
-  `<sessions-root>/<project>/<encoded-session-id>/session.jsonl`, or the
-  default checksummed multi-frame zstd encoding at `session.jsonl.zstd`. The
-  immutable header records session identity, cwd, creation time, seed lineage,
-  delegation origin, and agent preset. Event rows carry a contiguous `seq`;
-  runs of assistant deltas may use the `text-chunks`, `reasoning-chunks`, and
-  `tool-call-chunks` packed storage rows. Session IDs are arbitrary non-empty
-  strings and are injectively encoded before use as a directory name. A
-  sessions root belongs to one physical encoding; the upstream backend rejects
-  an opposite-suffix artifact rather than providing mixed-root fallback or
-  migration. `sourceEventSeqs` uses non-negative safe integers and inclusive
-  `[start, end]` ranges, mixed entry by entry: `[[138, 144]]` represents seven
-  sequences. This is intentional storage compression, introduced in upstream
-  commit
+- **Format:** Released session generations `0` through `3` are stored as JSONL
+  under `<sessions-root>/<project>/<encoded-session-id>/`. Generation zero uses
+  the suffix-only `session.jsonl` (or the default checksummed multi-frame zstd
+  encoding at `session.jsonl.zstd`); generation `N > 0` carries a lowercase
+  numeric component at `session.vN.jsonl[.zstd]`. One session directory can
+  retain several immutable generations; the numerically newest canonical
+  generation is current. The immutable header records session identity, cwd,
+  creation time, seed lineage, delegation origin, and agent preset. Event rows
+  carry a contiguous `seq`. Generations 0 and 1 may encode runs of assistant
+  deltas with the `text-chunks`, `reasoning-chunks`, and `tool-call-chunks`
+  packed storage rows, and their `sourceEventSeqs` uses non-negative safe
+  integers and inclusive `[start, end]` ranges, mixed entry by entry:
+  `[[138, 144]]` represents seven sequences. This provenance compression was
+  introduced in upstream commit
   [df76bc6](https://github.com/deepseek-ai/deepseek-harness/commit/df76bc695b4bdff093369ab22a506cd37ca087c1).
+  Generation 2 embeds the timed assistant stream in `assistant/message` and
+  records settled non-surface attempts as `assistant/attempt`; generation 3
+  additionally promotes the system prompt to a `system/message` surface event,
+  renames the PTC dispatch tags to `tool/ptc-dispatch[-start]`, and spells
+  replacement coordinates as `startSeq`/`endSeq`. Session IDs are arbitrary
+  non-empty strings and are injectively encoded before use as a directory name.
+  A sessions root belongs to one physical encoding; the upstream backend
+  rejects an opposite-suffix artifact rather than providing mixed-root fallback
+  or migration.
 
 - **Evidence:** `source`.
 
@@ -1962,36 +1971,41 @@ schemas keep their existing ordering behavior.
 
 - **Agentsview:** `internal/parser/deepseek_harness.go`,
   `internal/parser/deepseek_harness_format.go`, and
-  `internal/parser/deepseek_harness_provider.go`. Only events at or after a
-  child's `seedLength` contribute transcript rows and usage, while the full
-  log remains available to validate event and turn/step structure and fold the
-  latest title and agent preset. Surface replacements are excluded from the
-  human transcript, and a chunk-only live response is positioned from its
-  first assistant chunk and reconstructed until a final assistant message
-  replaces it on the next authoritative parse. Agentsview reversibly escapes
-  `%` and the reserved remote-host separator `~` in canonical session IDs.
-  Explicit raw-ID lookups remain literal; canonical escaping is decoded only
-  when lookup starts from a full session ID. Per-response usage events are the
-  sole analytics rows, while messages retain explicit context/output token
+  `internal/parser/deepseek_harness_provider.go`. Released generations 0 through
+  3 are accepted, and discovery prefers the newest canonical generation in a
+  session directory. Only events at or after a child's inherited cut contribute
+  transcript rows and usage, while the full log validates event and turn/step
+  structure and folds the latest title and agent preset. Surface replacements
+  are excluded from the human transcript; a chunk-only generation-0 or
+  generation-1 live response is positioned from its first assistant chunk and
+  reconstructed until a final assistant message replaces it on the next
+  authoritative parse. Generation-2 and later messages read embedded stream
+  usage and finish reasons when the outer data omits them, and generation-3
+  system messages join the transcript as system rows. Agentsview reversibly
+  escapes `%` and the reserved remote-host separator `~` in canonical session
+  IDs. Explicit raw-ID lookups remain literal; canonical escaping is decoded
+  only when lookup starts from a full session ID. Per-response usage events are
+  the sole analytics rows, while messages retain explicit context/output token
   fields without duplicating the raw Harness usage blob into `token_usage`.
   Plain and zstd artifacts in one session directory are treated as one logical
-  source and rejected while both exist; a change maps directly to the
-  surviving sibling once that conflict is removed. The optional Harness SQLite
-  persistence backend is not supported. The updated inventory accepts all
-  released version-0 event names, including `model/selection`, delivery
-  tracking, subagent model policy, and team events. These metadata events do
-  not add transcript rows; model-selection reasoning effort is not imported.
+  source and rejected while both exist; a change maps directly to the surviving
+  sibling once that conflict is removed. The version-0 inventory accepts all
+  released event names, including `model/selection`, delivery tracking, subagent
+  model policy, and team events; those metadata events do not add transcript
+  rows. The version-0 provenance validator accepts mixed safe-integer and
+  inclusive-range entries without allocating an expanded list. Model-selection
+  reasoning effort is not imported. The optional Harness SQLite persistence
+  backend is not supported.
 
-- **Later formats:** The reverified upstream
-  [session schema](https://github.com/deepseek-ai/deepseek-harness/blob/56c4c3e47c195ff5edbfe3d307bdef81f3de348b/packages/core/session/src/types.ts)
-  is version `3`. Agentsview still rejects versions `1` through `3` and does
-  not run upstream's migrations. The current
-  [generated event inventory](https://github.com/deepseek-ai/deepseek-harness/blob/56c4c3e47c195ff5edbfe3d307bdef81f3de348b/packages/core/session/src/known-event-types.ts)
-  includes later events such as `assistant/attempt`, `system/message`, and
-  `tool/ptc-dispatch*`; these do not belong to the frozen version-0 inventory.
-  Version-3 system messages and `startSeq`/`endSeq` surface replacements need
-  a separate format update. Accepting compressed provenance and version-0
-  metadata does not add support for later session formats.
+- **Later formats:** Agentsview reads the on-disk generations directly and does
+  not run upstream's v0-to-v3 migrations. Generation-1 rows keep the version-0
+  packed assistant chunks. Generation-2 rows carry the embedded assistant
+  stream and `assistant/attempt`; Agentsview imports final stream usage and
+  finish reasons but does not reconstruct an assistant message from a failed
+  attempt that produced none. Generation-2 request-header `system` prompts are
+  not imported as transcript rows. Generation-3 seeded sessions use the last
+  `session/end-seed {inherited:true}` marker as the inherited cut, and
+  replacement coordinates use `startSeq`/`endSeq`.
 
 ## OpenClaw (`openclaw`)
 
