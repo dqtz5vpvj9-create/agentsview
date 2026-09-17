@@ -111,6 +111,18 @@ func deepSeekHarnessPathVersion(path string) (int64, bool) {
 	return version, true
 }
 
+// isSupportedDeepSeekHarnessFormatVersion keeps discovery inside the released
+// generations this build reads. A newer harness writes its own generation
+// alongside the ones already in a session directory, and every released bump so
+// far renamed required events or renumbered sequences, so an unread generation
+// cannot stand in for a supported one. Discovery ignores it and keeps reporting
+// the newest generation it can actually parse; an explicitly targeted log still
+// fails with the header's unsupported-version error.
+func isSupportedDeepSeekHarnessFormatVersion(version int64) bool {
+	return version >= deepSeekHarnessOldestFormatVersion &&
+		version <= deepSeekHarnessNewestFormatVersion
+}
+
 func deepSeekHarnessPathParts(root, path string) (
 	project, encodedID string, version int64, ok bool,
 ) {
@@ -124,7 +136,7 @@ func deepSeekHarnessPathParts(root, path string) (
 		return "", "", 0, false
 	}
 	version, ok = deepSeekHarnessPathVersion(parts[2])
-	if !ok {
+	if !ok || !isSupportedDeepSeekHarnessFormatVersion(version) {
 		return "", "", 0, false
 	}
 	if parts[0] != "_no-cwd" &&
@@ -160,7 +172,7 @@ func isPreferredDeepSeekHarnessSourcePath(root, path string) bool {
 				continue
 			}
 			siblingVersion, siblingOK := deepSeekHarnessPathVersion(entry.Name())
-			if !siblingOK {
+			if !siblingOK || !isSupportedDeepSeekHarnessFormatVersion(siblingVersion) {
 				continue
 			}
 			if siblingVersion > highest {

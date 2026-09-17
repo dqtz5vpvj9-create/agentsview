@@ -1551,6 +1551,52 @@ func TestDeepSeekHarnessProviderPrefersNewestGeneration(t *testing.T) {
 	assert.NotEqual(t, v0Path, discovered[0].DisplayPath)
 }
 
+func TestDeepSeekHarnessProviderIgnoresUnsupportedGeneration(t *testing.T) {
+	root := t.TempDir()
+	v3Path := writeDeepSeekHarnessVersionedFixture(
+		t, root, "future-gen", deepSeekHarnessFixtureCwd, "zstd", 3,
+		deepSeekHarnessV3Fixture("future-gen"),
+	)
+	futureRecords := deepSeekHarnessV3Fixture("future-gen")
+	futureHeader, ok := futureRecords[0].(map[string]any)
+	require.True(t, ok)
+	futureHeader["version"] = deepSeekHarnessNewestFormatVersion + 1
+	writeDeepSeekHarnessVersionedFixture(
+		t, root, "future-gen", deepSeekHarnessFixtureCwd, "zstd",
+		deepSeekHarnessNewestFormatVersion+1, futureRecords,
+	)
+	provider, ok := NewProvider(
+		AgentDeepSeekHarness,
+		ProviderConfig{Roots: []string{root}},
+	)
+	require.True(t, ok)
+
+	discovered, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, discovered, 1)
+	assert.Equal(t, v3Path, discovered[0].DisplayPath)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: discovered[0]})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	assert.Equal(t, "3", outcome.Results[0].Result.Session.SourceVersion)
+}
+
+func TestDeepSeekHarnessRejectsUnsupportedGenerationByPath(t *testing.T) {
+	records := deepSeekHarnessV3Fixture("future-only")
+	header, ok := records[0].(map[string]any)
+	require.True(t, ok)
+	header["version"] = deepSeekHarnessNewestFormatVersion + 1
+	path := writeDeepSeekHarnessVersionedFixture(
+		t, t.TempDir(), "future-only", deepSeekHarnessFixtureCwd, "plain",
+		deepSeekHarnessNewestFormatVersion+1, records,
+	)
+
+	_, err := parseDeepSeekHarnessSession(t.Context(), path, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported DeepSeek Harness session format version")
+}
+
 func TestDeepSeekHarnessV3AllowsLegacyTurnRestart(t *testing.T) {
 	records := []any{
 		deepSeekHarnessV3Header("v3-restart", deepSeekHarnessFixtureCwd),
