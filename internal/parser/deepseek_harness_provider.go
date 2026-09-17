@@ -140,11 +140,6 @@ func deepSeekHarnessPathParts(root, path string) (
 	return parts[0], parts[1], version, true
 }
 
-func isDeepSeekHarnessSourcePath(root, path string) bool {
-	_, _, _, ok := deepSeekHarnessPathParts(root, path)
-	return ok
-}
-
 // isPreferredDeepSeekHarnessSourcePath keeps discovery deterministic when one
 // session directory retains multiple immutable generations or both physical
 // encodings. The numerically newest canonical generation wins; within that
