@@ -1,0 +1,172 @@
+import { expect, test, type Page } from "@playwright/test";
+import { SessionsPage } from "./pages/sessions-page";
+import { waitForStableValue } from "./helpers/virtual-list-helpers";
+
+const SESSION = "test-session-xlarge-5500";
+
+function message(ordinal: number, content = `Message ${ordinal}`) {
+  return {
+    id: ordinal + 1, session_id: SESSION, ordinal,
+    role: ordinal % 2 === 0 ? "user" : "assistant",
+    content, content_length: content.length,
+    timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, ordinal)).toISOString(),
+    has_thinking: false, thinking_text: "", has_tool_use: false,
+    model: "", token_usage: null, context_tokens: 0, output_tokens: 0,
+    has_context_tokens: false, has_output_tokens: false,
+    tool_calls: [], is_system: false,
+  };
+}
+
+type LiveWindow = Window & {
+  __liveUpdate?: () => number;
+  __layoutSamples?: { frames: number; maxGap: number; stop: () => void };
+};
+
+async function fixture(page: Page, newestFirst: boolean) {
+  let transcript = Array.from({ length: 80 }, (_, i) => message(i));
+  await page.addInitScript(({ session }) => {
+    const Native = window.EventSource;
+    const sources: EventSource[] = [];
+    window.EventSource = class extends Native {
+      constructor(url: string | URL, options?: EventSourceInit) {
+        super(url, options);
+        if (String(url).includes(`/sessions/${session}/watch`)) sources.push(this);
+      }
+    };
+    (window as LiveWindow).__liveUpdate = () => {
+      const active = sources.filter((source) => source.readyState !== Native.CLOSED);
+      for (const source of active) {
+        source.dispatchEvent(new MessageEvent("session_updated", { data: "{}" }));
+      }
+      return active.length;
+    };
+  }, { session: SESSION });
+
+  await page.route(`**/api/v1/sessions/${SESSION}`, async (route) => {
+    const response = await route.fetch();
+    await route.fulfill({ json: { ...await response.json(), message_count: transcript.length } });
+  });
+  await page.route(`**/api/v1/sessions/${SESSION}/messages*`, async (route) => {
+    const url = new URL(route.request().url());
+    const desc = url.searchParams.get("direction") === "desc";
+    const from = Number(url.searchParams.get("from") ?? (desc ? transcript.length - 1 : 0));
+    const limit = Number(url.searchParams.get("limit") ?? 1000);
+    const selected = transcript.filter((item) => desc ? item.ordinal <= from : item.ordinal >= from);
+    if (desc) selected.reverse();
+    await route.fulfill({ json: { messages: selected.slice(0, limit), count: transcript.length } });
+  });
+  const sp = new SessionsPage(page);
+  await sp.goto();
+  await sp.selectFirstSession();
+  if (newestFirst) await sp.toggleSortOrder();
+  await expect(sp.scroller).toHaveAttribute("data-loaded", "true");
+
+  async function refresh(next: typeof transcript) {
+    transcript = next;
+    const response = page.waitForResponse((r) => r.url().includes(`/sessions/${SESSION}/messages`));
+    const listeners = await page.evaluate(() => (window as LiveWindow).__liveUpdate?.() ?? 0);
+    expect(listeners).toBeGreaterThan(0);
+    await (await response).finished();
+  }
+  return { sp, refresh, data: () => transcript };
+}
+
+async function sampleGeometry(page: Page) {
+  await page.evaluate(() => {
+    const state = { frames: 0, maxGap: 0, stop: () => {} };
+    let running = true;
+    let frame = 0;
+    const sample = () => {
+      if (!running) return;
+      const rows = [...document.querySelectorAll<HTMLElement>(".message-list-scroll .virtual-row")];
+      for (let i = 1; i < rows.length; i++) {
+        const before = rows[i - 1]!.getBoundingClientRect();
+        const after = rows[i]!.getBoundingClientRect();
+        state.maxGap = Math.max(state.maxGap, Math.abs(after.top - before.bottom));
+      }
+      state.frames++;
+      frame = requestAnimationFrame(sample);
+    };
+    state.stop = () => { running = false; cancelAnimationFrame(frame); };
+    (window as LiveWindow).__layoutSamples = state;
+    frame = requestAnimationFrame(sample);
+  });
+}
+
+async function finishGeometry(page: Page) {
+  const samples = await page.evaluate(() => {
+    const sample = (window as LiveWindow).__layoutSamples!;
+    sample.stop();
+    return { frames: sample.frames, maxGap: sample.maxGap };
+  });
+  expect(samples.frames).toBeGreaterThan(0);
+  expect(samples.maxGap).toBeLessThanOrEqual(1);
+}
+
+for (const newestFirst of [false, true]) {
+  const order = newestFirst ? "newest-first" : "oldest-first";
+  test(`${order}: a stationary reader keeps the same message during live refresh`, async ({ page }) => {
+    const errors: string[] = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    const { sp, refresh, data } = await fixture(page, newestFirst);
+    await sp.scroller.evaluate((el) => { el.scrollTop = el.scrollHeight / 2; });
+    await waitForStableValue(() => sp.scroller.evaluate((el) => el.scrollTop), 500);
+    const anchor = await sp.scroller.evaluate((el) => {
+      const top = el.getBoundingClientRect().top;
+      const rows = [...el.querySelectorAll<HTMLElement>(".virtual-row")];
+      const row = rows.find((item) => item.getBoundingClientRect().bottom > top)!;
+      return {
+        key: row.dataset.messageKey!, top: row.getBoundingClientRect().top - top,
+        aboveKey: rows[0]!.dataset.messageKey!,
+      };
+    });
+    const anchorOrdinal = Number(anchor.key.split("-m-").at(-1));
+    const aboveOrdinal = Number(anchor.aboveKey.split("-m-").at(-1));
+    expect(aboveOrdinal).not.toBe(anchorOrdinal);
+    const anchorRow = sp.scroller.locator(`[data-message-key="${anchor.key}"]`);
+    await sampleGeometry(page);
+    for (let revision = 1; revision <= 6; revision++) {
+      const marker = `Live revision ${revision}`;
+      const next = data().map((item) => {
+        if (item.ordinal === anchorOrdinal) return message(item.ordinal, marker);
+        if (item.ordinal === aboveOrdinal) {
+          return message(item.ordinal, revision % 2 ? "A changing paragraph.\n\n".repeat(12) : "Short content.");
+        }
+        return item;
+      });
+      // Exercise same-count content updates first, then inserts at the latest edge.
+      if (revision > 3) next.push(message(next.length));
+      await refresh(next);
+      await expect(anchorRow).toContainText(marker);
+      await expect.poll(() => anchorRow.evaluate((row, expected) => {
+        const scroller = row.closest(".message-list-scroll")!;
+        return Math.abs(row.getBoundingClientRect().top - scroller.getBoundingClientRect().top - expected);
+      }, anchor.top)).toBeLessThanOrEqual(1);
+    }
+    await finishGeometry(page);
+    expect(errors).toEqual([]);
+  });
+
+  test(`${order}: follow latest survives streaming growth and stops on manual intent`, async ({ page }) => {
+    const { sp, refresh, data } = await fixture(page, newestFirst);
+    const follow = page.getByLabel("Follow latest messages");
+    await follow.click();
+    await expect(follow).toHaveAttribute("aria-pressed", "true");
+    await sampleGeometry(page);
+    for (let revision = 1; revision <= 4; revision++) {
+      const marker = `Streaming revision ${revision}`;
+      const next = [...data()];
+      const ordinal = next.length - 1;
+      next[ordinal] = message(ordinal, `${marker}\n\n${"More response text.\n\n".repeat(revision * 8)}`);
+      await refresh(next);
+      await expect(sp.scroller).toContainText(marker);
+      await expect.poll(() => sp.scroller.evaluate((el, reversed) => reversed
+        ? el.scrollTop : el.scrollHeight - el.clientHeight - el.scrollTop, newestFirst))
+        .toBeLessThanOrEqual(8);
+    }
+    await finishGeometry(page);
+    await sp.scroller.hover();
+    await page.mouse.wheel(0, newestFirst ? 600 : -600);
+    await expect(follow).toHaveAttribute("aria-pressed", "false");
+  });
+}
