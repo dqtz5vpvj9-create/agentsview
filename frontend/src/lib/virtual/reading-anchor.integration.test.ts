@@ -26,6 +26,7 @@ describe("reading preservation without implicit latest following", () => {
     document.body.append(el);
     el.scrollTop = top;
     let core: Core | undefined;
+    const scrollWrites: number[] = [];
     let reportOffset: ((offset: number, scrolling: boolean) => void) | undefined;
     Object.defineProperties(el, {
       clientHeight: { value: viewport },
@@ -53,6 +54,7 @@ describe("reading preservation without implicit latest following", () => {
           return () => { reportOffset = undefined; };
         },
         scrollToFn: (offset, { adjustments = 0 }) => {
+          scrollWrites.push(offset + adjustments);
           el.scrollTop = Math.max(0, Math.min(offset + adjustments, el.scrollHeight - viewport));
           reportOffset?.(el.scrollTop, false);
         },
@@ -70,8 +72,40 @@ describe("reading preservation without implicit latest following", () => {
     const v = component.getVirtualizer().instance as Core;
     for (let index = 0; index < 4; index++) v.resizeItem(index, 100);
     await tick();
-    return { el, v, options };
+    return { el, v, options, scrollWrites };
   }
+
+  it.each([0, 150.25, 300])("tail appends at offset %s never write the scroll position", async (top) => {
+    const { el, v, options, scrollWrites } = await setup(top);
+    v.resizeItem(0, 112.5);
+    v.resizeItem(2, 135.25);
+    await tick();
+    v.getTotalSize();
+    const original = v.measurementsCache.map(({ key, start, size }) => ({ key, start, size }));
+    const scrollTop = el.scrollTop;
+    scrollWrites.length = 0;
+    let keys = ["a", "b", "c", "d"];
+    for (const batch of [1, 3, 8]) {
+      const height = v.getTotalSize();
+      const added = Array.from({ length: batch }, (_, i) => `new-${keys.length + i}`);
+      keys = [...keys, ...added];
+      component!.setOptions(options(keys));
+      await tick();
+      expect(v.getTotalSize()).toBe(height + batch * 100);
+      expect(v.measurementsCache.slice(0, original.length)
+        .map(({ key, start, size }) => ({ key, start, size }))).toEqual(original);
+      expect(el.scrollTop).toBe(scrollTop);
+      expect(v.scrollOffset).toBe(scrollTop);
+      expect(scrollWrites).toEqual([]);
+      // Discovering a taller appended row changes only the extent below us.
+      v.resizeItem(keys.length - 1, 180);
+      await tick();
+      expect(v.getTotalSize()).toBe(height + batch * 100 + 80);
+      expect(el.scrollTop).toBe(scrollTop);
+      expect(v.scrollOffset).toBe(scrollTop);
+      expect(scrollWrites).toEqual([]);
+    }
+  });
 
   it("preserves b at +50 through an interior swap with unchanged edge keys", async () => {
     const { el, v, options } = await setup();

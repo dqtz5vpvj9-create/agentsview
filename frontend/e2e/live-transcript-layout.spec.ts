@@ -35,6 +35,11 @@ type LayoutSamples = {
   maxUncovered: number;
   maxAnchorDrift: number;
   missingAnchorFrames: number;
+  stationaryRows: number;
+  maxViewportDrift: number;
+  maxScrollDrift: number;
+  changedReadingRows: number;
+  missingReadingRows: number;
   stop: () => void;
 };
 type LiveWindow = Window & {
@@ -127,12 +132,31 @@ async function fixture(page: Page, newestFirst: boolean) {
   return { sp, refresh, data: () => transcript };
 }
 
-async function sampleGeometry(page: Page, anchor?: ReadingPosition) {
-  await page.evaluate((reading) => {
+async function sampleGeometry(page: Page, anchor?: ReadingPosition, freezeViewport = false) {
+  await page.evaluate(({ reading, freezeViewport }) => {
     const state: LayoutSamples = {
       frames: 0, minRows: Infinity, maxGap: 0, maxUncovered: 0,
-      maxAnchorDrift: 0, missingAnchorFrames: 0, stop: () => {},
+      maxAnchorDrift: 0, missingAnchorFrames: 0, stationaryRows: 0,
+      maxViewportDrift: 0, maxScrollDrift: 0, changedReadingRows: 0,
+      missingReadingRows: 0, stop: () => {},
     };
+    const initialScroller = document.querySelector<HTMLElement>(".message-list-scroll");
+    const initialTop = initialScroller?.scrollTop ?? 0;
+    const viewport = initialScroller?.getBoundingClientRect();
+    // Pin EVERY initially visible row, including partially visible rows. Keep
+    // actual node references so a remount cannot pass by recreating the same key.
+    const pinned = freezeViewport && initialScroller && viewport
+      ? [...initialScroller.querySelectorAll<HTMLElement>(".virtual-row")]
+        .filter((node) => {
+          const rect = node.getBoundingClientRect();
+          return rect.bottom > viewport.top && rect.top < viewport.bottom;
+        })
+        .map((node) => ({
+          node, key: node.dataset.messageKey, text: node.textContent,
+          rect: node.getBoundingClientRect(),
+        }))
+      : [];
+    state.stationaryRows = pinned.length;
     let running = true;
     let frame = 0;
     const sample = () => {
@@ -140,6 +164,24 @@ async function sampleGeometry(page: Page, anchor?: ReadingPosition) {
       const el = document.querySelector<HTMLElement>(".message-list-scroll");
       const rows = el ? [...el.querySelectorAll<HTMLElement>(".virtual-row")] : [];
       state.minRows = Math.min(state.minRows, rows.length);
+      if (freezeViewport && el) {
+        state.maxScrollDrift = Math.max(state.maxScrollDrift, Math.abs(el.scrollTop - initialTop));
+        for (const before of pinned) {
+          if (!before.node.isConnected || !rows.includes(before.node)) {
+            state.missingReadingRows++;
+            continue;
+          }
+          if (before.node.dataset.messageKey !== before.key || before.node.textContent !== before.text) {
+            state.changedReadingRows++;
+          }
+          const rect = before.node.getBoundingClientRect();
+          // Absolute viewport coordinates: a common translation or a width
+          // change must fail even if all rows remain adjacent to one another.
+          state.maxViewportDrift = Math.max(state.maxViewportDrift,
+            Math.abs(rect.top - before.rect.top), Math.abs(rect.bottom - before.rect.bottom),
+            Math.abs(rect.left - before.rect.left), Math.abs(rect.right - before.rect.right));
+        }
+      }
       for (let i = 1; i < rows.length; i++) {
         const before = rows[i - 1]!.getBoundingClientRect();
         const after = rows[i]!.getBoundingClientRect();
@@ -179,7 +221,7 @@ async function sampleGeometry(page: Page, anchor?: ReadingPosition) {
     };
     (window as LiveWindow).__layoutSamples = state;
     frame = requestAnimationFrame(sample);
-  }, anchor);
+  }, { reading: anchor, freezeViewport });
 }
 
 async function finishGeometry(page: Page) {
@@ -200,11 +242,47 @@ async function finishGeometry(page: Page) {
   expect(samples.maxUncovered).toBeLessThanOrEqual(1);
   expect(samples.missingAnchorFrames).toBe(0);
   expect(samples.maxAnchorDrift).toBeLessThanOrEqual(1);
+  return samples;
 }
 
 for (const newestFirst of [false, true]) {
   for (const zoom of [80, 100, 125]) {
     const order = `${newestFirst ? "newest-first" : "oldest-first"} at ${zoom}%`;
+    test(`${order}: pure append grows the extent without moving any visible content`, async ({ page }) => {
+      const errors: string[] = [];
+      page.on("pageerror", (error) => errors.push(error.message));
+      await page.addInitScript(
+        (value) => localStorage.setItem("agentsview-zoom-level", String(value)), zoom,
+      );
+      const { sp, refresh, data } = await fixture(page, newestFirst);
+      const follow = page.getByLabel("Follow latest messages");
+      await expect(follow).toHaveAttribute("aria-pressed", "false");
+      await sp.scroller.evaluate((el) => { el.scrollTop = el.scrollHeight / 2; });
+      await waitForStableValue(() => sp.scroller.evaluate((el) => el.scrollTop), 500);
+      await sampleGeometry(page, undefined, true);
+      for (const batch of [1, 2, 7, 25, 80]) {
+        const previous = data();
+        const height = await sp.scroller.evaluate((el) => el.scrollHeight);
+        const added = Array.from({ length: batch }, (_, i) => message(
+          previous.length + i, "Appended paragraph.\n\n".repeat(i % 5 + 1),
+        ));
+        // Preserve all historical content. The ongoing animation sampler must
+        // remain clean throughout delivery, re-render, and size discovery.
+        await refresh([...previous, ...added]);
+        await expect.poll(() => sp.scroller.evaluate((el) => el.scrollHeight)).toBeGreaterThan(height);
+        await expect(follow).toHaveAttribute("aria-pressed", "false");
+      }
+      const samples = await finishGeometry(page);
+      expect(samples.stationaryRows).toBeGreaterThan(1);
+      expect(samples.missingReadingRows).toBe(0);
+      expect(samples.changedReadingRows).toBe(0);
+      expect(samples.maxViewportDrift).toBe(0);
+      // Reversed display prepends in layout space. It may change scrollTop to
+      // keep identical viewport coordinates; a forward tail append must not.
+      if (!newestFirst) expect(samples.maxScrollDrift).toBe(0);
+      expect(errors).toEqual([]);
+    });
+
     test(`${order}: a stationary reader keeps the same message during live refresh`, async ({
       page,
     }) => {

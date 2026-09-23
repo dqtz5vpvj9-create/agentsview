@@ -10,7 +10,7 @@ export interface ReadingAnchor<Key> {
 }
 
 /**
- * undefined: the order is unchanged; leave scrolling alone.
+ * undefined: the existing prefix is unchanged; leave scrolling alone on append.
  * null: no previous row survives; start the replacement at the beginning.
  * Otherwise preserve a retained row's position, including interior reorders.
  */
@@ -19,8 +19,13 @@ export function captureReadingAnchor<Key>(
   nextKeys: readonly Key[],
   scrollOffset: number,
 ): ReadingAnchor<Key> | null | undefined {
+  // A tail append cannot move any existing row's start. Do not queue a
+  // scroll write, even to the same offset: only the total extent must grow.
+  // A logical append in newest-first order is a prepend and still needs
+  // same-frame reading-position compensation through the path below.
   if (
-    previous.length === nextKeys.length &&
+    previous.length <= nextKeys.length &&
+    (previous.length > 0 || nextKeys.length === 0) &&
     previous.every((row, index) => row.key === nextKeys[index])
   ) return undefined;
   if (previous.length === 0 || nextKeys.length === 0) return null;

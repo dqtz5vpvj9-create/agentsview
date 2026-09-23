@@ -11,6 +11,25 @@ function layout(keys: readonly string[], heights: Record<string, number> = {}) {
 }
 
 describe("reading anchors", () => {
+  it("leaves every existing reading position untouched on a tail append", () => {
+    const rows = layout(["a", "b", "c"], { a: 112.5, b: 135.25, c: 100.5 });
+    for (const next of [["a", "b", "c", "d"], ["a", "b", "c", "d", "e", "f"]]) {
+      for (const top of [0, 50.25, 112.5, 150, 300.25]) {
+        expect(captureReadingAnchor(rows, next, top)).toBeUndefined();
+      }
+    }
+  });
+
+  it("still compensates a logical append displayed in newest-first order", () => {
+    const anchor = captureReadingAnchor(layout(["c", "b", "a"]), ["d", "c", "b", "a"], 150);
+    expect(anchor).toEqual({ key: "b", offset: 50 });
+    expect(resolveReadingAnchor(anchor!, layout(["d", "c", "b", "a"]))).toBe(250);
+  });
+
+  it("preserves the empty-list initialization contract", () => {
+    expect(captureReadingAnchor([], [], 0)).toBeUndefined();
+    expect(captureReadingAnchor([], ["a"], 0)).toBeNull();
+  });
   it("preserves an interior swap whose count and edge keys are unchanged", () => {
     const before = layout(["a", "b", "c", "d"]);
     const after = layout(["a", "c", "b", "d"]);
