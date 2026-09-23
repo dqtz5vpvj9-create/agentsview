@@ -1,3 +1,4 @@
+import { tick } from "svelte";
 import type { Virtualizer } from "@tanstack/virtual-core";
 
 interface RowMeasurement {
@@ -5,17 +6,29 @@ interface RowMeasurement {
   index: number;
 }
 
-/** Keep the element's index current before handing it to the core observer. */
+/** Register a row only after Svelte has committed its attributes and children. */
 export function measureRow(node: HTMLElement, options: RowMeasurement) {
+  let revision = 0;
+  let destroyed = false;
   function update(next: RowMeasurement) {
-    // Svelte can run an action update before the sibling attribute update.
-    // Reading an old data-index after a prepend associates the retained node
-    // with another key and can unobserve its neighbour permanently.
-    if (node.dataset.index !== String(next.index)) node.dataset.index = String(next.index);
-    next.virtualizer?.measureElement(node);
+    const current = ++revision;
+    void tick().then(() => {
+      if (destroyed || current !== revision || !node.isConnected) return;
+      // Legacy action updates can precede sibling attributes and content.
+      // Wait for that render, and discard any superseded index before the core
+      // associates this retained node with a key or reads its current height.
+      if (node.dataset.index !== String(next.index)) node.dataset.index = String(next.index);
+      next.virtualizer?.measureElement(node);
+    });
   }
   update(options);
-  return { update };
+  return {
+    update,
+    destroy() {
+      destroyed = true;
+      revision++;
+    },
+  };
 }
 
 /** Measure horizontal transcript rows in unscaled, fractional layout pixels. */

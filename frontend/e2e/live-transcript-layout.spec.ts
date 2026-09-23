@@ -29,6 +29,7 @@ function message(ordinal: number, content = `Message ${ordinal}`) {
 
 type LiveWindow = Window & {
   __liveUpdate?: () => number;
+  __liveStreamCount?: () => number;
   __layoutSamples?: { frames: number; maxGap: number; stop: () => void };
 };
 
@@ -36,20 +37,46 @@ async function fixture(page: Page, newestFirst: boolean) {
   let transcript = Array.from({ length: 80 }, (_, i) => message(i));
   await page.addInitScript(
     ({ session }) => {
-      const Native = window.EventSource;
-      const sources: EventSource[] = [];
-      window.EventSource = class extends Native {
-        constructor(url: string | URL, options?: EventSourceInit) {
-          super(url, options);
-          if (String(url).includes(`/sessions/${session}/watch`)) sources.push(this);
+      // The app imports the eventsource package, which reads a fetch stream.
+      // Deliver actual SSE bytes through that transport and its real parser.
+      const originalFetch = window.fetch.bind(window);
+      const streams = new Set<ReadableStreamDefaultController<Uint8Array>>();
+      window.fetch = async (input, init) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (!new URL(url, location.href).pathname.endsWith(`/sessions/${session}/watch`)) {
+          return originalFetch(input, init);
         }
+        const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+        let activeController: ReadableStreamDefaultController<Uint8Array>;
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            activeController = controller;
+            streams.add(controller);
+            const close = () => {
+              if (streams.delete(controller)) controller.close();
+            };
+            signal?.addEventListener("abort", close, { once: true });
+            if (signal?.aborted) close();
+          },
+          cancel() {
+            streams.delete(activeController);
+          },
+        });
+        return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
       };
+      (window as LiveWindow).__liveStreamCount = () => streams.size;
       (window as LiveWindow).__liveUpdate = () => {
-        const active = sources.filter((source) => source.readyState !== Native.CLOSED);
-        for (const source of active) {
-          source.dispatchEvent(new MessageEvent("session_updated", { data: "{}" }));
+        const event = new TextEncoder().encode("event: session_updated\ndata: {}\n\n");
+        let delivered = 0;
+        for (const stream of streams) {
+          try {
+            stream.enqueue(event);
+            delivered++;
+          } catch {
+            streams.delete(stream);
+          }
         }
-        return active.length;
+        return delivered;
       };
     },
     { session: SESSION },
@@ -75,6 +102,10 @@ async function fixture(page: Page, newestFirst: boolean) {
   await sp.selectFirstSession();
   if (newestFirst) await sp.toggleSortOrder();
   await expect(sp.scroller).toHaveAttribute("data-loaded", "true");
+  await expect(sp.scroller).toHaveAttribute("data-session-id", SESSION);
+  await expect
+    .poll(() => page.evaluate(() => (window as LiveWindow).__liveStreamCount?.() ?? 0))
+    .toBeGreaterThan(0);
 
   async function refresh(next: typeof transcript) {
     transcript = next;
