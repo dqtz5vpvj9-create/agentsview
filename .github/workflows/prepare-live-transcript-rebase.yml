@@ -5,7 +5,7 @@ on:
     branches: [automation/live-transcript-rebase-20260923]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   prepare:
@@ -27,13 +27,35 @@ jobs:
           test "$(git rev-parse upstream/main)" = 66dd6e5dc8fbb890d9eb21d64df952364abbd1c1
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git rebase --onto upstream/main 30cca8baa4955f36871a70ee6783ab16ff602986
+          if ! git rebase --onto upstream/main 30cca8baa4955f36871a70ee6783ab16ff602986; then
+            expected=$(printf '%s\n' frontend/src/lib/virtual/createVirtualizer.svelte.ts frontend/src/lib/virtual/createVirtualizer.test.ts)
+            test "$(git diff --name-only --diff-filter=U)" = "$expected"
+            # The upstream delta in these two files is formatting only. Keep
+            # the feature versions; retain Git's three-way merge elsewhere.
+            for file in frontend/src/lib/virtual/createVirtualizer.svelte.ts frontend/src/lib/virtual/createVirtualizer.test.ts; do
+              git show "aba772a69728bce3cd6c0619078670e0abb9b9b6:$file" > "$file"
+              git add "$file"
+            done
+            GIT_EDITOR=true git rebase --continue
+          fi
+          git diff HEAD^ HEAD --check
+          test "$(git rev-parse HEAD^)" = 66dd6e5dc8fbb890d9eb21d64df952364abbd1c1
           git log -2 --format='%H %s'
+      - name: Publish only if the feature branch has not moved
+        if: steps.rebase.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin \
+            --force-with-lease=refs/heads/fix/live-transcript-consistency:aba772a69728bce3cd6c0619078670e0abb9b9b6 \
+            HEAD:refs/heads/fix/live-transcript-consistency
       - name: Export the exact Git workspace
         if: always()
         shell: bash
-        run: |
-          tar --exclude='./.git/hooks' -czf /tmp/live-transcript-workspace.tar.gz .
+        run: tar --exclude='./.git/hooks' -czf /tmp/live-transcript-workspace.tar.gz .
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -45,18 +67,25 @@ jobs:
         with:
           node-version: '24.11.0'
       - name: Install the repository-pinned frontend toolchain
+        id: install
         if: steps.rebase.outcome == 'success'
         working-directory: frontend
         run: npm ci
+      - name: Exercise the rebased adapter and navigation
+        if: steps.install.outcome == 'success'
+        working-directory: frontend
+        run: |
+          npm run i18n:compile
+          npm run test -- src/lib/virtual src/lib/components/content/staged-scroll
       - name: Package the isolated frontend toolchain
-        if: steps.rebase.outcome == 'success'
+        if: always() && steps.install.outcome == 'success'
         shell: bash
         run: |
           mkdir -p /tmp/live-transcript-toolchain
           cp "$(command -v node)" /tmp/live-transcript-toolchain/node
           tar -czf /tmp/live-transcript-toolchain/frontend-node-modules.tar.gz -C frontend node_modules
       - uses: actions/upload-artifact@v4
-        if: steps.rebase.outcome == 'success'
+        if: always() && steps.install.outcome == 'success'
         with:
           name: live-transcript-toolchain
           path: /tmp/live-transcript-toolchain
