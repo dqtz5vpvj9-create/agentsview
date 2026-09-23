@@ -1,0 +1,63 @@
+name: Prepare live transcript rebase workspace
+
+on:
+  push:
+    branches: [automation/live-transcript-rebase-20260923]
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: aba772a69728bce3cd6c0619078670e0abb9b9b6
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Replay the transcript change on upstream main
+        id: rebase
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/kenn-io/agentsview.git
+          git fetch upstream main
+          test "$(git rev-parse upstream/main)" = 66dd6e5dc8fbb890d9eb21d64df952364abbd1c1
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rebase --onto upstream/main 30cca8baa4955f36871a70ee6783ab16ff602986
+          git log -2 --format='%H %s'
+      - name: Export the exact Git workspace
+        if: always()
+        shell: bash
+        run: |
+          tar --exclude='./.git/hooks' -czf /tmp/live-transcript-workspace.tar.gz .
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-transcript-workspace
+          path: /tmp/live-transcript-workspace.tar.gz
+          retention-days: 3
+      - uses: actions/setup-node@v4
+        if: steps.rebase.outcome == 'success'
+        with:
+          node-version: '24.11.0'
+      - name: Install the repository-pinned frontend toolchain
+        if: steps.rebase.outcome == 'success'
+        working-directory: frontend
+        run: npm ci
+      - name: Package the isolated frontend toolchain
+        if: steps.rebase.outcome == 'success'
+        shell: bash
+        run: |
+          mkdir -p /tmp/live-transcript-toolchain
+          cp "$(command -v node)" /tmp/live-transcript-toolchain/node
+          tar -czf /tmp/live-transcript-toolchain/frontend-node-modules.tar.gz -C frontend node_modules
+      - uses: actions/upload-artifact@v4
+        if: steps.rebase.outcome == 'success'
+        with:
+          name: live-transcript-toolchain
+          path: /tmp/live-transcript-toolchain
+          retention-days: 3
