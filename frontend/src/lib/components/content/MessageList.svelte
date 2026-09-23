@@ -43,9 +43,6 @@
   let destroyed = false;
   let activeFollowScrollRequest: number | null = null;
   let followingScrollRaf: number | null = null;
-  let followSettleTimer:
-    | ReturnType<typeof setTimeout>
-    | null = null;
   let visibleProgressSignature: string | null = $state(null);
   let visibleProgressRaf: number | null = null;
   let unreadTraversalKey: string | null = null;
@@ -82,36 +79,43 @@
     displayedOrdinals.join(","),
   );
 
-  function itemAt(index: number, newestFirst = ui.sortNewestFirst) {
-    if (newestFirst) {
-      const mapped = displayItemsAsc.length - 1 - index;
-      return displayItemsAsc[mapped];
-    }
-    return displayItemsAsc[index];
+  // Snapshot the order used by both the key extractor and the render pass.
+  // A previous getItemKey closure must never read a newer message array.
+  let orderedDisplayItems = $derived(
+    ui.sortNewestFirst ? [...displayItemsAsc].reverse() : [...displayItemsAsc],
+  );
+
+  function itemAt(index: number) {
+    return orderedDisplayItems[index];
   }
 
   const virtualizer = createVirtualizer(() => {
-    const count = displayItemsAsc.length;
+    const items = orderedDisplayItems;
     const el = containerRef ?? null;
     const sid = sessions.activeSessionId ?? "";
-    const newestFirst = ui.sortNewestFirst;
+    const keys = items.map((item) => item.kind === "tool-group"
+      ? `${sid}-tg-${item.ordinals[0]}`
+      : `${sid}-m-${item.message.ordinal}`);
     return {
-      count,
+      count: items.length,
       getScrollElement: () => el,
       estimateSize: () => 120,
       overscan: 5,
-      useAnimationFrameWithResizeObserver: true,
+      // Preserve the visible key and its offset on prepend/trim/reorder.
+      // Following the latest edge is explicit and also supports newest-first.
+      anchorTo: "end" as const,
+      followOnAppend: false,
+      useAnimationFrameWithResizeObserver: false,
+      // Normal-flow rows retain fractional CSS pixels. Rounding each height
+      // would accumulate drift between the block and the virtual coordinates.
+      measureElement: (node, entry) => entry?.borderBoxSize?.[0]?.blockSize
+        ?? node.getBoundingClientRect().height,
       measureCacheKey: sid,
-      getItemKey: (index: number) => {
-        const item = itemAt(index, newestFirst);
-        if (!item) return `${sid}-${index}`;
-        if (item.kind === "tool-group") {
-          return `${sid}-tg-${item.ordinals[0]}`;
-        }
-        return `${sid}-m-${item.message.ordinal}`;
-      },
+      getItemKey: (index: number) => keys[index] ?? `${sid}-${index}`,
     };
   });
+
+  let virtualRows = $derived(virtualizer.instance?.getVirtualItems() ?? []);
 
   /** Svelte action: measure element for variable-height virtualizer */
   function measureElement(
@@ -471,10 +475,6 @@
       cancelAnimationFrame(followingScrollRaf);
       followingScrollRaf = null;
     }
-    if (followSettleTimer !== null) {
-      clearTimeout(followSettleTimer);
-      followSettleTimer = null;
-    }
   });
 
   function cancelFollowLatestWork() {
@@ -489,10 +489,6 @@
       cancelAnimationFrame(followingScrollRaf);
       followingScrollRaf = null;
     }
-    if (followSettleTimer !== null) {
-      clearTimeout(followSettleTimer);
-      followSettleTimer = null;
-    }
   }
 
   function scrollToDisplayIndex(
@@ -502,11 +498,16 @@
     reqId = lastScrollRequest,
     align: ScrollAlign = "start",
   ): Promise<boolean> {
+    const ordinal = itemAt(index)?.ordinals[0];
+    const sessionId = messages.sessionId;
     return settleVirtualScroll({
       index, align, waitFrames, scrollRetries,
+      getIndex: () => ordinal === undefined ? -1 : orderedDisplayItems.findIndex(
+        (item) => item.ordinals.includes(ordinal),
+      ),
       getVirtualizer: () => virtualizer.instance,
       getCount: () => displayItemsAsc.length,
-      isCurrent: () => !destroyed && reqId === lastScrollRequest,
+      isCurrent: () => !destroyed && reqId === lastScrollRequest && messages.sessionId === sessionId,
       nextFrame: raf,
     });
   }
@@ -570,7 +571,7 @@
       reqId,
       ui.sortNewestFirst ? "start" : "end",
     );
-    startFollowLatestSettle(reqId);
+    if (ui.followLatest) forceLatestEdge();
   }
 
   function forceLatestEdge() {
@@ -580,28 +581,19 @@
       : containerRef.scrollHeight;
   }
 
-  function startFollowLatestSettle(reqId: number) {
-    if (followSettleTimer !== null) {
-      clearTimeout(followSettleTimer);
-      followSettleTimer = null;
-    }
-
-    const tick = () => {
-      followSettleTimer = null;
-      if (
-        reqId !== lastScrollRequest ||
-        !ui.followLatest ||
-        !containerRef
-      ) {
-        return;
-      }
-
-      forceLatestEdge();
-      followSettleTimer = setTimeout(tick, 100);
-    };
-
-    tick();
-  }
+  // Re-pin only after a layout notification, including late image/tool sizes.
+  // There is no polling loop competing with manual reading or navigation.
+  $effect(() => {
+    const follow = ui.followLatest;
+    const el = containerRef;
+    const newestFirst = ui.sortNewestFirst;
+    void virtualizer.instance;
+    if (!follow || !el) return;
+    untrack(() => {
+      if (activeFollowScrollRequest !== lastScrollRequest) return;
+      el.scrollTop = newestFirst ? 0 : el.scrollHeight;
+    });
+  });
 
   function queueFollowLatestScroll() {
     if (!ui.followLatest) return;
@@ -829,7 +821,11 @@
     <div
       style="height: {virtualizer.instance?.getTotalSize() ?? 0}px; width: 100%; position: relative;"
     >
-      {#each virtualizer.instance?.getVirtualItems() ?? [] as row (row.key)}
+      <div
+        class="virtual-block"
+        style="transform: translateY({virtualRows[0]?.start ?? 0}px);"
+      >
+      {#each virtualRows as row (row.key)}
         {@const item = itemAt(row.index)}
         {#if item}
           <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -839,7 +835,7 @@
             class:selected={ui.selectedOrdinal !== null &&
               item.ordinals.includes(ui.selectedOrdinal)}
             data-index={row.index}
-            style="position: absolute; top: 0; left: 0; width: 100%; transform: translateY({row.start}px);"
+            data-message-key={row.key}
             use:measureElement={virtualizer.instance}
             onclick={() => {
               const sel = window.getSelection();
@@ -879,6 +875,7 @@
           </div>
         {/if}
       {/each}
+      </div>
     </div>
   </div>
   </SessionFindView>
@@ -893,7 +890,17 @@
     overflow-anchor: none;
   }
 
+  /* Keep the contiguous rendered window in normal flow: a growing message
+     must move its neighbours in the same layout, before remeasurement. */
+  .virtual-block {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+  }
+
   .virtual-row {
+    display: flow-root;
     padding: 5px 12px;
     overflow-anchor: none;
   }
