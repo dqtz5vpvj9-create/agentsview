@@ -38,6 +38,8 @@ vi.mock("@tanstack/virtual-core", async () => {
     }
 
     _willUpdate() {}
+    _didMount() { return () => {}; }
+    measure() { this.itemSizeCache = new Map(); }
   }
 
   return {

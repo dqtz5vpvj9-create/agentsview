@@ -1,320 +1,126 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
-import { mount, unmount, tick } from "svelte";
-// @ts-ignore
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { mount, tick, unmount } from "svelte";
 import VirtualizerTest from "./VirtualizerTest.svelte";
 
-const ASYNC_UPDATE_DELAY_MS = 100;
-
-type MockOptions = Record<string, unknown>;
-
-const { lastOptions, lastInstance } = vi.hoisted(() => ({
-  lastOptions: { value: undefined as MockOptions | undefined },
-  lastInstance: { value: undefined as Record<string, unknown> | undefined },
+type Options = Record<string, unknown>;
+interface FakeInstance {
+  options: Options;
+  scrollOffset?: number;
+  itemSizeCache: Map<string, number>;
+}
+const state = vi.hoisted(() => ({
+  instance: undefined as FakeInstance | undefined,
+  dispose: vi.fn(),
+  scroll: vi.fn(),
 }));
 
-vi.mock("@tanstack/virtual-core", async () => {
-  const original =
-    await vi.importActual<typeof import("@tanstack/virtual-core")>("@tanstack/virtual-core");
-  return {
-    ...original,
-    Virtualizer: class {
-      options: MockOptions;
-      scrollOffset: number | undefined = undefined;
-      constructor(opts: MockOptions) {
-        this.options = opts;
-        lastOptions.value = opts;
-        lastInstance.value = this as unknown as Record<string, unknown>;
-      }
-      setOptions(opts: MockOptions) {
-        this.options = opts;
-        lastOptions.value = opts;
-      }
-      _willUpdate() {}
-    },
-    observeElementOffset: vi.fn(),
-    observeElementRect: vi.fn(),
-    elementScroll: vi.fn(),
-    observeWindowOffset: vi.fn(),
-    observeWindowRect: vi.fn(),
-    windowScroll: vi.fn(),
-  };
-});
+// Intentionally silent setOptions: unchanged ranges do not guarantee onChange.
+vi.mock("@tanstack/virtual-core", async () => ({
+  ...await vi.importActual<typeof import("@tanstack/virtual-core")>("@tanstack/virtual-core"),
+  Virtualizer: class implements FakeInstance {
+    options: Options;
+    scrollOffset?: number;
+    itemSizeCache = new Map<string, number>();
+    constructor(options: Options) {
+      this.options = options;
+      state.instance = this;
+    }
+    setOptions(options: Options) { this.options = options; }
+    _willUpdate() {}
+    _didMount() { return state.dispose; }
+    measure() { this.itemSizeCache.clear(); }
+    scrollToOffset = state.scroll;
+  },
+}));
 
-describe("initialOffset semantics", () => {
+describe("virtualizer adapter", () => {
+  let component: ReturnType<typeof mount> | undefined;
   beforeEach(() => {
-    lastOptions.value = undefined;
-    lastInstance.value = undefined;
-    vi.clearAllMocks();
     vi.useFakeTimers();
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("element virtualizer uses scrollTop on first mount", async () => {
-    const onInstanceChange = vi.fn();
-    const container = document.createElement("div");
-    const scrollDiv = document.createElement("div");
-    Object.defineProperty(scrollDiv, "scrollTop", {
-      value: 200,
-      writable: false,
-    });
-
-    const component = mount(VirtualizerTest, {
-      target: container,
-      props: {
-        type: "element",
-        options: {
-          count: 10,
-          getScrollElement: () => scrollDiv,
-          estimateSize: () => 50,
-          initialOffset: 999,
-        },
-        onInstanceChange,
-      },
-    });
-
-    await tick();
-    expect(lastOptions.value).toBeDefined();
-    expect(lastOptions.value!.initialOffset).toBe(200);
-
-    unmount(component);
-  });
-
-  it("element virtualizer falls back to 0 with null scroll element", async () => {
-    const onInstanceChange = vi.fn();
-    const container = document.createElement("div");
-
-    const component = mount(VirtualizerTest, {
-      target: container,
-      props: {
-        type: "element",
-        options: {
-          count: 10,
-          getScrollElement: () => null,
-          estimateSize: () => 50,
-          initialOffset: 999,
-        },
-        onInstanceChange,
-      },
-    });
-
-    await tick();
-    expect(lastOptions.value).toBeDefined();
-    expect(lastOptions.value!.initialOffset).toBe(0);
-
-    unmount(component);
-  });
-
-  it("window virtualizer uses 0 on first mount", async () => {
-    const onInstanceChange = vi.fn();
-    const container = document.createElement("div");
-
-    const component = mount(VirtualizerTest, {
-      target: container,
-      props: {
-        type: "window",
-        options: {
-          count: 20,
-          estimateSize: () => 50,
-          initialOffset: 999,
-        },
-        onInstanceChange,
-      },
-    });
-
-    await tick();
-    expect(lastOptions.value).toBeDefined();
-    expect(lastOptions.value!.initialOffset).toBe(0);
-
-    unmount(component);
-  });
-
-  it("element virtualizer ignores user initialOffset with scrollTop=0", async () => {
-    const onInstanceChange = vi.fn();
-    const container = document.createElement("div");
-    const scrollDiv = document.createElement("div");
-    Object.defineProperty(scrollDiv, "scrollTop", {
-      value: 0,
-      writable: false,
-    });
-
-    const component = mount(VirtualizerTest, {
-      target: container,
-      props: {
-        type: "element",
-        options: {
-          count: 10,
-          getScrollElement: () => scrollDiv,
-          estimateSize: () => 50,
-          initialOffset: 500,
-        },
-        onInstanceChange,
-      },
-    });
-
-    await tick();
-    expect(lastOptions.value).toBeDefined();
-    expect(lastOptions.value!.initialOffset).toBe(0);
-
-    unmount(component);
-  });
-
-  it("window virtualizer ignores user initialOffset", async () => {
-    const onInstanceChange = vi.fn();
-    const container = document.createElement("div");
-
-    const component = mount(VirtualizerTest, {
-      target: container,
-      props: {
-        type: "window",
-        options: {
-          count: 20,
-          estimateSize: () => 50,
-          initialOffset: 500,
-        },
-        onInstanceChange,
-      },
-    });
-
-    await tick();
-    expect(lastOptions.value).toBeDefined();
-    expect(lastOptions.value!.initialOffset).toBe(0);
-
-    unmount(component);
-  });
-
-  it("update path prefers instance.scrollOffset over wrapper initialOffset", async () => {
-    const onInstanceChange = vi.fn();
-    const container = document.createElement("div");
-    const scrollDiv = document.createElement("div");
-    Object.defineProperty(scrollDiv, "scrollTop", {
-      value: 0,
-      writable: false,
-    });
-
-    const component = mount(VirtualizerTest, {
-      target: container,
-      props: {
-        type: "element",
-        options: {
-          count: 10,
-          getScrollElement: () => scrollDiv,
-          estimateSize: () => 50,
-        },
-        onInstanceChange,
-      },
-    });
-
-    await tick();
-    expect(lastOptions.value).toBeDefined();
-    expect(lastOptions.value!.initialOffset).toBe(0);
-
-    // Simulate the instance having scrolled to offset 150
-    lastInstance.value!.scrollOffset = 150;
-
-    // Trigger an options update via setOptions on the test harness,
-    // which re-runs the $effect and hits the update path
-    component.setOptions({
-      count: 15,
-      getScrollElement: () => scrollDiv,
-      estimateSize: (): number => 50,
-    });
-    await tick();
-
-    expect(lastOptions.value!.initialOffset).toBe(150);
-
-    unmount(component);
-  });
-});
-
-describe("createVirtualizer reactivity", () => {
-  beforeEach(() => {
-    lastOptions.value = undefined;
-    lastInstance.value = undefined;
     vi.clearAllMocks();
-    vi.useFakeTimers();
+    state.instance = undefined;
+  });
+  afterEach(async () => {
+    if (component) await unmount(component);
+    component = undefined;
+    vi.useRealTimers();
+    document.body.innerHTML = "";
   });
 
-  afterEach(() => {
-    vi.useRealTimers();
-  });
+  async function setup(type: "element" | "window", options: Options) {
+    const changed = vi.fn();
+    component = mount(VirtualizerTest, {
+      target: document.body,
+      props: { type, options, onInstanceChange: changed },
+    });
+    await tick();
+    return { changed, instance: state.instance! };
+  }
 
   it.each([
-    {
-      type: "element" as const,
-      options: {
-        count: 10,
-        getScrollElement: () => document.createElement("div"),
-        estimateSize: (): number => 50,
-      },
-    },
-    {
-      type: "window" as const,
-      options: {
-        count: 20,
-        estimateSize: (): number => 50,
-      },
-    },
-  ])(
-    "updates when onChange fires with same reference ($type virtualizer)",
-    async ({ type, options }) => {
-      const onInstanceChange = vi.fn();
-      const container = document.createElement("div");
+    { type: "element" as const, top: 200, supplied: 999, expected: 200 },
+    { type: "element" as const, top: 0, supplied: 500, expected: 0 },
+    { type: "element" as const, top: null, supplied: 999, expected: 0 },
+    { type: "window" as const, top: 200, supplied: 999, expected: 0 },
+    { type: "window" as const, top: 0, supplied: 500, expected: 0 },
+  ])("preserves initialOffset semantics: $type/$top", async ({ type, top, supplied, expected }) => {
+    const el = document.createElement("div");
+    el.scrollTop = top ?? 0;
+    const { instance } = await setup(type, {
+      count: 10,
+      estimateSize: () => 50,
+      getScrollElement: () => top === null ? null : el,
+      initialOffset: supplied,
+    });
+    expect(instance.options.initialOffset).toBe(expected);
+  });
 
-      const component = mount(VirtualizerTest, {
-        target: container,
-        props: { type, options, onInstanceChange },
-      });
+  it.each([false, true])("publishes onChange(sync=%s) without a timer", async (sync) => {
+    const { changed, instance } = await setup("element", {
+      count: 10, getScrollElement: () => null, estimateSize: () => 50,
+    });
+    const initial = changed.mock.calls.length;
+    (instance.options.onChange as (v: unknown, sync: boolean) => void)(instance, sync);
+    await tick();
+    expect(changed).toHaveBeenCalledTimes(initial + 1);
+    expect(changed.mock.calls.at(-1)?.[0]).toBe(instance);
+    expect(vi.getTimerCount()).toBe(0);
+  });
 
+  it.each(["element", "window"] as const)("publishes silent count and key changes: %s", async (type) => {
+    const el = document.createElement("div");
+    el.scrollTop = 150;
+    const options = { count: 10, getScrollElement: () => el, estimateSize: () => 50 };
+    const { changed, instance } = await setup(type, options);
+    instance.scrollOffset = 150;
+    instance.itemSizeCache.set("retained", 75);
+    let calls = changed.mock.calls.length;
+    for (const count of [11, 11, 9, 0]) {
+      component!.setOptions({ ...options, count, getItemKey: (i: number) => `revision-${calls}-${i}` });
       await tick();
+      expect(changed).toHaveBeenCalledTimes(++calls);
+      expect(state.instance).toBe(instance);
+      expect(instance.options.count).toBe(count);
+      expect(instance.options.initialOffset).toBe(150);
+      expect(instance.itemSizeCache.get("retained")).toBe(75);
+    }
+    expect(state.scroll).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
 
-      expect(onInstanceChange).toHaveBeenCalledTimes(1);
-      expect(lastOptions.value).toBeDefined();
-
-      const { onChange } = lastOptions.value!;
-      expect(typeof onChange).toBe("function");
-
-      const firstInstance = onInstanceChange.mock.calls[0]![0];
-      expect(component.getVirtualizer().instance).toBe(firstInstance);
-
-      const rawInstance = lastInstance.value;
-      expect(rawInstance).toBe(firstInstance);
-
-      // Mutate raw instance to verify same object reference
-      (rawInstance as Record<string, unknown>)._test_mutation = "updated";
-
-      // 1. Sync update (onChange(..., false))
-      (onChange as (inst: unknown, async: boolean) => void)(rawInstance, false);
-      await tick();
-      vi.advanceTimersByTime(ASYNC_UPDATE_DELAY_MS);
-      await tick();
-
-      expect(onInstanceChange).toHaveBeenCalledTimes(2);
-      const receivedSync = onInstanceChange.mock.calls[1]![0];
-      expect(receivedSync).toBe(rawInstance);
-      expect(receivedSync._test_mutation).toBe("updated");
-      expect(component.getVirtualizer().instance).toBe(rawInstance);
-
-      // 2. Async update (onChange(..., true))
-      (onChange as (inst: unknown, async: boolean) => void)(rawInstance, true);
-
-      // Should not have updated yet (setTimeout is pending)
-      await tick();
-      expect(onInstanceChange).toHaveBeenCalledTimes(2);
-
-      // Advance timers to trigger the queued update
-      vi.advanceTimersByTime(ASYNC_UPDATE_DELAY_MS);
-      await tick();
-
-      expect(onInstanceChange).toHaveBeenCalledTimes(3);
-      const receivedAsync = onInstanceChange.mock.calls[2]![0];
-      expect(receivedAsync).toBe(rawInstance);
-      expect(receivedAsync._test_mutation).toBe("updated");
-
-      unmount(component);
-    },
-  );
+  it("disposes observers once and ignores a late notification after unmount", async () => {
+    const { changed, instance } = await setup("element", {
+      count: 10, getScrollElement: () => null, estimateSize: () => 50,
+    });
+    const onChange = instance.options.onChange as (v: unknown, sync: boolean) => void;
+    await unmount(component!);
+    component = undefined;
+    const calls = changed.mock.calls.length;
+    onChange(instance, true);
+    await tick();
+    expect(state.dispose).toHaveBeenCalledTimes(1);
+    expect(changed).toHaveBeenCalledTimes(calls);
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });
