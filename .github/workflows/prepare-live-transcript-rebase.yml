@@ -1,42 +1,27 @@
-name: Validate live transcript refinements
+name: Validate live transcript consistency
 
 on:
   push:
     branches: [automation/live-transcript-rebase-20260923]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          ref: 7e63e198d62ab92d58a7953dd876514742215f9c
           fetch-depth: 0
           persist-credentials: false
-      - name: Apply the reviewed refinement to the exact rebased head
-        shell: bash
+      - name: Verify the exact rebased source
         run: |
-          set -euo pipefail
-          python - <<'PY'
-          import base64, gzip, hashlib
-          from pathlib import Path
-          raw = Path('automation/live-transcript-refinements.patch.gz').read_bytes()
-          # Repair a missing base64 character in the transport blob. The full
-          # decoded diff must match the locally exercised SHA-256 before use.
-          encoded = base64.b64encode(raw).decode().replace('PUfF4iwSH', 'PUfFf4iwSH').rstrip('=')
-          decoded = base64.b64decode(encoded + '=' * (-len(encoded) % 4))
-          patch = gzip.decompress(decoded)
-          assert hashlib.sha256(patch).hexdigest() == '857cfd6eb0e4a3907a95fc1203cc5cb01e995a4063124fac9c95fa8e54deb452'
-          Path('/tmp/live-transcript-refinements.patch').write_bytes(patch)
-          PY
-          git checkout --detach 580b8a3cec240dbf21c557a2f52f9dd47e70d905
-          test "$(git rev-parse HEAD^)" = 66dd6e5dc8fbb890d9eb21d64df952364abbd1c1
-          git apply --check /tmp/live-transcript-refinements.patch
-          git apply /tmp/live-transcript-refinements.patch
-          git diff --check
+          test "$(git rev-parse HEAD^{tree})" = de0779f172c5ee86a2383da24eb66db8ec7edabb
+          git merge-base --is-ancestor 66dd6e5dc8fbb890d9eb21d64df952364abbd1c1 HEAD
+          git diff 66dd6e5dc8fbb890d9eb21d64df952364abbd1c1 HEAD --check
       - uses: actions/setup-node@v4
         with:
           node-version: '24.11.0'
@@ -52,28 +37,8 @@ jobs:
           npm run check
           npm run test -- --maxWorkers=2 src/lib/virtual src/lib/components/content/staged-scroll src/lib/components/content/MessageList.test.ts src/lib/components/content/MessageList-search.test.ts
           npm run build
-      - name: Publish the verified refinement without replacing concurrent work
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add frontend/src/lib/virtual frontend/src/lib/components/content/MessageList.svelte frontend/e2e/live-transcript-layout.spec.ts
-          git diff --cached --check
-          git commit -m 'fix(transcript): preserve row observers and anchors across live prepends'
-          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
-          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin \
-            --force-with-lease=refs/heads/fix/live-transcript-consistency:580b8a3cec240dbf21c557a2f52f9dd47e70d905 \
-            HEAD:refs/heads/fix/live-transcript-consistency
-          mkdir -p /tmp/live-transcript-results
-          git log -3 --format='%H %s' > /tmp/live-transcript-results/commits.txt
-          git diff HEAD^ HEAD --stat > /tmp/live-transcript-results/change-summary.txt
       - name: Build isolated application fixtures
-        shell: bash
         run: |
-          set -euo pipefail
           mkdir -p /tmp/live-transcript-bin
           go run ./internal/pricing/cmd/litellm-snapshot -restore
           cp -r frontend/dist/. internal/web/dist/
@@ -88,18 +53,18 @@ jobs:
           CI: 'true'
           E2E_PREBUILT_FIXTURE: /tmp/live-transcript-bin/testfixture
           E2E_PREBUILT_SERVER: /tmp/live-transcript-bin/agentsview
-        run: npx playwright test e2e/live-transcript-layout.spec.ts --workers=2 --reporter=list,html
-      - name: Export results and exact feature source
+          PLAYWRIGHT_JSON_OUTPUT_NAME: test-results/results.json
+        run: npx playwright test e2e/live-transcript-layout.spec.ts --workers=2 --retries=0 --reporter=list,html,json
+      - name: Record the source identity
         if: always()
-        shell: bash
         run: |
           mkdir -p /tmp/live-transcript-results
+          git log -4 --format='%H %s' > /tmp/live-transcript-results/commits.txt
           git status --short > /tmp/live-transcript-results/status.txt
-          tar --exclude='./.git' --exclude='./frontend/node_modules' --exclude='./frontend/playwright-report' --exclude='./frontend/test-results' -czf /tmp/live-transcript-results/source.tar.gz .
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: live-transcript-validation
+          name: live-transcript-final-validation
           path: |
             /tmp/live-transcript-results
             frontend/playwright-report
