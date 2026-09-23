@@ -1,8 +1,6 @@
 <script lang="ts">
   import { onDestroy, tick, untrack } from "svelte";
   import { Button, EmptyState } from "@kenn-io/kit-ui";
-  // kit-ui-check-ignore: MessageList uses the local TanStack wrapper for pinned-message scroll reconciliation and per-session measurement cache resets; kit-ui VirtualList does not expose those controls yet.
-  import type { Virtualizer } from "@tanstack/virtual-core";
   import { messages } from "../../stores/messages.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
@@ -10,6 +8,8 @@
   import { readProgress } from "../../stores/read-progress.svelte.js";
   import { CircleQuestionMarkIcon, MessageSquareIcon } from "../../icons.js";
   import { createVirtualizer } from "../../virtual/createVirtualizer.svelte.js";
+  import { measureRow, measureRowHeight } from "../../virtual/measure-row.js";
+  import { shouldAdjustTranscriptScroll } from "../../virtual/transcript-anchor.js";
   import MessageContent from "./MessageContent.svelte";
   import CompactBoundaryDivider from "./CompactBoundaryDivider.svelte";
   import SystemBoundaryCard from "../system/SystemBoundaryCard.svelte";
@@ -108,34 +108,14 @@
       useAnimationFrameWithResizeObserver: false,
       // Normal-flow rows retain fractional CSS pixels. Rounding each height
       // would accumulate drift between the block and the virtual coordinates.
-      measureElement: (node, entry) => entry?.borderBoxSize?.[0]?.blockSize
-        ?? node.getBoundingClientRect().height,
+      measureElement: measureRowHeight,
+      shouldAdjustScrollPositionOnItemSizeChange: shouldAdjustTranscriptScroll,
       measureCacheKey: sid,
       getItemKey: (index: number) => keys[index] ?? `${sid}-${index}`,
     };
   });
 
   let virtualRows = $derived(virtualizer.instance?.getVirtualItems() ?? []);
-
-  /** Svelte action: measure element for variable-height virtualizer */
-  function measureElement(
-    node: HTMLElement,
-    virt: Virtualizer<HTMLElement, HTMLElement> | undefined,
-  ) {
-    virt?.measureElement(node);
-    return {
-      update(
-        nextVirt:
-          | Virtualizer<HTMLElement, HTMLElement>
-          | undefined,
-      ) {
-        nextVirt?.measureElement(node);
-      },
-      destroy() {
-        // Cleanup handled by virtualizer
-      },
-    };
-  }
 
   function publishVisibleTimestamp() {
     const v = virtualizer.instance;
@@ -836,7 +816,7 @@
               item.ordinals.includes(ui.selectedOrdinal)}
             data-index={row.index}
             data-message-key={row.key}
-            use:measureElement={virtualizer.instance}
+            use:measureRow={{ virtualizer: virtualizer.instance, index: row.index }}
             onclick={() => {
               const sel = window.getSelection();
               if (sel && sel.toString().length > 0) return;

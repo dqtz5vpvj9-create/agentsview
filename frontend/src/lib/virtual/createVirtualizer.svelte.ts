@@ -13,18 +13,31 @@ import {
 
 type PartialKeys<T, K extends keyof T> = Omit<T, K> & Partial<Pick<T, K>>;
 
+type AdapterOptions<TScroll extends Element | Window, TItem extends Element> = {
+  measureCacheKey?: unknown;
+  shouldAdjustScrollPositionOnItemSizeChange?: Virtualizer<
+    TScroll,
+    TItem
+  >["shouldAdjustScrollPositionOnItemSizeChange"];
+};
+
 type ElementOpts = PartialKeys<
   VirtualizerOptions<HTMLElement, HTMLElement>,
   "observeElementOffset" | "observeElementRect" | "scrollToFn"
-> & { measureCacheKey?: unknown };
+> &
+  AdapterOptions<HTMLElement, HTMLElement>;
 
 type WindowOpts = PartialKeys<
   VirtualizerOptions<Window, HTMLElement>,
   "observeElementOffset" | "observeElementRect" | "scrollToFn" | "getScrollElement"
-> & { measureCacheKey?: unknown };
+> &
+  AdapterOptions<Window, HTMLElement>;
 
-type BaseOpts<TScroll extends Element | Window, TItem extends Element> =
-  VirtualizerOptions<TScroll, TItem> & { measureCacheKey?: unknown };
+type BaseOpts<TScroll extends Element | Window, TItem extends Element> = VirtualizerOptions<
+  TScroll,
+  TItem
+> &
+  AdapterOptions<TScroll, TItem>;
 
 function createBaseVirtualizer<TScroll extends Element | Window, TItem extends Element>(
   optsFn: () => BaseOpts<TScroll, TItem>,
@@ -39,7 +52,10 @@ function createBaseVirtualizer<TScroll extends Element | Window, TItem extends E
   function notify() {
     // Publishing is synchronous, just like the official Svelte adapter.
     // Never make an options effect depend on its own invalidation counter.
-    if (!destroyed) untrack(() => { version += 1; });
+    if (!destroyed)
+      untrack(() => {
+        version += 1;
+      });
   }
 
   $effect.pre(() => {
@@ -68,6 +84,9 @@ function createBaseVirtualizer<TScroll extends Element | Window, TItem extends E
           resetScroll = true;
         }
       }
+      // TanStack exposes this policy as an instance hook, not a core option.
+      instance.shouldAdjustScrollPositionOnItemSizeChange =
+        opts.shouldAdjustScrollPositionOnItemSizeChange;
       lastMeasureCacheKey = opts.measureCacheKey;
       // setOptions need not emit onChange when the visible range is unchanged.
       // Publish the new count/key mapping before Svelte renders any rows.
