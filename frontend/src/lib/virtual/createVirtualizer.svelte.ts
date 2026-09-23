@@ -1,11 +1,10 @@
 import { onDestroy, untrack } from "svelte";
+import { observeFreshElementOffset, observeFreshWindowOffset } from "./observe-scroll-offset.js";
 import {
   Virtualizer,
   type VirtualizerOptions,
-  observeElementOffset,
   observeElementRect,
   elementScroll,
-  observeWindowOffset,
   observeWindowRect,
   windowScroll,
   // kit-ui-check-ignore: the transcript needs TanStack's measurement and anchor controls.
@@ -125,7 +124,7 @@ export function createVirtualizer(optsFn: () => ElementOpts) {
     const opts = optsFn();
     const scrollEl = opts.getScrollElement?.() ?? null;
     return {
-      observeElementOffset,
+      observeElementOffset: observeFreshElementOffset,
       observeElementRect,
       scrollToFn: elementScroll,
       ...opts,
@@ -136,7 +135,7 @@ export function createVirtualizer(optsFn: () => ElementOpts) {
 
 export function createWindowVirtualizer(optsFn: () => WindowOpts) {
   return createBaseVirtualizer<Window, HTMLElement>(() => ({
-    observeElementOffset: observeWindowOffset,
+    observeElementOffset: observeFreshWindowOffset,
     observeElementRect: observeWindowRect,
     scrollToFn: windowScroll,
     getScrollElement: () => window,

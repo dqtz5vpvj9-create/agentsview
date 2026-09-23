@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { tick } from "svelte";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import type { Virtualizer } from "@tanstack/virtual-core";
 import { measureRow, measureRowHeight } from "./measure-row.js";
@@ -40,16 +41,36 @@ describe("transcript row layout height", () => {
     expect(measureRowHeight(node)).toBe(112);
   });
 
-  it("updates a retained node index before registering it after a prepend", () => {
+  it("updates a retained node index before registering it after a prepend", async () => {
     const node = document.createElement("div");
+    document.body.append(node);
     const seen: string[] = [];
     const virtualizer = {
       measureElement: (element: HTMLElement) => seen.push(element.dataset.index!),
     } as unknown as Virtualizer<HTMLElement, HTMLElement>;
     const action = measureRow(node, { virtualizer, index: 4 });
+    await tick();
     expect(node.dataset.index).toBe("4");
     action.update({ virtualizer, index: 5 });
+    await tick();
     action.update({ virtualizer, index: 6 });
+    await tick();
     expect(seen).toEqual(["4", "5", "6"]);
+  });
+  it("discards superseded and destroyed row measurements", async () => {
+    const node = document.createElement("div");
+    document.body.append(node);
+    const measureElement = vi.fn();
+    const virtualizer = { measureElement } as unknown as Virtualizer<HTMLElement, HTMLElement>;
+    const action = measureRow(node, { virtualizer, index: 4 });
+    action.update({ virtualizer, index: 5 });
+    action.update({ virtualizer, index: 6 });
+    await tick();
+    expect(measureElement).toHaveBeenCalledTimes(1);
+    expect(node.dataset.index).toBe("6");
+    action.update({ virtualizer, index: 7 });
+    action.destroy();
+    await tick();
+    expect(measureElement).toHaveBeenCalledTimes(1);
   });
 });
