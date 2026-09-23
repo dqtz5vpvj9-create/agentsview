@@ -103,7 +103,8 @@
       overscan: 5,
       // Preserve the visible key and its offset on prepend/trim/reorder.
       // Following the latest edge is explicit and also supports newest-first.
-      anchorTo: "end" as const,
+      preserveScrollAnchor: true,
+      anchorTo: "start" as const,
       followOnAppend: false,
       useAnimationFrameWithResizeObserver: false,
       // Normal-flow rows retain fractional CSS pixels. Rounding each height
