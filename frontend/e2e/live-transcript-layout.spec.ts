@@ -6,14 +6,24 @@ const SESSION = "test-session-xlarge-5500";
 
 function message(ordinal: number, content = `Message ${ordinal}`) {
   return {
-    id: ordinal + 1, session_id: SESSION, ordinal,
+    id: ordinal + 1,
+    session_id: SESSION,
+    ordinal,
     role: ordinal % 2 === 0 ? "user" : "assistant",
-    content, content_length: content.length,
+    content,
+    content_length: content.length,
     timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, ordinal)).toISOString(),
-    has_thinking: false, thinking_text: "", has_tool_use: false,
-    model: "", token_usage: null, context_tokens: 0, output_tokens: 0,
-    has_context_tokens: false, has_output_tokens: false,
-    tool_calls: [], is_system: false,
+    has_thinking: false,
+    thinking_text: "",
+    has_tool_use: false,
+    model: "",
+    token_usage: null,
+    context_tokens: 0,
+    output_tokens: 0,
+    has_context_tokens: false,
+    has_output_tokens: false,
+    tool_calls: [],
+    is_system: false,
   };
 }
 
@@ -24,34 +34,39 @@ type LiveWindow = Window & {
 
 async function fixture(page: Page, newestFirst: boolean) {
   let transcript = Array.from({ length: 80 }, (_, i) => message(i));
-  await page.addInitScript(({ session }) => {
-    const Native = window.EventSource;
-    const sources: EventSource[] = [];
-    window.EventSource = class extends Native {
-      constructor(url: string | URL, options?: EventSourceInit) {
-        super(url, options);
-        if (String(url).includes(`/sessions/${session}/watch`)) sources.push(this);
-      }
-    };
-    (window as LiveWindow).__liveUpdate = () => {
-      const active = sources.filter((source) => source.readyState !== Native.CLOSED);
-      for (const source of active) {
-        source.dispatchEvent(new MessageEvent("session_updated", { data: "{}" }));
-      }
-      return active.length;
-    };
-  }, { session: SESSION });
+  await page.addInitScript(
+    ({ session }) => {
+      const Native = window.EventSource;
+      const sources: EventSource[] = [];
+      window.EventSource = class extends Native {
+        constructor(url: string | URL, options?: EventSourceInit) {
+          super(url, options);
+          if (String(url).includes(`/sessions/${session}/watch`)) sources.push(this);
+        }
+      };
+      (window as LiveWindow).__liveUpdate = () => {
+        const active = sources.filter((source) => source.readyState !== Native.CLOSED);
+        for (const source of active) {
+          source.dispatchEvent(new MessageEvent("session_updated", { data: "{}" }));
+        }
+        return active.length;
+      };
+    },
+    { session: SESSION },
+  );
 
   await page.route(`**/api/v1/sessions/${SESSION}`, async (route) => {
     const response = await route.fetch();
-    await route.fulfill({ json: { ...await response.json(), message_count: transcript.length } });
+    await route.fulfill({ json: { ...(await response.json()), message_count: transcript.length } });
   });
   await page.route(`**/api/v1/sessions/${SESSION}/messages*`, async (route) => {
     const url = new URL(route.request().url());
     const desc = url.searchParams.get("direction") === "desc";
     const from = Number(url.searchParams.get("from") ?? (desc ? transcript.length - 1 : 0));
     const limit = Number(url.searchParams.get("limit") ?? 1000);
-    const selected = transcript.filter((item) => desc ? item.ordinal <= from : item.ordinal >= from);
+    const selected = transcript.filter((item) =>
+      desc ? item.ordinal <= from : item.ordinal >= from,
+    );
     if (desc) selected.reverse();
     await route.fulfill({ json: { messages: selected.slice(0, limit), count: transcript.length } });
   });
@@ -87,7 +102,10 @@ async function sampleGeometry(page: Page) {
       state.frames++;
       frame = requestAnimationFrame(sample);
     };
-    state.stop = () => { running = false; cancelAnimationFrame(frame); };
+    state.stop = () => {
+      running = false;
+      cancelAnimationFrame(frame);
+    };
     (window as LiveWindow).__layoutSamples = state;
     frame = requestAnimationFrame(sample);
   });
@@ -104,69 +122,104 @@ async function finishGeometry(page: Page) {
 }
 
 for (const newestFirst of [false, true]) {
-  const order = newestFirst ? "newest-first" : "oldest-first";
-  test(`${order}: a stationary reader keeps the same message during live refresh`, async ({ page }) => {
-    const errors: string[] = [];
-    page.on("pageerror", (error) => errors.push(error.message));
-    const { sp, refresh, data } = await fixture(page, newestFirst);
-    await sp.scroller.evaluate((el) => { el.scrollTop = el.scrollHeight / 2; });
-    await waitForStableValue(() => sp.scroller.evaluate((el) => el.scrollTop), 500);
-    const anchor = await sp.scroller.evaluate((el) => {
-      const top = el.getBoundingClientRect().top;
-      const rows = [...el.querySelectorAll<HTMLElement>(".virtual-row")];
-      const row = rows.find((item) => item.getBoundingClientRect().bottom > top)!;
-      return {
-        key: row.dataset.messageKey!, top: row.getBoundingClientRect().top - top,
-        aboveKey: rows[0]!.dataset.messageKey!,
-      };
-    });
-    const anchorOrdinal = Number(anchor.key.split("-m-").at(-1));
-    const aboveOrdinal = Number(anchor.aboveKey.split("-m-").at(-1));
-    expect(aboveOrdinal).not.toBe(anchorOrdinal);
-    const anchorRow = sp.scroller.locator(`[data-message-key="${anchor.key}"]`);
-    await sampleGeometry(page);
-    for (let revision = 1; revision <= 6; revision++) {
-      const marker = `Live revision ${revision}`;
-      const next = data().map((item) => {
-        if (item.ordinal === anchorOrdinal) return message(item.ordinal, marker);
-        if (item.ordinal === aboveOrdinal) {
-          return message(item.ordinal, revision % 2 ? "A changing paragraph.\n\n".repeat(12) : "Short content.");
-        }
-        return item;
+  for (const zoom of [80, 100, 125]) {
+    const order = `${newestFirst ? "newest-first" : "oldest-first"} at ${zoom}%`;
+    test(`${order}: a stationary reader keeps the same message during live refresh`, async ({
+      page,
+    }) => {
+      const errors: string[] = [];
+      page.on("pageerror", (error) => errors.push(error.message));
+      await page.addInitScript(
+        (value) => localStorage.setItem("agentsview-zoom-level", String(value)),
+        zoom,
+      );
+      const { sp, refresh, data } = await fixture(page, newestFirst);
+      await sp.scroller.evaluate((el) => {
+        el.scrollTop = el.scrollHeight / 2;
       });
-      // Exercise same-count content updates first, then inserts at the latest edge.
-      if (revision > 3) next.push(message(next.length));
-      await refresh(next);
-      await expect(anchorRow).toContainText(marker);
-      await expect.poll(() => anchorRow.evaluate((row, expected) => {
-        const scroller = row.closest(".message-list-scroll")!;
-        return Math.abs(row.getBoundingClientRect().top - scroller.getBoundingClientRect().top - expected);
-      }, anchor.top)).toBeLessThanOrEqual(1);
-    }
-    await finishGeometry(page);
-    expect(errors).toEqual([]);
-  });
+      await waitForStableValue(() => sp.scroller.evaluate((el) => el.scrollTop), 500);
+      const anchor = await sp.scroller.evaluate((el) => {
+        const top = el.getBoundingClientRect().top;
+        const rows = [...el.querySelectorAll<HTMLElement>(".virtual-row")];
+        const row = rows.find((item) => item.getBoundingClientRect().bottom > top)!;
+        return {
+          key: row.dataset.messageKey!,
+          top: row.getBoundingClientRect().top - top,
+          aboveKey: rows[0]!.dataset.messageKey!,
+        };
+      });
+      const anchorOrdinal = Number(anchor.key.split("-m-").at(-1));
+      const aboveOrdinal = Number(anchor.aboveKey.split("-m-").at(-1));
+      expect(aboveOrdinal).not.toBe(anchorOrdinal);
+      const anchorRow = sp.scroller.locator(`[data-message-key="${anchor.key}"]`);
+      await sampleGeometry(page);
+      for (let revision = 1; revision <= 6; revision++) {
+        const marker = `Live revision ${revision}`;
+        const next = data().map((item) => {
+          if (item.ordinal === anchorOrdinal) return message(item.ordinal, marker);
+          if (item.ordinal === aboveOrdinal) {
+            return message(
+              item.ordinal,
+              revision % 2 ? "A changing paragraph.\n\n".repeat(12) : "Short content.",
+            );
+          }
+          return item;
+        });
+        // Exercise same-count content updates first, then inserts at the latest edge.
+        if (revision > 3) next.push(message(next.length));
+        await refresh(next);
+        await expect(anchorRow).toContainText(marker);
+        await expect
+          .poll(() =>
+            anchorRow.evaluate((row, expected) => {
+              const scroller = row.closest(".message-list-scroll")!;
+              return Math.abs(
+                row.getBoundingClientRect().top - scroller.getBoundingClientRect().top - expected,
+              );
+            }, anchor.top),
+          )
+          .toBeLessThanOrEqual(1);
+      }
+      await finishGeometry(page);
+      expect(errors).toEqual([]);
+    });
 
-  test(`${order}: follow latest survives streaming growth and stops on manual intent`, async ({ page }) => {
-    const { sp, refresh, data } = await fixture(page, newestFirst);
-    const follow = page.getByLabel("Follow latest messages");
-    await follow.click();
-    await expect(follow).toHaveAttribute("aria-pressed", "true");
-    await sampleGeometry(page);
-    for (let revision = 1; revision <= 4; revision++) {
-      const marker = `Streaming revision ${revision}`;
-      const next = [...data()];
-      const ordinal = next.length - 1;
-      next[ordinal] = message(ordinal, `${marker}\n\n${"More response text.\n\n".repeat(revision * 8)}`);
-      await refresh(next);
-      await expect(sp.scroller).toContainText(marker);
-      await expect.poll(() => sp.scroller.evaluate((el, reversed) => reversed
-        ? el.scrollTop : el.scrollHeight - el.clientHeight - el.scrollTop, newestFirst))
-        .toBeLessThanOrEqual(8);
-    }
-    await finishGeometry(page);
-    await sp.scroller.hover();
-    await page.mouse.wheel(0, newestFirst ? 600 : -600);
-    await expect(follow).toHaveAttribute("aria-pressed", "false");
-  });
+    test(`${order}: follow latest survives streaming growth and stops on manual intent`, async ({
+      page,
+    }) => {
+      await page.addInitScript(
+        (value) => localStorage.setItem("agentsview-zoom-level", String(value)),
+        zoom,
+      );
+      const { sp, refresh, data } = await fixture(page, newestFirst);
+      const follow = page.getByLabel("Follow latest messages");
+      await follow.click();
+      await expect(follow).toHaveAttribute("aria-pressed", "true");
+      await sampleGeometry(page);
+      for (let revision = 1; revision <= 4; revision++) {
+        const marker = `Streaming revision ${revision}`;
+        const next = [...data()];
+        const ordinal = next.length - 1;
+        next[ordinal] = message(
+          ordinal,
+          `${marker}\n\n${"More response text.\n\n".repeat(revision * 8)}`,
+        );
+        await refresh(next);
+        await expect(sp.scroller).toContainText(marker);
+        await expect
+          .poll(() =>
+            sp.scroller.evaluate(
+              (el, reversed) =>
+                reversed ? el.scrollTop : el.scrollHeight - el.clientHeight - el.scrollTop,
+              newestFirst,
+            ),
+          )
+          .toBeLessThanOrEqual(8);
+      }
+      await finishGeometry(page);
+      await sp.scroller.hover();
+      await page.mouse.wheel(0, newestFirst ? 600 : -600);
+      await expect(follow).toHaveAttribute("aria-pressed", "false");
+    });
+  }
 }
