@@ -1,4 +1,4 @@
-name: Prepare live transcript rebase workspace
+name: Validate live transcript refinements
 
 on:
   push:
@@ -8,85 +8,100 @@ permissions:
   contents: write
 
 jobs:
-  prepare:
+  validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: aba772a69728bce3cd6c0619078670e0abb9b9b6
           fetch-depth: 0
           persist-credentials: false
-      - name: Replay the transcript change on upstream main
-        id: rebase
+      - name: Apply the reviewed refinement to the exact rebased head
         shell: bash
         run: |
           set -euo pipefail
-          git remote add upstream https://github.com/kenn-io/agentsview.git
-          git fetch upstream main
-          test "$(git rev-parse upstream/main)" = 66dd6e5dc8fbb890d9eb21d64df952364abbd1c1
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          if ! git rebase --onto upstream/main 30cca8baa4955f36871a70ee6783ab16ff602986; then
-            expected=$(printf '%s\n' frontend/src/lib/virtual/createVirtualizer.svelte.ts frontend/src/lib/virtual/createVirtualizer.test.ts)
-            test "$(git diff --name-only --diff-filter=U)" = "$expected"
-            # The upstream delta in these two files is formatting only. Keep
-            # the feature versions; retain Git's three-way merge elsewhere.
-            for file in frontend/src/lib/virtual/createVirtualizer.svelte.ts frontend/src/lib/virtual/createVirtualizer.test.ts; do
-              git show "aba772a69728bce3cd6c0619078670e0abb9b9b6:$file" > "$file"
-              git add "$file"
-            done
-            GIT_EDITOR=true git rebase --continue
-          fi
-          git diff HEAD^ HEAD --check
+          python - <<'PY'
+          import base64, gzip, hashlib
+          from pathlib import Path
+          raw = Path('automation/live-transcript-refinements.patch.gz').read_bytes()
+          # Repair a missing base64 character in the transport blob. The full
+          # decoded diff must match the locally exercised SHA-256 before use.
+          encoded = base64.b64encode(raw).decode().replace('PUfF4iwSH', 'PUfFf4iwSH').rstrip('=')
+          decoded = base64.b64decode(encoded + '=' * (-len(encoded) % 4))
+          patch = gzip.decompress(decoded)
+          assert hashlib.sha256(patch).hexdigest() == '857cfd6eb0e4a3907a95fc1203cc5cb01e995a4063124fac9c95fa8e54deb452'
+          Path('/tmp/live-transcript-refinements.patch').write_bytes(patch)
+          PY
+          git checkout --detach 580b8a3cec240dbf21c557a2f52f9dd47e70d905
           test "$(git rev-parse HEAD^)" = 66dd6e5dc8fbb890d9eb21d64df952364abbd1c1
-          git log -2 --format='%H %s'
-      - name: Publish only if the feature branch has not moved
-        if: steps.rebase.outcome == 'success'
+          git apply --check /tmp/live-transcript-refinements.patch
+          git apply /tmp/live-transcript-refinements.patch
+          git diff --check
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.11.0'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install pinned frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Check types and transcript regressions
+        working-directory: frontend
+        run: |
+          npm run check
+          npm run test -- --maxWorkers=2 src/lib/virtual src/lib/components/content/staged-scroll src/lib/components/content/MessageList.test.ts src/lib/components/content/MessageList-search.test.ts
+          npm run build
+      - name: Publish the verified refinement without replacing concurrent work
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add frontend/src/lib/virtual frontend/src/lib/components/content/MessageList.svelte frontend/e2e/live-transcript-layout.spec.ts
+          git diff --cached --check
+          git commit -m 'fix(transcript): preserve row observers and anchors across live prepends'
           auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
           git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin \
-            --force-with-lease=refs/heads/fix/live-transcript-consistency:aba772a69728bce3cd6c0619078670e0abb9b9b6 \
+            --force-with-lease=refs/heads/fix/live-transcript-consistency:580b8a3cec240dbf21c557a2f52f9dd47e70d905 \
             HEAD:refs/heads/fix/live-transcript-consistency
-      - name: Export the exact Git workspace
+          mkdir -p /tmp/live-transcript-results
+          git log -3 --format='%H %s' > /tmp/live-transcript-results/commits.txt
+          git diff HEAD^ HEAD --stat > /tmp/live-transcript-results/change-summary.txt
+      - name: Build isolated application fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/live-transcript-bin
+          go run ./internal/pricing/cmd/litellm-snapshot -restore
+          cp -r frontend/dist/. internal/web/dist/
+          CGO_ENABLED=1 go build -tags 'fts5,kit_posthog_disabled' -o /tmp/live-transcript-bin/testfixture ./cmd/testfixture
+          CGO_ENABLED=1 go build -tags 'fts5,kit_posthog_disabled' -o /tmp/live-transcript-bin/agentsview ./cmd/agentsview
+      - name: Install browser engines
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium webkit
+      - name: Exercise application-level live refresh
+        working-directory: frontend
+        env:
+          CI: 'true'
+          E2E_PREBUILT_FIXTURE: /tmp/live-transcript-bin/testfixture
+          E2E_PREBUILT_SERVER: /tmp/live-transcript-bin/agentsview
+        run: npx playwright test e2e/live-transcript-layout.spec.ts --workers=2 --reporter=list,html
+      - name: Export results and exact feature source
         if: always()
         shell: bash
-        run: tar --exclude='./.git/hooks' -czf /tmp/live-transcript-workspace.tar.gz .
+        run: |
+          mkdir -p /tmp/live-transcript-results
+          git status --short > /tmp/live-transcript-results/status.txt
+          tar --exclude='./.git' --exclude='./frontend/node_modules' --exclude='./frontend/playwright-report' --exclude='./frontend/test-results' -czf /tmp/live-transcript-results/source.tar.gz .
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: live-transcript-workspace
-          path: /tmp/live-transcript-workspace.tar.gz
-          retention-days: 3
-      - uses: actions/setup-node@v4
-        if: steps.rebase.outcome == 'success'
-        with:
-          node-version: '24.11.0'
-      - name: Install the repository-pinned frontend toolchain
-        id: install
-        if: steps.rebase.outcome == 'success'
-        working-directory: frontend
-        run: npm ci
-      - name: Exercise the rebased adapter and navigation
-        if: steps.install.outcome == 'success'
-        working-directory: frontend
-        run: |
-          npm run i18n:compile
-          npm run test -- src/lib/virtual src/lib/components/content/staged-scroll
-      - name: Package the isolated frontend toolchain
-        if: always() && steps.install.outcome == 'success'
-        shell: bash
-        run: |
-          mkdir -p /tmp/live-transcript-toolchain
-          cp "$(command -v node)" /tmp/live-transcript-toolchain/node
-          tar -czf /tmp/live-transcript-toolchain/frontend-node-modules.tar.gz -C frontend node_modules
-      - uses: actions/upload-artifact@v4
-        if: always() && steps.install.outcome == 'success'
-        with:
-          name: live-transcript-toolchain
-          path: /tmp/live-transcript-toolchain
+          name: live-transcript-validation
+          path: |
+            /tmp/live-transcript-results
+            frontend/playwright-report
+            frontend/test-results
           retention-days: 3
